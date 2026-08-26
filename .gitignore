@@ -1,0 +1,21 @@
+# C/C++ build outputs
+*.o
+*.a
+*.so
+*.out
+
+# Java bytecode
+*.class
+
+# Local executables produced by this project
+/kvstore
+/kvs_reactor
+/rbtree
+/testcase
+/kvs-client/go-kvstore
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+*~
