@@ -1,3 +1,4 @@
 [submodule "NtyCo"]
 	path = NtyCo
 	url = https://github.com/wangbojing/NtyCo
+	ignore = untracked
