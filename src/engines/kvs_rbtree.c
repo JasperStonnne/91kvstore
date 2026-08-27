@@ -5,32 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include"kvstore.h"
-#define RED				1
-#define BLACK 			2
-
-#define ENABLE_KEY_CHAR 1
-
-#if ENABLE_KEY_CHAR
-typedef char* KEY_TYPE;
-#else
-typedef int KEY_TYPE;//key
-#endif
-
-
-typedef struct _rbtree_node {
-	unsigned char color;
-	struct _rbtree_node *right;
-	struct _rbtree_node *left;
-	struct _rbtree_node *parent;
-	KEY_TYPE key;
-	void *value;
-} rbtree_node;
-
-typedef struct _rbtree {
-	rbtree_node *root;
-	rbtree_node *nil;
-} rbtree;
-
 
 
 
@@ -458,8 +432,6 @@ int main() {
 
 
 #endif
-
-typedef struct _rbtree kvs_rbtree_t;
 
 kvs_rbtree_t global_rbtree;
 

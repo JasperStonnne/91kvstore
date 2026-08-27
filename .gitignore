@@ -12,10 +12,15 @@
 /kvs_reactor
 /rbtree
 /testcase
-/kvs-client/go-kvstore
+/clients/go-kvstore
+
+# Build directories
+/build/
+/bin/
 
 # Editor and OS files
 .vscode/
 .idea/
 .DS_Store
 *~
+
