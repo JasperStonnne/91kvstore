@@ -12,6 +12,8 @@ NTYCO_DIR := $(THIRD_PARTY_DIR)/NtyCo
 BUILD_DIR := build
 BIN_DIR := bin
 
+PERSISTENCE_DIR := $(SRC_DIR)/persistence
+
 CPPFLAGS := -I$(INCLUDE_DIR) -I$(NTYCO_DIR)/core
 CFLAGS := -std=gnu11 -Wall -Wextra -g
 LDFLAGS := -L$(NTYCO_DIR)
@@ -25,7 +27,8 @@ OBJS := \
 	$(BUILD_DIR)/kvs_array.o \
 	$(BUILD_DIR)/kvs_rbtree.o \
 	$(BUILD_DIR)/kvs_hash.o \
-	$(BUILD_DIR)/kvs_skiplist.o
+	$(BUILD_DIR)/kvs_skiplist.o\
+	$(BUILD_DIR)/aof.o
 
 .PHONY: all testcase clean
 
@@ -69,6 +72,8 @@ $(BIN_DIR)/testcase: $(TEST_DIR)/testcase.c | $(BIN_DIR)
 $(BUILD_DIR)/kvs_skiplist.o: $(ENGINE_DIR)/kvs_skiplist.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/aof.o: $(PERSISTENCE_DIR)/aof.c $(INCLUDE_DIR)/persistence.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
 

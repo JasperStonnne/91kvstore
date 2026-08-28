@@ -1,7 +1,7 @@
 //kvstore.c
 
 #include"kvstore.h"
-
+#include "persistence.h"
 
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
@@ -405,6 +405,10 @@ int main(int argc,char *argv[]){
 
     int port =atoi(argv[1]);
     init_kvengine();
+    if (kvs_aof_open("appendonly.aof") < 0) {
+        fprintf(stderr, "failed to open AOF\n");
+        return -1;
+}
 #if (NETWORK_SELECT==NETWORK_REACTOR)
     reactor_start(port,kvs_protocol);
 #elif(NETWORK_SELECT==NETWORK_NTYCO)

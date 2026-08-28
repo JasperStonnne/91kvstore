@@ -18,6 +18,9 @@
 /build/
 /bin/
 
+test_aof
+*.aof
+
 # Editor and OS files
 .vscode/
 .idea/
