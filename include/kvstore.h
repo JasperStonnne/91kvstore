@@ -24,9 +24,10 @@
 #define ENABLE_ARRAY 1
 #define ENABLE_RBTREE 1
 #define ENABLE_HASH 1
-
+#define ENABLE_SKIPLIST 1
 
 #define KVS_ARRAY_SIZE 1024
+
 
 
 
@@ -154,6 +155,30 @@ char * kvs_hash_get(kvs_hash_t *hash, char *key);
 int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
 int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
+#endif
+
+#if ENABLE_SKIPLIST
+#define KVS_SKIPLIST_MAX_LEVEL 6
+
+typedef struct kvs_skiplist_node {
+    char *key;
+    char *value;
+    struct kvs_skiplist_node **forward;
+} kvs_skiplist_node_t;
+
+typedef struct kvs_skiplist {
+    int level;
+    kvs_skiplist_node_t* header;
+} kvs_skiplist_t;
+
+int  kvs_skiplist_create(kvs_skiplist_t *inst);
+void kvs_skiplist_destory(kvs_skiplist_t *inst);
+int kvs_skiplist_set(kvs_skiplist_t* skipList,char *key,char* value);
+int kvs_skiplist_del(kvs_skiplist_t *skipList, char *key);
+int kvs_skiplist_mod(kvs_skiplist_t *skipList, char *key, char *newValue);
+int kvs_skiplist_exist(kvs_skiplist_t *skipList, char *key);
+char *kvs_skiplist_get(kvs_skiplist_t *inst,char *key );
+
 
 
 #endif

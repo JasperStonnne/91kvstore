@@ -24,7 +24,8 @@ OBJS := \
 	$(BUILD_DIR)/ntyco.o \
 	$(BUILD_DIR)/kvs_array.o \
 	$(BUILD_DIR)/kvs_rbtree.o \
-	$(BUILD_DIR)/kvs_hash.o
+	$(BUILD_DIR)/kvs_hash.o \
+	$(BUILD_DIR)/kvs_skiplist.o
 
 .PHONY: all testcase clean
 
@@ -65,5 +66,9 @@ $(BUILD_DIR)/kvs_hash.o: $(ENGINE_DIR)/kvs_hash.c $(INCLUDE_DIR)/kvstore.h | $(B
 $(BIN_DIR)/testcase: $(TEST_DIR)/testcase.c | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
 
+$(BUILD_DIR)/kvs_skiplist.o: $(ENGINE_DIR)/kvs_skiplist.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
+

@@ -195,7 +195,28 @@ void hash_testcase_10w(int connfd){
     int time_used=TIME_SUB_MS(tv_end,tv_begin);//ms
     printf("hash testcase --->time_used: %d,qps: %d",time_used,90000*1000/time_used);
 }
+void skiplist_testcase_10w(int connfd){
+    int count =10000;
+    int i=0;
+    struct timeval tv_begin;
+    gettimeofday(&tv_begin, NULL);
+    for(i=0;i<count;i++){
+    testcase(connfd,"SSET Dad Jasper","OK\r\n","HSET-Dad");
+    testcase(connfd,"SGET Dad","Jasper\r\n","HGET-Dad"); 
+    testcase(connfd,"SMOD Dad Sao","OK\r\n","HMOD-Dad");
+    testcase(connfd,"SGET Dad","Sao\r\n","HGET-Dad");
+    testcase(connfd,"SEXIST Dad","EXIST\r\n","HEXIST-Dad");
+    testcase(connfd,"SDEL Dad","OK\r\n","HDEL-Dad"); 
+    testcase(connfd,"SGET Dad","NO EXIST\r\n","HGET-Dad");
+    testcase(connfd,"SMOD Dad Jasper","NO EXIST\r\n","HMOD-Dad");
+    testcase(connfd,"SEXIST Dad","NO EXIST\r\n","HEXIST-Dad");      
 
+}
+    struct timeval tv_end;
+    gettimeofday(&tv_end, NULL);
+    int time_used=TIME_SUB_MS(tv_end,tv_begin);//ms
+    printf("skiplist testcase --->time_used: %d,qps: %d",time_used,90000*1000/time_used);
+}
 //testcase 172.16.145.129 2000
 int main(int argc,char *argv[]){
 
@@ -217,6 +238,8 @@ int main(int argc,char *argv[]){
         array_testcase_10w(connfd); 
     }else if(mode==3){
         hash_testcase_10w(connfd);
+    }else if(mode==4){
+        skiplist_testcase_10w(connfd);
     }
     
     

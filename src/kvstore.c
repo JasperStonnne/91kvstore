@@ -15,6 +15,10 @@ extern kvs_rbtree_t global_rbtree;
 extern kvs_hash_t global_hash;
 #endif
 
+#if ENABLE_SKIPLIST
+extern kvs_skiplist_t global_skiplist;
+#endif
+
 void *kvs_malloc(size_t size){
 
 
@@ -29,7 +33,8 @@ void kvs_free(void *ptr){
 const char *command[]={
     "SET","GET","DEL","MOD","EXIST",
     "RSET","RGET","RDEL","RMOD","REXIST",
-    "HSET","HGET","HDEL","HMOD","HEXIST"
+    "HSET","HGET","HDEL","HMOD","HEXIST",
+    "SSET","SGET","SDEL","SMOD","SEXIST"
 };
 enum{
     KVS_CMD_START=0,
@@ -52,7 +57,12 @@ enum{
     KVS_CMD_HDEL,//2
     KVS_CMD_HMOD,//3
     KVS_CMD_HEXIST,//4 
-
+    //skiplist
+    KVS_CMD_SSET,
+    KVS_CMD_SGET,//1
+    KVS_CMD_SDEL,//2
+    KVS_CMD_SMOD,//3
+    KVS_CMD_SEXIST,//4 
     KVS_CMD_COUNT,
 };
 
@@ -254,7 +264,56 @@ int kvs_filter_protocol(char **tokens,int count,char *response){
             length=sprintf(response,"NO EXIST\r\n");              
         }
         break;        
-
+#endif
+#if ENABLE_SKIPLIST
+    case KVS_CMD_SSET:
+        ret=kvs_skiplist_set(&global_skiplist,key,value);
+        if(ret<0){
+            length=sprintf(response,"ERROR\r\n");
+        }else if(ret==0){
+            length=sprintf(response,"OK\r\n");  
+        }else{
+            length=sprintf(response,"EXIST\r\n");
+        }
+        
+        break;
+    case KVS_CMD_SGET:{
+    char *result=kvs_skiplist_get(&global_skiplist,key); 
+    if(result==NULL){
+        length=sprintf(response,"NO EXIST\r\n");
+    }else {
+        length=sprintf(response,"%s\r\n",result); 
+    }
+        break;
+}
+    case KVS_CMD_SDEL:
+        ret=kvs_skiplist_del(&global_skiplist,key);
+        if(ret<0){
+           length=sprintf(response,"ERROR\r\n"); 
+        }else if(ret==0){
+            length=sprintf(response,"OK\r\n");
+        }else{
+            length=sprintf(response,"NO EXIST\r\n");  
+        }
+        break;
+    case KVS_CMD_SMOD:
+        ret=kvs_skiplist_mod(&global_skiplist,key,value);
+        if(ret<0){
+           length=sprintf(response,"ERROR\r\n"); 
+        }else if(ret==0){
+            length=sprintf(response,"OK\r\n");
+        }else{
+            length=sprintf(response,"NO EXIST\r\n");  
+        }
+        break;
+    case KVS_CMD_SEXIST:
+        ret=kvs_skiplist_exist(&global_skiplist,key);
+        if(ret==0){
+        length=sprintf(response,"EXIST\r\n");
+        }else{
+            length=sprintf(response,"NO EXIST\r\n");              
+        }
+        break;        
 
 #endif
 
@@ -307,9 +366,13 @@ int init_kvengine(void){
 #endif
 
 #if ENABLE_HASH
-    memset(&global_rbtree,0,sizeof(kvs_hash_t));
+    memset(&global_hash,0,sizeof(kvs_hash_t));
     kvs_hash_create(&global_hash);
+#endif
 
+#if ENABLE_SKIPLIST
+    memset(&global_skiplist,0,sizeof(kvs_skiplist_t)); 
+    kvs_skiplist_create(&global_skiplist);
 #endif
     return 0;
 }
@@ -326,6 +389,10 @@ void dest_kvengine(void){
 
 #if ENABLE_HASH
     kvs_hash_destory(&global_hash);
+#endif
+
+#if ENABLE_SKIPLIST
+    kvs_skiplist_destory(&global_skiplist);
 #endif
 
 
