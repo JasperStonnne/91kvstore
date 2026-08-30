@@ -76,7 +76,7 @@ int kvs_hash_create(kvs_hash_t *hash) {
 
 	hash->nodes = (hashnode_t**)kvs_malloc(sizeof(hashnode_t*) * MAX_TABLE_SIZE);
 	if (!hash->nodes) return -1;
-
+	memset(hash->nodes,0,sizeof(hashnode_t *) * MAX_TABLE_SIZE);
 	hash->max_slots = MAX_TABLE_SIZE;
 	hash->count = 0; 
 
@@ -248,6 +248,42 @@ int kvs_hash_exist(kvs_hash_t *hash, char *key) {
 	return 0;
 	
 }
+int kvs_hash_foreach(
+    kvs_hash_t *hash,
+    kvs_visit_handler visitor,
+    void *context
+) {
+    if (hash == NULL ||
+        hash->nodes == NULL ||
+        visitor == NULL) {
+        return -1;
+    }
+
+    for (int i = 0; i < hash->max_slots; i++) {
+        hashnode_t *node = hash->nodes[i];
+
+        while (node != NULL) {
+            if (node->key != NULL &&
+                node->value != NULL) {
+
+                int ret = visitor(
+                    node->key,
+                    node->value,
+                    context
+                );
+
+                if (ret < 0) {
+                    return -1;
+                }
+            }
+
+            node = node->next;
+        }
+    }
+
+    return 0;
+}
+
 
 #if 0
 int main() {

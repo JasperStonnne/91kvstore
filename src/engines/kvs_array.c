@@ -158,7 +158,21 @@ int kvs_array_exist(kvs_array_t *inst, char *key){
         return 1;//不存在
     }
     return 0;//存在
+}
 
 
-
+int kvs_array_foreach(kvs_array_t *inst,kvs_visit_handler visitor,void *context){
+    if(inst==NULL||inst->table==NULL||visitor==NULL){
+        return -1;
+    }
+    for(int i=0;i<inst->total;i++){
+        if(inst->table[i].key==NULL||inst->table[i].value==NULL){
+            continue;
+        }
+        int ret=visitor(inst->table[i].key, inst->table[i].value,context);
+        if(ret<0){
+            return -1;
+        }
+    }
+    return 0;
 }

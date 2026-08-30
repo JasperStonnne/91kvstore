@@ -524,3 +524,68 @@ int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key){
     return 0;
 
 }
+static int kvs_rbtree_foreach_node(
+    kvs_rbtree_t *inst,
+    rbtree_node *node,
+    kvs_visit_handler visitor,
+    void *context
+) {
+    if (node == NULL) {
+        return -1;
+    }
+
+    if (node == inst->nil) {
+        return 0;
+    }
+
+    if (kvs_rbtree_foreach_node(
+            inst,
+            node->left,
+            visitor,
+            context) < 0) {
+        return -1;
+    }
+
+    if (node->key != NULL &&
+        node->value != NULL) {
+
+        int ret = visitor(
+            node->key,
+            (const char *)node->value,
+            context
+        );
+
+        if (ret < 0) {
+            return -1;
+        }
+    }
+
+    if (kvs_rbtree_foreach_node(
+            inst,
+            node->right,
+            visitor,
+            context) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+int kvs_rbtree_foreach(
+    kvs_rbtree_t *inst,
+    kvs_visit_handler visitor,
+    void *context
+) {
+    if (inst == NULL ||
+        inst->root == NULL ||
+        inst->nil == NULL ||
+        visitor == NULL) {
+        return -1;
+    }
+
+    return kvs_rbtree_foreach_node(
+        inst,
+        inst->root,
+        visitor,
+        context
+    );
+}

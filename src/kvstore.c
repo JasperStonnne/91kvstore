@@ -70,7 +70,21 @@ const char *response[]={
 
 
 };
-
+static int aof_replaying = 0;
+static int kvs_is_write_command(int cmd){
+    if(cmd<KVS_CMD_START||cmd>=KVS_CMD_COUNT){
+        return 0;
+    }
+    switch (cmd%5)
+    {
+    case 0:
+    case 2:
+    case 3:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 
 
@@ -320,6 +334,15 @@ int kvs_filter_protocol(char **tokens,int count,char *response){
     default:
         assert(0);
     }
+    if(!aof_replaying&&ret==0&&kvs_is_write_command(cmd)){
+        int aof_ret=kvs_aof_append(tokens,count);
+        if(aof_ret<0){
+            fprintf(stderr,"failed to append AOF\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+
     return length;
 
 }
@@ -349,6 +372,13 @@ int kvs_protocol(char *msg,int length,char *response){
 
     int count=kvs_split_token(msg,tokens);//count的作用是 有多少个tokens
     if (count==-1) return -1;
+    if(count==1&&strcmp(tokens[0],"SAVE")==0){
+        int save_result=kvs_snapshot_save("snapshot.db");
+        if(save_result<0){
+            return sprintf(response,"ERROR\r\n");
+        }
+        return sprintf(response, "OK\r\n");
+    }
     //memcpy(response,msg,length);
     return kvs_filter_protocol(tokens,count,response);
 }
@@ -405,6 +435,20 @@ int main(int argc,char *argv[]){
 
     int port =atoi(argv[1]);
     init_kvengine();
+    aof_replaying =1;
+    long long offset=kvs_snapshot_load("snapshot.db",kvs_protocol);
+    if(offset<0){
+        aof_replaying=-1;
+        fprintf(stderr,"failed to load snapshot\n");
+        return -1;
+    }
+    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_protocol);
+    aof_replaying=0;
+    if(replay_ret<0){
+        fprintf(stderr, "failed to replay AOF\n");
+        return -1;
+    }
+
     if (kvs_aof_open("appendonly.aof") < 0) {
         fprintf(stderr, "failed to open AOF\n");
         return -1;

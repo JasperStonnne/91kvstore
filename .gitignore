@@ -20,7 +20,7 @@
 
 test_aof
 *.aof
-
+/snapshot.db
 # Editor and OS files
 .vscode/
 .idea/

@@ -18,8 +18,8 @@ static kvs_skiplist_node_t* skiplist_create_node(int level, const char *key, con
         kvs_free(newNode);
         return NULL;
     }
-    strcpy(newNode->key,key); 
-    
+    strcpy(newNode->key,key);
+
     newNode->value = kvs_malloc(strlen(value)+1);
     if(newNode->value==NULL){
         kvs_free(newNode->key);
@@ -37,7 +37,7 @@ static kvs_skiplist_node_t* skiplist_create_node(int level, const char *key, con
         return NULL;
 
     }
-    
+
     return newNode;
 }
 
@@ -47,17 +47,17 @@ int  kvs_skiplist_create(kvs_skiplist_t *inst) {
         return -1;
     }
     skipList->level = 0;
-    
-    skipList->header = skiplist_create_node(KVS_SKIPLIST_MAX_LEVEL,"",""); //头节点不保存业务数据 所以key和value使用空字符串 
+
+    skipList->header = skiplist_create_node(KVS_SKIPLIST_MAX_LEVEL,"",""); //头节点不保存业务数据 所以key和value使用空字符串
     if(skipList->header==NULL){
         return -1;
     }
-    
+
     for (int i = 0; i <= KVS_SKIPLIST_MAX_LEVEL; ++i) {
         skipList->header->forward[i] = NULL;
     }
-    
-   return 0; 
+
+   return 0;
 }
 void kvs_skiplist_destory(kvs_skiplist_t *inst){
 
@@ -67,7 +67,7 @@ void kvs_skiplist_destory(kvs_skiplist_t *inst){
     kvs_skiplist_node_t *current=inst->header->forward[0];
     while(current!=NULL){
     kvs_skiplist_node_t *next=current->forward[0];
-    
+
     kvs_free(current->key);
     kvs_free(current->value);
     kvs_free(current->forward);
@@ -100,7 +100,7 @@ int kvs_skiplist_set(kvs_skiplist_t* skipList,char *key,char* value) {
    for (int i = skipList->level; i >= 0; --i) {
       while (current->forward[i] != NULL && strcmp(current->forward[i]->key , key)<0){
          current = current->forward[i];
-      
+
    }
         update[i] = current;
    }
@@ -112,8 +112,8 @@ int kvs_skiplist_set(kvs_skiplist_t* skipList,char *key,char* value) {
       if (level > skipList->level) {
          for (int i = skipList->level + 1; i <= level; ++i)
             update[i] = skipList->header;
-        
-      
+
+
        skipList->level = level;
     }
       kvs_skiplist_node_t* newNode = skiplist_create_node(level, key, value);
@@ -132,16 +132,16 @@ int kvs_skiplist_set(kvs_skiplist_t* skipList,char *key,char* value) {
 
 void display(kvs_skiplist_t* skipList) {
     printf("Skip List:\n");
-    
+
     for (int i = 0; i <= skipList->level; ++i) {
         kvs_skiplist_node_t* node = skipList->header->forward[i];
         printf("Level %d: ", i);
-        
+
         while (node != NULL) {
             printf("%s ", node->key);
             node = node->forward[i];
         }
-        
+
         printf("\n");
     }
 }
@@ -160,7 +160,7 @@ static kvs_skiplist_node_t *skiplist_search_node(kvs_skiplist_t* skipList, const
 
     current = current -> forward[0];
 
-    if(current!=NULL && strcmp(current -> key,key)==0){   
+    if(current!=NULL && strcmp(current -> key,key)==0){
         return current;
     }
     return NULL;
@@ -188,7 +188,7 @@ int kvs_skiplist_del(kvs_skiplist_t *skipList, char *key){
         }
         update[i]=current;
     }
-    current = current->forward[0]; 
+    current = current->forward[0];
     if(current==NULL||strcmp(current->key,key)!=0){
         return 1;
     }
@@ -241,6 +241,40 @@ int kvs_skiplist_exist(kvs_skiplist_t *skipList, char *key){
         return 0;
     }
     return 1;
+}
+int kvs_skiplist_foreach(
+    kvs_skiplist_t *inst,
+    kvs_visit_handler visitor,
+    void *context
+) {
+    if (inst == NULL ||
+        inst->header == NULL ||
+        visitor == NULL) {
+        return -1;
+    }
+
+    kvs_skiplist_node_t *node =
+        inst->header->forward[0];
+
+    while (node != NULL) {
+        if (node->key != NULL &&
+            node->value != NULL) {
+
+            int ret = visitor(
+                node->key,
+                node->value,
+                context
+            );
+
+            if (ret < 0) {
+                return -1;
+            }
+        }
+
+        node = node->forward[0];
+    }
+
+    return 0;
 }
 #if 0
 static void check_test(int condition, const char *testName)

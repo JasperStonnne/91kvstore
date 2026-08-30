@@ -32,6 +32,7 @@
 
 
 typedef int (*msg_handler)(char *msg,int length,char *response);
+typedef int (*kvs_visit_handler)( const char *key,const char *value,void *context);
 
 extern int reactor_start(unsigned short port,msg_handler handler);
 extern int ntyco_start(unsigned short port,msg_handler handler);
@@ -61,7 +62,7 @@ extern int proactor_start(unsigned short port,msg_handler handler);
     int kvs_array_del(kvs_array_t *inst,char *key);
     int kvs_array_mod(kvs_array_t *inst,char *key,char *value);
     int kvs_array_exist(kvs_array_t *inst, char *key);
-
+    int kvs_array_foreach(kvs_array_t *inst,kvs_visit_handler visitor,void *context);
 
 
 #endif
@@ -106,7 +107,7 @@ char* kvs_rbtree_get(kvs_rbtree_t *inst,char *key);
 int kvs_rbtree_del(kvs_rbtree_t *inst,char *key);
 int kvs_rbtree_mod(kvs_rbtree_t *inst,char *key,char *value);
 int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key);
-
+int kvs_rbtree_foreach(kvs_rbtree_t *inst,kvs_visit_handler visitor,void *context);
 
 #endif
 
@@ -155,6 +156,7 @@ char * kvs_hash_get(kvs_hash_t *hash, char *key);
 int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
 int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
+int kvs_hash_foreach(kvs_hash_t *hash, kvs_visit_handler visitor,void *context);
 #endif
 
 #if ENABLE_SKIPLIST
@@ -178,7 +180,7 @@ int kvs_skiplist_del(kvs_skiplist_t *skipList, char *key);
 int kvs_skiplist_mod(kvs_skiplist_t *skipList, char *key, char *newValue);
 int kvs_skiplist_exist(kvs_skiplist_t *skipList, char *key);
 char *kvs_skiplist_get(kvs_skiplist_t *inst,char *key );
-
+int kvs_skiplist_foreach(kvs_skiplist_t *inst,kvs_visit_handler visitor,void *context);
 
 
 #endif

@@ -28,7 +28,8 @@ OBJS := \
 	$(BUILD_DIR)/kvs_rbtree.o \
 	$(BUILD_DIR)/kvs_hash.o \
 	$(BUILD_DIR)/kvs_skiplist.o\
-	$(BUILD_DIR)/aof.o
+	$(BUILD_DIR)/aof.o\
+	$(BUILD_DIR)/snapshot.o
 
 .PHONY: all testcase clean
 
@@ -73,6 +74,9 @@ $(BUILD_DIR)/kvs_skiplist.o: $(ENGINE_DIR)/kvs_skiplist.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/aof.o: $(PERSISTENCE_DIR)/aof.c $(INCLUDE_DIR)/persistence.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/snapshot.o: $(PERSISTENCE_DIR)/snapshot.c $(INCLUDE_DIR)/persistence.h $(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)

@@ -1,5 +1,9 @@
 #include<stdio.h>
 #include <unistd.h>
+#include<errno.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include<string.h>
 #include"persistence.h"
 
 static FILE *aof_fp=NULL;
@@ -61,4 +65,57 @@ int kvs_aof_append(char **tokens, int count){
         return -1;
     }
     return 0;
+}
+
+int kvs_aof_replay(const char*path,long long offset,aof_replay_handler handler){
+    if(path==NULL||handler==NULL||offset<0){
+        return -1;
+    }
+    FILE *fp=fopen(path,"r");
+    if(fp==NULL){
+        if(errno==ENOENT){
+            return 0;
+        }
+        return -1;
+    }
+    if(fseeko(fp,(off_t)offset,SEEK_SET)!=0){//fp 文件 ，移动字节数 SEEK_SET从文件开头计算位置
+        fclose(fp);
+        return -1;
+    }
+    char *line=NULL;//保存我所读取到的一行
+    size_t capacity=0;//当前分配的内存容量
+    ssize_t line_length;//实际读取到的字符数
+    int replay_result=0;//每次重放的结果
+    while((line_length=getline(&line,&capacity,fp))!=-1){
+        while (line_length > 0 &&(line[line_length - 1] == '\n' ||line[line_length - 1] == '\r')) {
+            line[--line_length] = '\0';
+    }
+    if(line_length==0){
+        continue;
+    }
+    char response[1024]={0};
+    int response_length=handler(line,(int)line_length,response);
+    if(response_length<=0||strcmp(response,"OK\r\n")!=0){
+        replay_result=-1;
+        break;
+    }
+}
+    if(ferror(fp))  {
+        replay_result=-1;
+    }
+    free(line);
+    if (fclose(fp) != 0) {
+        replay_result = -1;
+    }
+    return replay_result;
+}
+long long kvs_aof_get_offset(void){
+    if(aof_fp==NULL){
+        return -1;
+    }
+    off_t offset =ftello(aof_fp);
+    if(offset==(off_t)-1){
+        return -1;
+    }
+    return (long long)offset;
 }
