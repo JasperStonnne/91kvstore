@@ -3,6 +3,7 @@ CC := gcc
 SRC_DIR := src
 ENGINE_DIR := $(SRC_DIR)/engines
 NETWORK_DIR := $(SRC_DIR)/network
+MEMORY_DIR := $(SRC_DIR)/memory
 INCLUDE_DIR := include
 TEST_DIR := tests
 
@@ -31,7 +32,7 @@ OBJS := \
 	$(BUILD_DIR)/aof.o\
 	$(BUILD_DIR)/snapshot.o
 
-.PHONY: all testcase clean
+.PHONY: all testcase test-memory-pool clean
 
 all: $(BIN_DIR)/kvstore
 
@@ -78,6 +79,20 @@ $(BUILD_DIR)/aof.o: $(PERSISTENCE_DIR)/aof.c $(INCLUDE_DIR)/persistence.h | $(BU
 
 $(BUILD_DIR)/snapshot.o: $(PERSISTENCE_DIR)/snapshot.c $(INCLUDE_DIR)/persistence.h $(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+test-memory-pool: $(BIN_DIR)/test_memory_pool
+	./$(BIN_DIR)/test_memory_pool
+
+$(BIN_DIR)/test_memory_pool: \
+		$(TEST_DIR)/test_memory_pool.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		-fsanitize=address -fno-omit-frame-pointer \
+		$(TEST_DIR)/test_memory_pool.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $@
+
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
 
