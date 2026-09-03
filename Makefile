@@ -30,9 +30,10 @@ OBJS := \
 	$(BUILD_DIR)/kvs_hash.o \
 	$(BUILD_DIR)/kvs_skiplist.o\
 	$(BUILD_DIR)/aof.o\
-	$(BUILD_DIR)/snapshot.o
+	$(BUILD_DIR)/snapshot.o\
+	$(BUILD_DIR)/memory_pool.o
 
-.PHONY: all testcase test-memory-pool clean
+.PHONY: all testcase test-memory-pool test-hash-memory-pool clean
 
 all: $(BIN_DIR)/kvstore
 
@@ -80,8 +81,27 @@ $(BUILD_DIR)/aof.o: $(PERSISTENCE_DIR)/aof.c $(INCLUDE_DIR)/persistence.h | $(BU
 $(BUILD_DIR)/snapshot.o: $(PERSISTENCE_DIR)/snapshot.c $(INCLUDE_DIR)/persistence.h $(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/memory_pool.o: $(MEMORY_DIR)/memory_pool.c $(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
 test-memory-pool: $(BIN_DIR)/test_memory_pool
 	./$(BIN_DIR)/test_memory_pool
+
+test-hash-memory-pool: $(BIN_DIR)/test_hash_memory_pool
+	./$(BIN_DIR)/test_hash_memory_pool
+
+$(BIN_DIR)/test_hash_memory_pool: \
+	$(TEST_DIR)/test_hash_memory_pool.c \
+	$(ENGINE_DIR)/kvs_hash.c \
+	$(MEMORY_DIR)/memory_pool.c \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		-fsanitize=address -fno-omit-frame-pointer \
+		$(TEST_DIR)/test_hash_memory_pool.c \
+		$(ENGINE_DIR)/kvs_hash.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $@
 
 $(BIN_DIR)/test_memory_pool: \
 		$(TEST_DIR)/test_memory_pool.c \

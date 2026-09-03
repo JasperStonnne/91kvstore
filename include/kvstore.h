@@ -10,7 +10,7 @@
 #include<stdlib.h>
 #include<stddef.h>
 #include <assert.h>
-
+#include<memory_pool.h>
 
 #define NETWORK_REACTOR 0
 #define NETWORK_PROACTOR 1
@@ -140,9 +140,10 @@ typedef struct hashnode_s {
 typedef struct hashtable_s {
 
 	hashnode_t **nodes; //* change **, 
-
 	int max_slots;
 	int count;
+
+    memory_pool_t node_pool;
 
 } hashtable_t;
 
