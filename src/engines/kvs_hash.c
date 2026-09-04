@@ -67,8 +67,7 @@ hashnode_t *_create_node(kvs_hash_t *hash, char *key, char *value) {
 		hash_storge_free(hash,node);
 		return NULL;
 	}
-	memset(kcopy, 0, strlen(key) + 1);
-	strncpy(kcopy, key, strlen(key));
+	memcpy(kcopy, key, strlen(key) + 1);
 
 	node->key = kcopy;
 
@@ -78,8 +77,7 @@ hashnode_t *_create_node(kvs_hash_t *hash, char *key, char *value) {
 		hash_storge_free(hash,node);
 		return NULL;
 	}
-	memset(kvalue, 0, strlen(value) + 1);
-	strncpy(kvalue, value, strlen(value));
+	memcpy(kvalue,value, strlen(value) + 1);
 
 	node->value = kvalue;
 	
@@ -222,13 +220,12 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value) {
 	}
 
 	// node --> 
-	kvs_free(node->value);
+
 
 	char *kvalue = kvs_malloc(strlen(value) + 1);
 	if (kvalue == NULL) return -2;
-	memset(kvalue, 0, strlen(value) + 1);
-	strncpy(kvalue, value, strlen(value));
-
+	memcpy(kvalue, value, strlen(value) + 1);
+	kvs_free(node->value);
 	node->value = kvalue;
 	
 	return 0;
