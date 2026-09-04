@@ -10,7 +10,9 @@
 #include "kvstore.h"
 
 #define HASH_NODE_BLOCKS_PER_CHUNK 1024
-
+#ifndef KVS_HASH_USE_MEMORY_POOL
+#define KVS_HASH_USE_MEMORY_POOL 1
+#endif
 // Key, Value --> 
 // Modify 
 
@@ -36,16 +38,33 @@ static int _hash(char *key, int size) {
 	return sum % size;
 
 }
-
+static hashnode_t *hash_node_alloc(kvs_hash_t *hash){
+	if (!hash) return NULL;
+#if KVS_HASH_USE_MEMORY_POOL
+	return (hashnode_t*)memory_pool_alloc(&hash->node_pool);
+#else
+	return (hashnode_t*)kvs_malloc(sizeof(hashnode_t));
+#endif
+}
+static void hash_storge_free(kvs_hash_t *hash,hashnode_t *node){
+	if(hash==NULL||node==NULL){
+		return;
+	}
+#if KVS_HASH_USE_MEMORY_POOL
+	memory_pool_free(&hash->node_pool,node);
+#else
+	kvs_free(node);
+#endif
+}
 hashnode_t *_create_node(kvs_hash_t *hash, char *key, char *value) {
 
-	hashnode_t *node = (hashnode_t*)memory_pool_alloc(&hash->node_pool);//hash node的节点 申请现在走我们做的memory_pool
+	hashnode_t *node =hash_node_alloc(hash);//hash node的节点 申请现在走我们做的memory_pool
 	if (node==NULL) return NULL;
 	
 #if ENABLE_KEY_POINTER
 	char *kcopy = kvs_malloc(strlen(key) + 1);
 	if (kcopy == NULL){
-		memory_pool_free(&hash->node_pool,node);
+		hash_storge_free(hash,node);
 		return NULL;
 	}
 	memset(kcopy, 0, strlen(key) + 1);
@@ -56,7 +75,7 @@ hashnode_t *_create_node(kvs_hash_t *hash, char *key, char *value) {
 	char *kvalue = kvs_malloc(strlen(value) + 1);
 	if (kvalue == NULL) { 
 		kvs_free(kcopy);
-		memory_pool_free(&hash->node_pool,node);
+		hash_storge_free(hash,node);
 		return NULL;
 	}
 	memset(kvalue, 0, strlen(value) + 1);
@@ -80,16 +99,18 @@ static void _hash_node_free(kvs_hash_t *hash,hashnode_t *node){
 	kvs_free(node->key);
 	kvs_free(node->value);
 #endif
-	memory_pool_free(&hash->node_pool,node);
+	hash_storge_free(hash,node);
 }
 
 //
 int kvs_hash_create(kvs_hash_t *hash) {
 
 	if (!hash) return -1;
+#if KVS_HASH_USE_MEMORY_POOL
 	if (memory_pool_init(&hash->node_pool,sizeof(hashnode_t),HASH_NODE_BLOCKS_PER_CHUNK) != 0) {
 	return -1;
 }
+#endif
 
 	hash->nodes = (hashnode_t**)kvs_malloc(sizeof(hashnode_t*) * MAX_TABLE_SIZE);
 	if (!hash->nodes) return -1;
@@ -121,8 +142,9 @@ void kvs_hash_destory(kvs_hash_t *hash) {
 
 	kvs_free(hash->nodes);
 	hash->nodes = NULL;
-
+#if KVS_HASH_USE_MEMORY_POOL
 	memory_pool_destory(&hash->node_pool);
+#endif
 	hash->max_slots = 0;
 	hash->count = 0;
 }

@@ -5,6 +5,9 @@
 
 #include "kvstore.h"
 
+#ifndef KVS_HASH_USE_MEMORY_POOL
+#define KVS_HASH_USE_MEMORY_POOL 1
+#endif
 /*
  * 独立测试不链接 src/kvstore.c，
  * 因此在这里提供 kvs_malloc/kvs_free 的简单实现。
@@ -52,8 +55,10 @@ int main(void) {
      * 内存池采用懒加载。
      * 还没有插入节点，因此尚未创建 Chunk。
      */
+#if KVS_HASH_USE_MEMORY_POOL
     assert(hash.node_pool.chunk_list == NULL);
     assert(hash.node_pool.free_list == NULL);
+#endif
 
     /*
      * 第二部分：插入第一个节点。
@@ -61,8 +66,9 @@ int main(void) {
      */
     assert(kvs_hash_set(&hash, "name", "Jasper") == 0);
     assert(hash.count == 1);
+#if KVS_HASH_USE_MEMORY_POOL
     assert(hash.node_pool.chunk_list != NULL);
-
+#endif
     /*
      * 验证 key/value 能够正常查询。
      */
@@ -98,21 +104,27 @@ int main(void) {
      * 两次业务节点不同，但底层 hashnode_t Block 地址相同，
      * 证明删除的节点已经被内存池复用。
      */
-    assert(second_node == first_node);
-
     printf("first node  = %p\n", (void *)first_node);
-    printf("second node = %p (reused)\n", (void *)second_node);
+    printf("second node = %p\n", (void *)second_node);
 
+#if KVS_HASH_USE_MEMORY_POOL
+    assert(second_node == first_node);
+    printf("memory pool reused the released node block\n");
+#else
+    printf("malloc mode does not require address reuse\n");
+#endif
     /*
      * 第五部分：销毁 Hash。
      * 销毁剩余 key/value、桶数组以及 node_pool 的所有 Chunk。
      */
     kvs_hash_destory(&hash);
-
     assert(hash.nodes == NULL);
     assert(hash.count == 0);
+
+#if KVS_HASH_USE_MEMORY_POOL
     assert(hash.node_pool.chunk_list == NULL);
     assert(hash.node_pool.free_list == NULL);
+#endif
 
     printf("hash memory pool integration test passed\n");
 

@@ -16,6 +16,8 @@ BIN_DIR := bin
 PERSISTENCE_DIR := $(SRC_DIR)/persistence
 
 CPPFLAGS := -I$(INCLUDE_DIR) -I$(NTYCO_DIR)/core
+HASH_USE_MEMORY_POOL ?= 1
+CPPFLAGS += -DKVS_HASH_USE_MEMORY_POOL=$(HASH_USE_MEMORY_POOL)
 CFLAGS := -std=gnu11 -Wall -Wextra -g
 LDFLAGS := -L$(NTYCO_DIR)
 LDLIBS := -luring -lntyco -lpthread -ldl
