@@ -35,7 +35,7 @@ OBJS := \
 	$(BUILD_DIR)/snapshot.o\
 	$(BUILD_DIR)/memory_pool.o
 
-.PHONY: all testcase test-memory-pool benchmark-hash clean
+.PHONY: all testcase test-memory-pool benchmark-hash  benchmark-hash-memory clean
 
 all: $(BIN_DIR)/kvstore
 
@@ -118,6 +118,19 @@ benchmark-hash: $(BIN_DIR)/benchmark_hash_pool $(BIN_DIR)/benchmark_hash_malloc
 	./$(BIN_DIR)/benchmark_hash_pool
 	./$(BIN_DIR)/benchmark_hash_malloc
 
+$(BIN_DIR)/benchmark_hash_memory_pool: \
+	$(TEST_DIR)/benchmark_hash_memory.c \
+	$(ENGINE_DIR)/kvs_hash.c \
+	$(MEMORY_DIR)/memory_pool.c \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(CC) -I$(INCLUDE_DIR) $(CFLAGS) -O2 -Werror \
+		-DKVS_HASH_USE_MEMORY_POOL=1 \
+		$(TEST_DIR)/benchmark_hash_memory.c \
+		$(ENGINE_DIR)/kvs_hash.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $@
+
 $(BIN_DIR)/benchmark_hash_pool: \
 	$(TEST_DIR)/benchmark_hash_allocator.c \
 	$(ENGINE_DIR)/kvs_hash.c \
@@ -143,6 +156,23 @@ $(BIN_DIR)/benchmark_hash_malloc: \
 		$(ENGINE_DIR)/kvs_hash.c \
 		$(MEMORY_DIR)/memory_pool.c \
 		-o $@
+$(BIN_DIR)/benchmark_hash_memory_malloc: \
+	$(TEST_DIR)/benchmark_hash_memory.c \
+	$(ENGINE_DIR)/kvs_hash.c \
+	$(MEMORY_DIR)/memory_pool.c \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(CC) -I$(INCLUDE_DIR) $(CFLAGS) -O2 -Werror \
+		-DKVS_HASH_USE_MEMORY_POOL=0 \
+		$(TEST_DIR)/benchmark_hash_memory.c \
+		$(ENGINE_DIR)/kvs_hash.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $@
+
+benchmark-hash-memory: $(BIN_DIR)/benchmark_hash_memory_pool $(BIN_DIR)/benchmark_hash_memory_malloc
+	./$(BIN_DIR)/benchmark_hash_memory_pool
+	./$(BIN_DIR)/benchmark_hash_memory_malloc
+
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
 

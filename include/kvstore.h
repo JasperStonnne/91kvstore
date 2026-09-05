@@ -158,6 +158,7 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
 int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
 int kvs_hash_foreach(kvs_hash_t *hash, kvs_visit_handler visitor,void *context);
+int kvs_hash_count(kvs_hash_t *hash);
 #endif
 
 #if ENABLE_SKIPLIST
