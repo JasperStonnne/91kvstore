@@ -1,3 +1,4 @@
+//hash 接入内存池以后 CRUD和节点复用是否正常
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>

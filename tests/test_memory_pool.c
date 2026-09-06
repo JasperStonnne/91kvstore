@@ -1,3 +1,4 @@
+//内存池 自身能否申请 归还 复用 扩容 与销毁
 #include "memory_pool.h"                    // 引入内存池接口
 #include <assert.h>                         // assert 用来验证条件
 #include <stdio.h>                          // printf

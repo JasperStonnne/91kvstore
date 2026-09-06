@@ -1,3 +1,4 @@
+//不经过网络 反复测试 内存池和 malloc 在 增加和删除一个 Hash 节点时的性能差异。
 #include <stdio.h>      // printf
 #include <stdlib.h>     // malloc、free
 #include <time.h>       // clock_gettime

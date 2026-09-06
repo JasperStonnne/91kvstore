@@ -1,9 +1,15 @@
 CC := gcc
 
+# 1：Hash 节点使用内存池
+# 0：Hash 节点使用 malloc
+HASH_USE_MEMORY_POOL ?= 1
+
 SRC_DIR := src
 ENGINE_DIR := $(SRC_DIR)/engines
 NETWORK_DIR := $(SRC_DIR)/network
 MEMORY_DIR := $(SRC_DIR)/memory
+PERSISTENCE_DIR := $(SRC_DIR)/persistence
+
 INCLUDE_DIR := include
 TEST_DIR := tests
 
@@ -13,12 +19,14 @@ NTYCO_DIR := $(THIRD_PARTY_DIR)/NtyCo
 BUILD_DIR := build
 BIN_DIR := bin
 
-PERSISTENCE_DIR := $(SRC_DIR)/persistence
+CPPFLAGS := \
+	-I$(INCLUDE_DIR) \
+	-I$(NTYCO_DIR)/core \
+	-DKVS_HASH_USE_MEMORY_POOL=$(HASH_USE_MEMORY_POOL)
 
-CPPFLAGS := -I$(INCLUDE_DIR) -I$(NTYCO_DIR)/core
-HASH_USE_MEMORY_POOL ?= 1
-CPPFLAGS += -DKVS_HASH_USE_MEMORY_POOL=$(HASH_USE_MEMORY_POOL)
 CFLAGS := -std=gnu11 -Wall -Wextra -g
+BENCH_CFLAGS := $(CFLAGS) -O2 -Werror
+
 LDFLAGS := -L$(NTYCO_DIR)
 LDLIBS := -luring -lntyco -lpthread -ldl
 
@@ -30,12 +38,19 @@ OBJS := \
 	$(BUILD_DIR)/kvs_array.o \
 	$(BUILD_DIR)/kvs_rbtree.o \
 	$(BUILD_DIR)/kvs_hash.o \
-	$(BUILD_DIR)/kvs_skiplist.o\
-	$(BUILD_DIR)/aof.o\
-	$(BUILD_DIR)/snapshot.o\
+	$(BUILD_DIR)/kvs_skiplist.o \
+	$(BUILD_DIR)/aof.o \
+	$(BUILD_DIR)/snapshot.o \
 	$(BUILD_DIR)/memory_pool.o
 
-.PHONY: all testcase test-memory-pool benchmark-hash  benchmark-hash-memory clean
+.PHONY: \
+	all \
+	testcase \
+	test-memory-pool \
+	test-hash-memory-pool \
+	benchmark-hash \
+	benchmark-hash-memory \
+	clean
 
 all: $(BIN_DIR)/kvstore
 
@@ -50,44 +65,79 @@ $(NTYCO_DIR)/libntyco.a:
 $(BIN_DIR)/kvstore: $(OBJS) $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
 	$(CC) $(OBJS) $(LDFLAGS) $(LDLIBS) -o $@
 
-$(BUILD_DIR)/kvstore.o: $(SRC_DIR)/kvstore.c $(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+$(BUILD_DIR)/kvstore.o: \
+	$(SRC_DIR)/kvstore.c \
+	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/reactor.o: $(NETWORK_DIR)/reactor.c $(INCLUDE_DIR)/server.h | $(BUILD_DIR)
+$(BUILD_DIR)/reactor.o: \
+	$(NETWORK_DIR)/reactor.c \
+	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/proactor.o: $(NETWORK_DIR)/proactor.c $(INCLUDE_DIR)/server.h | $(BUILD_DIR)
+$(BUILD_DIR)/proactor.o: \
+	$(NETWORK_DIR)/proactor.c \
+	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/ntyco.o: $(NETWORK_DIR)/ntyco.c | $(BUILD_DIR)
+$(BUILD_DIR)/ntyco.o: \
+	$(NETWORK_DIR)/ntyco.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kvs_array.o: $(ENGINE_DIR)/kvs_array.c $(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+$(BUILD_DIR)/kvs_array.o: \
+	$(ENGINE_DIR)/kvs_array.c \
+	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kvs_rbtree.o: $(ENGINE_DIR)/kvs_rbtree.c $(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+$(BUILD_DIR)/kvs_rbtree.o: \
+	$(ENGINE_DIR)/kvs_rbtree.c \
+	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kvs_hash.o: $(ENGINE_DIR)/kvs_hash.c $(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+$(BUILD_DIR)/kvs_hash.o: \
+	$(ENGINE_DIR)/kvs_hash.c \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BIN_DIR)/testcase: $(TEST_DIR)/testcase.c | $(BIN_DIR)
+$(BUILD_DIR)/kvs_skiplist.o: \
+	$(ENGINE_DIR)/kvs_skiplist.c \
+	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/aof.o: \
+	$(PERSISTENCE_DIR)/aof.c \
+	$(INCLUDE_DIR)/persistence.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/snapshot.o: \
+	$(PERSISTENCE_DIR)/snapshot.c \
+	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/memory_pool.o: \
+	$(MEMORY_DIR)/memory_pool.c \
+	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BIN_DIR)/testcase: \
+	$(TEST_DIR)/testcase.c | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
-
-$(BUILD_DIR)/kvs_skiplist.o: $(ENGINE_DIR)/kvs_skiplist.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/aof.o: $(PERSISTENCE_DIR)/aof.c $(INCLUDE_DIR)/persistence.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/snapshot.o: $(PERSISTENCE_DIR)/snapshot.c $(INCLUDE_DIR)/persistence.h $(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/memory_pool.o: $(MEMORY_DIR)/memory_pool.c $(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 test-memory-pool: $(BIN_DIR)/test_memory_pool
 	./$(BIN_DIR)/test_memory_pool
+
+$(BIN_DIR)/test_memory_pool: \
+	$(TEST_DIR)/test_memory_pool.c \
+	$(MEMORY_DIR)/memory_pool.c \
+	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		-fsanitize=address \
+		-fno-omit-frame-pointer \
+		$(TEST_DIR)/test_memory_pool.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $@
 
 test-hash-memory-pool: $(BIN_DIR)/test_hash_memory_pool
 	./$(BIN_DIR)/test_hash_memory_pool
@@ -99,80 +149,42 @@ $(BIN_DIR)/test_hash_memory_pool: \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
-		-fsanitize=address -fno-omit-frame-pointer \
+		-fsanitize=address \
+		-fno-omit-frame-pointer \
 		$(TEST_DIR)/test_hash_memory_pool.c \
 		$(ENGINE_DIR)/kvs_hash.c \
 		$(MEMORY_DIR)/memory_pool.c \
 		-o $@
 
-$(BIN_DIR)/test_memory_pool: \
-		$(TEST_DIR)/test_memory_pool.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
-		-fsanitize=address -fno-omit-frame-pointer \
-		$(TEST_DIR)/test_memory_pool.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $@
-benchmark-hash: $(BIN_DIR)/benchmark_hash_pool $(BIN_DIR)/benchmark_hash_malloc
-	./$(BIN_DIR)/benchmark_hash_pool
-	./$(BIN_DIR)/benchmark_hash_malloc
-
-$(BIN_DIR)/benchmark_hash_memory_pool: \
-	$(TEST_DIR)/benchmark_hash_memory.c \
-	$(ENGINE_DIR)/kvs_hash.c \
-	$(MEMORY_DIR)/memory_pool.c \
-	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
-	$(CC) -I$(INCLUDE_DIR) $(CFLAGS) -O2 -Werror \
-		-DKVS_HASH_USE_MEMORY_POOL=1 \
-		$(TEST_DIR)/benchmark_hash_memory.c \
-		$(ENGINE_DIR)/kvs_hash.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $@
-
-$(BIN_DIR)/benchmark_hash_pool: \
-	$(TEST_DIR)/benchmark_hash_allocator.c \
-	$(ENGINE_DIR)/kvs_hash.c \
-	$(MEMORY_DIR)/memory_pool.c \
-	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
-	$(CC) -I$(INCLUDE_DIR) $(CFLAGS) -O2 -Werror \
-		-DKVS_HASH_USE_MEMORY_POOL=1 \
+# 编译 Hash 分配速度测试，不自动运行。
+#
+# 使用方法：
+# make HASH_USE_MEMORY_POOL=1 benchmark-hash
+# ./bin/benchmark_hash_allocator
+#
+# make HASH_USE_MEMORY_POOL=0 benchmark-hash
+# ./bin/benchmark_hash_allocator
+benchmark-hash: | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
 		$(TEST_DIR)/benchmark_hash_allocator.c \
 		$(ENGINE_DIR)/kvs_hash.c \
 		$(MEMORY_DIR)/memory_pool.c \
-		-o $@
+		-o $(BIN_DIR)/benchmark_hash_allocator
 
-$(BIN_DIR)/benchmark_hash_malloc: \
-	$(TEST_DIR)/benchmark_hash_allocator.c \
-	$(ENGINE_DIR)/kvs_hash.c \
-	$(MEMORY_DIR)/memory_pool.c \
-	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
-	$(CC) -I$(INCLUDE_DIR) $(CFLAGS) -O2 -Werror \
-		-DKVS_HASH_USE_MEMORY_POOL=0 \
-		$(TEST_DIR)/benchmark_hash_allocator.c \
-		$(ENGINE_DIR)/kvs_hash.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $@
-$(BIN_DIR)/benchmark_hash_memory_malloc: \
-	$(TEST_DIR)/benchmark_hash_memory.c \
-	$(ENGINE_DIR)/kvs_hash.c \
-	$(MEMORY_DIR)/memory_pool.c \
-	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
-	$(CC) -I$(INCLUDE_DIR) $(CFLAGS) -O2 -Werror \
-		-DKVS_HASH_USE_MEMORY_POOL=0 \
+# 编译 Hash 内存占用测试，不自动运行。
+#
+# 使用方法：
+# make HASH_USE_MEMORY_POOL=1 benchmark-hash-memory
+# ./bin/benchmark_hash_memory
+#
+# make HASH_USE_MEMORY_POOL=0 benchmark-hash-memory
+# ./bin/benchmark_hash_memory
+benchmark-hash-memory: | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
 		$(TEST_DIR)/benchmark_hash_memory.c \
 		$(ENGINE_DIR)/kvs_hash.c \
 		$(MEMORY_DIR)/memory_pool.c \
-		-o $@
-
-benchmark-hash-memory: $(BIN_DIR)/benchmark_hash_memory_pool $(BIN_DIR)/benchmark_hash_memory_malloc
-	./$(BIN_DIR)/benchmark_hash_memory_pool
-	./$(BIN_DIR)/benchmark_hash_memory_malloc
+		-o $(BIN_DIR)/benchmark_hash_memory
 
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
-
