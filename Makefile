@@ -50,6 +50,7 @@ OBJS := \
 	test-hash-memory-pool \
 	benchmark-hash \
 	benchmark-hash-memory \
+	test-rbtree-memory-pool \
 	clean
 
 all: $(BIN_DIR)/kvstore
@@ -186,5 +187,21 @@ benchmark-hash-memory: | $(BIN_DIR)
 		$(MEMORY_DIR)/memory_pool.c \
 		-o $(BIN_DIR)/benchmark_hash_memory
 
+test-rbtree-memory-pool: $(BIN_DIR)/test_rbtree_memory_pool
+	./$(BIN_DIR)/test_rbtree_memory_pool
+
+$(BIN_DIR)/test_rbtree_memory_pool: \
+	$(TEST_DIR)/test_rbtree_memory_pool.c \
+	$(ENGINE_DIR)/kvs_rbtree.c \
+	$(MEMORY_DIR)/memory_pool.c \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		-fsanitize=address \
+		-fno-omit-frame-pointer \
+		$(TEST_DIR)/test_rbtree_memory_pool.c \
+		$(ENGINE_DIR)/kvs_rbtree.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $@
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)

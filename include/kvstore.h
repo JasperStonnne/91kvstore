@@ -93,6 +93,7 @@ typedef struct _rbtree_node {
 typedef struct _rbtree {
 	rbtree_node *root;
 	rbtree_node *nil;
+    memory_pool_t node_pool;
 } rbtree;
 
 
