@@ -7,15 +7,46 @@
 #include<string.h>
 
 kvs_skiplist_t global_skiplist;
+#ifndef KVS_SKIPLIST_USE_MEMORY_POOL
+#define KVS_SKIPLIST_USE_MEMORY_POOL 1
+#endif
 
-static kvs_skiplist_node_t* skiplist_create_node(int level, const char *key, const char* value) {//改成const char* 传入字符串不应该修改
-    kvs_skiplist_node_t* newNode = (kvs_skiplist_node_t*)kvs_malloc(sizeof(kvs_skiplist_node_t));
+#define SKIPLIST_NODE_BLOCKS_PER_CHUNK 1024
+
+static kvs_skiplist_node_t *skiplist_node_storage_alloc(kvs_skiplist_t *inst,bool use_node_pool){
+    (void)inst;
+    (void)use_node_pool;
+#if KVS_SKIPLIST_USE_MEMORY_POOL
+    if(use_node_pool){
+        return (kvs_skiplist_node_t *)memory_pool_alloc(&inst->node_pool);
+    }
+#endif
+    return (kvs_skiplist_node_t *)kvs_malloc(sizeof(kvs_skiplist_node_t));
+}
+static void skiplist_node_storage_free(kvs_skiplist_t *inst,kvs_skiplist_node_t *node,bool use_node_pool){
+    (void)inst;
+    (void)node;
+    (void)use_node_pool;
+    if(node==NULL){
+        return;
+    }
+#if KVS_SKIPLIST_USE_MEMORY_POOL
+    if(use_node_pool){
+        memory_pool_free(&inst->node_pool,node);
+        return;
+    }
+#endif
+    kvs_free(node);
+}
+static kvs_skiplist_node_t* skiplist_create_node(kvs_skiplist_t *inst,int level, const char *key, const char* value,bool use_node_pool) {//改成const char* 传入字符串不应该修改
+    if (inst == NULL ||key == NULL ||value == NULL ||level < 0 ||level > KVS_SKIPLIST_MAX_LEVEL) {return NULL;}
+    kvs_skiplist_node_t *newNode =skiplist_node_storage_alloc(inst,use_node_pool);
     if(newNode==NULL){
         return NULL;
     }
     newNode->key = kvs_malloc(strlen(key)+1);
     if(newNode->key==NULL){
-        kvs_free(newNode);
+        skiplist_node_storage_free(inst,newNode,use_node_pool);
         return NULL;
     }
     strcpy(newNode->key,key);
@@ -23,7 +54,7 @@ static kvs_skiplist_node_t* skiplist_create_node(int level, const char *key, con
     newNode->value = kvs_malloc(strlen(value)+1);
     if(newNode->value==NULL){
         kvs_free(newNode->key);
-        kvs_free(newNode);
+        skiplist_node_storage_free(inst,newNode,use_node_pool);
         return NULL;
     }
 
@@ -33,11 +64,14 @@ static kvs_skiplist_node_t* skiplist_create_node(int level, const char *key, con
     if(newNode->forward==NULL){
         kvs_free(newNode->key);
         kvs_free(newNode->value);
-        kvs_free(newNode);
+        skiplist_node_storage_free(inst,newNode,use_node_pool);
         return NULL;
 
     }
-
+    // 初始化这个节点拥有的全部 forward 指针
+    for (int i = 0; i <= level; i++) {
+    newNode->forward[i] = NULL;
+    }
     return newNode;
 }
 
@@ -46,10 +80,18 @@ int  kvs_skiplist_create(kvs_skiplist_t *inst) {
     if(skipList==NULL){
         return -1;
     }
+#if KVS_SKIPLIST_USE_MEMORY_POOL
+    if (memory_pool_init(&skipList->node_pool,sizeof(kvs_skiplist_node_t),SKIPLIST_NODE_BLOCKS_PER_CHUNK) != 0) {
+    return -1;
+    }
+#endif
     skipList->level = 0;
 
-    skipList->header = skiplist_create_node(KVS_SKIPLIST_MAX_LEVEL,"",""); //头节点不保存业务数据 所以key和value使用空字符串
+    skipList->header = skiplist_create_node(skipList,KVS_SKIPLIST_MAX_LEVEL,"","",false); //头节点不保存业务数据 所以key和value使用空字符串
     if(skipList->header==NULL){
+#if KVS_SKIPLIST_USE_MEMORY_POOL
+        memory_pool_destory(&skipList->node_pool);
+#endif
         return -1;
     }
 
@@ -71,14 +113,16 @@ void kvs_skiplist_destory(kvs_skiplist_t *inst){
     kvs_free(current->key);
     kvs_free(current->value);
     kvs_free(current->forward);
-    kvs_free(current);
+    skiplist_node_storage_free(inst,current,true);
     current=next;
     }
     kvs_free(inst->header->key);
     kvs_free(inst->header->value);
     kvs_free(inst->header->forward);
     kvs_free(inst->header);
-
+#if KVS_SKIPLIST_USE_MEMORY_POOL
+    memory_pool_destory(&inst->node_pool);
+#endif
     inst->header = NULL;
     inst->level = 0;
 
@@ -112,14 +156,14 @@ int kvs_skiplist_set(kvs_skiplist_t* skipList,char *key,char* value) {
       if (level > skipList->level) {
          for (int i = skipList->level + 1; i <= level; ++i)
             update[i] = skipList->header;
-
-
-       skipList->level = level;
     }
-      kvs_skiplist_node_t* newNode = skiplist_create_node(level, key, value);
+      kvs_skiplist_node_t* newNode = skiplist_create_node(skipList,level,key,value,true);
       if(newNode==NULL){
         return -2;
       }
+      if (level > skipList->level) {
+        skipList->level = level;
+    }
       for (int i = 0; i <= level; ++i) {
          newNode->forward[i] = update[i]->forward[i];
          update[i]->forward[i] = newNode;
@@ -204,7 +248,7 @@ int kvs_skiplist_del(kvs_skiplist_t *skipList, char *key){
     kvs_free(current->forward);
     kvs_free(current->value);
     kvs_free(current->key);
-    kvs_free(current);
+   skiplist_node_storage_free(skipList,current,true);
 
     return 0;
 }

@@ -6,6 +6,10 @@ HASH_USE_MEMORY_POOL ?= 1
 # 1：红黑树节点使用内存池
 # 0：红黑树节点使用 malloc
 RBTREE_USE_MEMORY_POOL ?= 1
+# 1：跳表普通节点使用内存池
+# 0：跳表普通节点使用 malloc
+SKIPLIST_USE_MEMORY_POOL ?= 1
+
 SRC_DIR := src
 ENGINE_DIR := $(SRC_DIR)/engines
 NETWORK_DIR := $(SRC_DIR)/network
@@ -25,7 +29,8 @@ CPPFLAGS := \
 	-I$(INCLUDE_DIR) \
 	-I$(NTYCO_DIR)/core \
 	-DKVS_HASH_USE_MEMORY_POOL=$(HASH_USE_MEMORY_POOL) \
-	-DKVS_RBTREE_USE_MEMORY_POOL=$(RBTREE_USE_MEMORY_POOL)
+	-DKVS_RBTREE_USE_MEMORY_POOL=$(RBTREE_USE_MEMORY_POOL) \
+	-DKVS_SKIPLIST_USE_MEMORY_POOL=$(SKIPLIST_USE_MEMORY_POOL)
 
 CFLAGS := -std=gnu11 -Wall -Wextra -g
 BENCH_CFLAGS := $(CFLAGS) -O2 -Werror
@@ -56,6 +61,9 @@ OBJS := \
 	test-rbtree-memory-pool \
 	benchmark-rbtree \
 	benchmark-rbtree-memory \
+	test-skiplist-memory-pool \
+	benchmark-skiplist \
+	benchmark-skiplist-memory \
 	clean
 
 all: $(BIN_DIR)/kvstore
@@ -238,5 +246,53 @@ benchmark-rbtree-memory: | $(BIN_DIR)
 		$(ENGINE_DIR)/kvs_rbtree.c \
 		$(MEMORY_DIR)/memory_pool.c \
 		-o $(BIN_DIR)/benchmark_rbtree_memory
+
+test-skiplist-memory-pool: $(BIN_DIR)/test_skiplist_memory_pool
+	./$(BIN_DIR)/test_skiplist_memory_pool
+
+$(BIN_DIR)/test_skiplist_memory_pool: \
+	$(TEST_DIR)/test_skiplist_memory_pool.c \
+	$(ENGINE_DIR)/kvs_skiplist.c \
+	$(MEMORY_DIR)/memory_pool.c \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		-fsanitize=address \
+		-fno-omit-frame-pointer \
+		$(TEST_DIR)/test_skiplist_memory_pool.c \
+		$(ENGINE_DIR)/kvs_skiplist.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $@
+
+# 编译跳表节点分配速度测试，不自动运行。
+#
+# 使用方法：
+# make SKIPLIST_USE_MEMORY_POOL=1 benchmark-skiplist
+# ./bin/benchmark_skiplist_allocator
+#
+# make SKIPLIST_USE_MEMORY_POOL=0 benchmark-skiplist
+# ./bin/benchmark_skiplist_allocator
+benchmark-skiplist: | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
+		$(TEST_DIR)/benchmark_skiplist_allocator.c \
+		$(ENGINE_DIR)/kvs_skiplist.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $(BIN_DIR)/benchmark_skiplist_allocator
+
+# 编译跳表内存占用测试，不自动运行。
+#
+# 使用方法：
+# make SKIPLIST_USE_MEMORY_POOL=1 benchmark-skiplist-memory
+# ./bin/benchmark_skiplist_memory
+#
+# make SKIPLIST_USE_MEMORY_POOL=0 benchmark-skiplist-memory
+# ./bin/benchmark_skiplist_memory
+benchmark-skiplist-memory: | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
+		$(TEST_DIR)/benchmark_skiplist_memory.c \
+		$(ENGINE_DIR)/kvs_skiplist.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $(BIN_DIR)/benchmark_skiplist_memory
+
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)

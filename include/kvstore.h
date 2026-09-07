@@ -174,6 +174,7 @@ typedef struct kvs_skiplist_node {
 typedef struct kvs_skiplist {
     int level;
     kvs_skiplist_node_t* header;
+    memory_pool_t node_pool;
 } kvs_skiplist_t;
 
 int  kvs_skiplist_create(kvs_skiplist_t *inst);
