@@ -7,6 +7,9 @@
 
 #include "kvstore.h"
 
+#ifndef KVS_RBTREE_USE_MEMORY_POOL
+#define KVS_RBTREE_USE_MEMORY_POOL 1
+#endif
 // 独立测试不链接 src/kvstore.c，
 // 因此在测试中提供 kvs_malloc/kvs_free。
 void *kvs_malloc(size_t size) {
@@ -30,9 +33,10 @@ int main(void) {
     assert(tree.root == tree.nil);
 
     // 节点池使用懒扩容；尚未 SET，所以还没有 Chunk
+#if KVS_RBTREE_USE_MEMORY_POOL
     assert(tree.node_pool.chunk_list == NULL);
     assert(tree.node_pool.free_list == NULL);
-
+#endif
     // 插入第一个普通红黑树节点
     assert(kvs_rbtree_set(&tree, "name", "Jasper") == 0);
 
@@ -40,7 +44,9 @@ int main(void) {
     assert(tree.root != tree.nil);
 
     // 第一次申请节点会触发 node_pool 创建 Chunk
+#if KVS_RBTREE_USE_MEMORY_POOL
     assert(tree.node_pool.chunk_list != NULL);
+#endif
 
     // 验证业务数据正常
     char *value = kvs_rbtree_get(&tree, "name");
@@ -67,10 +73,9 @@ int main(void) {
     assert(tree.root == tree.nil);
 
     // 被删除的节点 Block 应该位于 free_list 表头
-    assert(
-        tree.node_pool.free_list ==
-        (free_node_t *)first_node
-    );
+#if KVS_RBTREE_USE_MEMORY_POOL
+    assert(tree.node_pool.free_list ==(free_node_t *)first_node);
+#endif
 
     // 插入一个不同的业务节点
     assert(kvs_rbtree_set(&tree, "city", "Shanghai") == 0);
@@ -78,17 +83,21 @@ int main(void) {
     // 当前又只有一个普通节点，所以它就是 root
     rbtree_node *second_node = tree.root;
     assert(second_node != tree.nil);
-
+#if KVS_RBTREE_USE_MEMORY_POOL
     // Free List 采用头插、头取，应该复用刚才归还的 Block
     assert(second_node == first_node);
-
+#endif
     // 验证复用 Block 后，新 key/value 没有受到旧数据影响
     value = kvs_rbtree_get(&tree, "city");
     assert(value != NULL);
     assert(strcmp(value, "Shanghai") == 0);
 
     printf("first node  = %p\n", (void *)first_node);
+#if KVS_RBTREE_USE_MEMORY_POOL
     printf("second node = %p (reused)\n", (void *)second_node);
+#else
+printf("second node = %p (malloc mode)\n", (void *)second_node);
+#endif
         // 再插入多个节点，构造不止一个节点的红黑树
     assert(kvs_rbtree_set(&tree, "alpha", "1") == 0);
     assert(kvs_rbtree_set(&tree, "echo", "5") == 0);
@@ -102,12 +111,12 @@ int main(void) {
     // 销毁后不应保留失效的树指针
     assert(tree.root == NULL);
     assert(tree.nil == NULL);
-
+#if KVS_RBTREE_USE_MEMORY_POOL
     // 内存池持有的 Chunk 和空闲链表都应该被清空
     assert(tree.node_pool.chunk_list == NULL);
     assert(tree.node_pool.free_list == NULL);
-
-    printf("rbtree memory pool integration test passed\n");
+#endif
+    printf("rbtree memory allocator test passed\n");
 
     return 0;
 }

@@ -3,7 +3,9 @@ CC := gcc
 # 1：Hash 节点使用内存池
 # 0：Hash 节点使用 malloc
 HASH_USE_MEMORY_POOL ?= 1
-
+# 1：红黑树节点使用内存池
+# 0：红黑树节点使用 malloc
+RBTREE_USE_MEMORY_POOL ?= 1
 SRC_DIR := src
 ENGINE_DIR := $(SRC_DIR)/engines
 NETWORK_DIR := $(SRC_DIR)/network
@@ -22,7 +24,8 @@ BIN_DIR := bin
 CPPFLAGS := \
 	-I$(INCLUDE_DIR) \
 	-I$(NTYCO_DIR)/core \
-	-DKVS_HASH_USE_MEMORY_POOL=$(HASH_USE_MEMORY_POOL)
+	-DKVS_HASH_USE_MEMORY_POOL=$(HASH_USE_MEMORY_POOL) \
+	-DKVS_RBTREE_USE_MEMORY_POOL=$(RBTREE_USE_MEMORY_POOL)
 
 CFLAGS := -std=gnu11 -Wall -Wextra -g
 BENCH_CFLAGS := $(CFLAGS) -O2 -Werror
@@ -51,6 +54,8 @@ OBJS := \
 	benchmark-hash \
 	benchmark-hash-memory \
 	test-rbtree-memory-pool \
+	benchmark-rbtree \
+	benchmark-rbtree-memory \
 	clean
 
 all: $(BIN_DIR)/kvstore
@@ -92,7 +97,8 @@ $(BUILD_DIR)/kvs_array.o: \
 
 $(BUILD_DIR)/kvs_rbtree.o: \
 	$(ENGINE_DIR)/kvs_rbtree.c \
-	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kvs_hash.o: \
@@ -203,5 +209,34 @@ $(BIN_DIR)/test_rbtree_memory_pool: \
 		$(ENGINE_DIR)/kvs_rbtree.c \
 		$(MEMORY_DIR)/memory_pool.c \
 		-o $@
+# 编译红黑树节点分配速度测试，不自动运行。
+#
+# 使用方法：
+# make RBTREE_USE_MEMORY_POOL=1 benchmark-rbtree
+# ./bin/benchmark_rbtree_allocator
+#
+# make RBTREE_USE_MEMORY_POOL=0 benchmark-rbtree
+# ./bin/benchmark_rbtree_allocator
+benchmark-rbtree: | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
+		$(TEST_DIR)/benchmark_rbtree_allocator.c \
+		$(ENGINE_DIR)/kvs_rbtree.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $(BIN_DIR)/benchmark_rbtree_allocator
+
+# 编译红黑树内存占用测试，不自动运行。
+#
+# 使用方法：
+# make RBTREE_USE_MEMORY_POOL=1 benchmark-rbtree-memory
+# ./bin/benchmark_rbtree_memory
+#
+# make RBTREE_USE_MEMORY_POOL=0 benchmark-rbtree-memory
+# ./bin/benchmark_rbtree_memory
+benchmark-rbtree-memory: | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
+		$(TEST_DIR)/benchmark_rbtree_memory.c \
+		$(ENGINE_DIR)/kvs_rbtree.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $(BIN_DIR)/benchmark_rbtree_memory
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
