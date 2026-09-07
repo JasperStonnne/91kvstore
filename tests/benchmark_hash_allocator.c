@@ -88,10 +88,13 @@ int main(){
         (double)operations / seconds;
 
     // 根据编译宏确定当前测试的分配策略名称
+// 根据编译宏确定当前测试的分配策略名称
 #if KVS_HASH_USE_MEMORY_POOL
     const char *allocator = "memory_pool";
+#elif defined(KVS_BENCHMARK_JEMALLOC)
+    const char *allocator = "jemalloc";
 #else
-    const char *allocator = "malloc";
+    const char *allocator = "glibc_malloc";
 #endif
 
     // 输出本轮 benchmark 的最终结果
