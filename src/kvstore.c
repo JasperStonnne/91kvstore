@@ -347,7 +347,16 @@ int kvs_filter_protocol(char **tokens,int count,char *response){
 
 }
 
-
+static int kvs_trim_command_end(char *msg,int length){
+    if(msg==NULL||length<=0){
+        return -1;
+    }
+    while(length>0&&(msg[length-1]=='\r'||msg[length-1]=='\n')){
+        msg[length-1]='\0';
+        length--;
+    }
+    return length;
+}
 
 
 
@@ -366,6 +375,10 @@ int kvs_protocol(char *msg,int length,char *response){
 //GET Key
 //DEL Key
     if (msg==NULL||length<=0||response==NULL) return -1;
+    length = kvs_trim_command_end(msg, length);
+    if(length<=0){
+        return -1;
+    }
     printf("recv: %d: %s\n",length,msg);
 
     char *tokens[KVS_MAX_TOKENS]={0};
