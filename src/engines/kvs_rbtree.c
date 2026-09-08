@@ -6,8 +6,10 @@
 #include <string.h>
 #include"kvstore.h"
 
-
-
+#define RBTREE_NODE_BLOCKS_PER_CHUNK 1024
+#ifndef KVS_RBTREE_USE_MEMORY_POOL
+#define KVS_RBTREE_USE_MEMORY_POOL 1
+#endif
 
 rbtree_node *rbtree_mini(rbtree *T, rbtree_node *x) {
 	while (x->left != T->nil) {
@@ -434,12 +436,65 @@ int main() {
 #endif
 
 kvs_rbtree_t global_rbtree;
+#ifndef KVS_RBTREE_USE_MEMORY_POOL
+#define KVS_RBTREE_USE_MEMORY_POOL 1
+#endif
+// 根据编译开关，选择节点从内存池还是通用分配器申请
+static rbtree_node *rbtree_node_alloc(kvs_rbtree_t *inst) {
+#if KVS_RBTREE_USE_MEMORY_POOL
+    return (rbtree_node *)memory_pool_alloc(&inst->node_pool);
+#else
+    (void)inst;
+    return (rbtree_node *)kvs_malloc(sizeof(rbtree_node));
+#endif
+}
+// 只释放 rbtree_node 本身，不处理 key/value
+static void rbtree_node_storage_free(kvs_rbtree_t *inst,
+                                     rbtree_node *node) {
+    if (inst == NULL || node == NULL) {
+        return;
+    }
+
+#if KVS_RBTREE_USE_MEMORY_POOL
+    memory_pool_free(&inst->node_pool, node);
+#else
+    kvs_free(node);
+#endif
+}
+//节点从内存池申请之后就不能再用kvs_free 必须还给原来的nodepool 为了避免 del destory各写一遍释放逻辑 所以在这直接写一个nodefree函数
+static void rbtree_node_free(kvs_rbtree_t *inst,rbtree_node *node){
+	if(inst==NULL||node==NULL) return;//大白话参数校验
+	kvs_free(node->key);
+	kvs_free(node->value);
+	rbtree_node_storage_free(inst, node);
+}
 
 
 int kvs_rbtree_create(kvs_rbtree_t *inst){
     if(inst==NULL) return -1;
+#if KVS_RBTREE_USE_MEMORY_POOL
+	if(memory_pool_init(&inst->node_pool,sizeof(rbtree_node),RBTREE_NODE_BLOCKS_PER_CHUNK)!=0){
+		return -1;
+	}
+#endif
     inst->nil = (rbtree_node*)kvs_malloc(sizeof(rbtree_node));
+	// nil 申请失败，需要清理已经初始化的 node_pool
+	if (inst->nil == NULL) {
+#if KVS_RBTREE_USE_MEMORY_POOL
+		memory_pool_destory(&inst->node_pool);
+#endif
+		return -1;
+	}
+
 	inst->nil->color = BLACK;
+	inst->nil->left = inst->nil;
+	inst->nil->right = inst->nil;
+	inst->nil->parent = inst->nil;
+	// nil 不保存业务数据
+	inst->nil->key = NULL;
+	inst->nil->value = NULL;
+
+	// 空树的 root 指向 nil
 	inst->root = inst->nil;
 
     return 0;
@@ -448,33 +503,43 @@ int kvs_rbtree_create(kvs_rbtree_t *inst){
 
 void kvs_rbtree_destory(kvs_rbtree_t *inst){
     if(inst==NULL) return;
-    rbtree_node *node = NULL;
-while(inst->root!=inst->nil){
-   rbtree_node *mini = rbtree_mini(inst,node);
-   rbtree_node *cur=rbtree_delete(inst,node);
-   kvs_free(cur);
-
-}
-    free(inst->nil);
-    return ;
+	while(inst->root!=inst->nil){
+		rbtree_node *mini = rbtree_mini(inst,inst->root);
+		rbtree_node *removed = rbtree_delete(inst, mini);
+		rbtree_node_free(inst,removed);
+	}
+	kvs_free(inst->nil);
+#if KVS_RBTREE_USE_MEMORY_POOL
+	memory_pool_destory(&inst->node_pool);
+#endif
+	inst->nil=NULL;
+	inst->root=NULL;
 }
 
 
 int kvs_rbtree_set(kvs_rbtree_t *inst, char *key,char *value){
     if(!inst||!key||!value) return -1;
-   rbtree_node *node = (rbtree_node*)kvs_malloc(sizeof(rbtree_node));
+	if (rbtree_search(inst, key) != inst->nil) {
+		return 1;  // 已存在
+    }
+	rbtree_node *node = rbtree_node_alloc(inst);
+	if(node==NULL)return -2;
+	node->key = kvs_malloc(strlen(key)+1);//key长度不固定 仍然使用kvs_malloc
+	if(!node->key){
+		rbtree_node_storage_free(inst, node);
+		return -2;
+	}
+	memcpy(node->key,key,strlen(key)+1);
 
-		node->key = kvs_malloc(strlen(key)+1);
-        if(!node->key) return -2;
-        memset(node->key,0,strlen(key)+1);
-        strcpy(node->key,key);
+	node->value =kvs_malloc(strlen(value)+1);
+	if (node->value == NULL) {
+    kvs_free(node->key);
+    rbtree_node_storage_free(inst, node);
+    return -2;
+	}
+	memcpy(node->value, value, strlen(value) + 1);
 
-		node->value =kvs_malloc(strlen(value)+1);
-        if(!node->value) return -2;
-        memset(node->value,0,strlen(value)+1);
-        strcpy(node->value,value);
-
-		rbtree_insert(inst, node); 
+	rbtree_insert(inst, node);
 
     return 0;
 
@@ -495,7 +560,7 @@ int kvs_rbtree_del(kvs_rbtree_t *inst,char *key){
         return 1;  // 不存在
     }//no exist
 		rbtree_node *cur = rbtree_delete(inst, node);
-		kvs_free(cur);
+		rbtree_node_free(inst,cur);
 
     return 0;
 }

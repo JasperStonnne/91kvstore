@@ -10,7 +10,7 @@
 #include<stdlib.h>
 #include<stddef.h>
 #include <assert.h>
-
+#include<memory_pool.h>
 
 #define NETWORK_REACTOR 0
 #define NETWORK_PROACTOR 1
@@ -93,6 +93,7 @@ typedef struct _rbtree_node {
 typedef struct _rbtree {
 	rbtree_node *root;
 	rbtree_node *nil;
+    memory_pool_t node_pool;
 } rbtree;
 
 
@@ -140,9 +141,10 @@ typedef struct hashnode_s {
 typedef struct hashtable_s {
 
 	hashnode_t **nodes; //* change **, 
-
 	int max_slots;
 	int count;
+
+    memory_pool_t node_pool;
 
 } hashtable_t;
 
@@ -157,6 +159,7 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
 int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
 int kvs_hash_foreach(kvs_hash_t *hash, kvs_visit_handler visitor,void *context);
+int kvs_hash_count(kvs_hash_t *hash);
 #endif
 
 #if ENABLE_SKIPLIST
@@ -171,6 +174,7 @@ typedef struct kvs_skiplist_node {
 typedef struct kvs_skiplist {
     int level;
     kvs_skiplist_node_t* header;
+    memory_pool_t node_pool;
 } kvs_skiplist_t;
 
 int  kvs_skiplist_create(kvs_skiplist_t *inst);

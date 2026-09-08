@@ -9,7 +9,10 @@
 
 #include "kvstore.h"
 
-
+#define HASH_NODE_BLOCKS_PER_CHUNK 1024
+#ifndef KVS_HASH_USE_MEMORY_POOL
+#define KVS_HASH_USE_MEMORY_POOL 1
+#endif
 // Key, Value --> 
 // Modify 
 
@@ -35,27 +38,46 @@ static int _hash(char *key, int size) {
 	return sum % size;
 
 }
+static hashnode_t *hash_node_alloc(kvs_hash_t *hash){
+	if (!hash) return NULL;
+#if KVS_HASH_USE_MEMORY_POOL
+	return (hashnode_t*)memory_pool_alloc(&hash->node_pool);
+#else
+	return (hashnode_t*)kvs_malloc(sizeof(hashnode_t));
+#endif
+}
+static void hash_storge_free(kvs_hash_t *hash,hashnode_t *node){
+	if(hash==NULL||node==NULL){
+		return;
+	}
+#if KVS_HASH_USE_MEMORY_POOL
+	memory_pool_free(&hash->node_pool,node);
+#else
+	kvs_free(node);
+#endif
+}
+hashnode_t *_create_node(kvs_hash_t *hash, char *key, char *value) {
 
-hashnode_t *_create_node(char *key, char *value) {
-
-	hashnode_t *node = (hashnode_t*)kvs_malloc(sizeof(hashnode_t));
-	if (!node) return NULL;
+	hashnode_t *node =hash_node_alloc(hash);//hash node的节点 申请现在走我们做的memory_pool
+	if (node==NULL) return NULL;
 	
 #if ENABLE_KEY_POINTER
 	char *kcopy = kvs_malloc(strlen(key) + 1);
-	if (kcopy == NULL) return NULL;
-	memset(kcopy, 0, strlen(key) + 1);
-	strncpy(kcopy, key, strlen(key));
+	if (kcopy == NULL){
+		hash_storge_free(hash,node);
+		return NULL;
+	}
+	memcpy(kcopy, key, strlen(key) + 1);
 
 	node->key = kcopy;
 
 	char *kvalue = kvs_malloc(strlen(value) + 1);
 	if (kvalue == NULL) { 
-		kvs_free(kvalue);
+		kvs_free(kcopy);
+		hash_storge_free(hash,node);
 		return NULL;
 	}
-	memset(kvalue, 0, strlen(value) + 1);
-	strncpy(kvalue, value, strlen(value));
+	memcpy(kvalue,value, strlen(value) + 1);
 
 	node->value = kvalue;
 	
@@ -67,12 +89,26 @@ hashnode_t *_create_node(char *key, char *value) {
 
 	return node;
 }
-
+static void _hash_node_free(kvs_hash_t *hash,hashnode_t *node){
+	if(hash==NULL||node==NULL){
+		return;
+	}
+#if ENABLE_KEY_POINTER
+	kvs_free(node->key);
+	kvs_free(node->value);
+#endif
+	hash_storge_free(hash,node);
+}
 
 //
 int kvs_hash_create(kvs_hash_t *hash) {
 
 	if (!hash) return -1;
+#if KVS_HASH_USE_MEMORY_POOL
+	if (memory_pool_init(&hash->node_pool,sizeof(hashnode_t),HASH_NODE_BLOCKS_PER_CHUNK) != 0) {
+	return -1;
+}
+#endif
 
 	hash->nodes = (hashnode_t**)kvs_malloc(sizeof(hashnode_t*) * MAX_TABLE_SIZE);
 	if (!hash->nodes) return -1;
@@ -94,17 +130,21 @@ void kvs_hash_destory(kvs_hash_t *hash) {
 
 		while (node != NULL) { // error
 
-			hashnode_t *tmp = node;
-			node = node->next;
-			hash->nodes[i] = node;
-			
-			kvs_free(tmp);
+			hashnode_t *next = node->next;
+			_hash_node_free(hash, node);
+			node = next;
 			
 		}
+		hash->nodes[i] = NULL;
 	}
 
 	kvs_free(hash->nodes);
-	
+	hash->nodes = NULL;
+#if KVS_HASH_USE_MEMORY_POOL
+	memory_pool_destory(&hash->node_pool);
+#endif
+	hash->max_slots = 0;
+	hash->count = 0;
 }
 
 // 5 + 2
@@ -126,10 +166,10 @@ int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
 	}
 #endif
 
-	hashnode_t *new_node = _create_node(key, value);
+	hashnode_t *new_node = _create_node(hash,key, value);
+	if(new_node == NULL) return -1;
 	new_node->next = hash->nodes[idx];
 	hash->nodes[idx] = new_node;
-	
 	hash->count ++;
 
 	return 0;
@@ -180,13 +220,12 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value) {
 	}
 
 	// node --> 
-	kvs_free(node->value);
+
 
 	char *kvalue = kvs_malloc(strlen(value) + 1);
 	if (kvalue == NULL) return -2;
-	memset(kvalue, 0, strlen(value) + 1);
-	strncpy(kvalue, value, strlen(value));
-
+	memcpy(kvalue, value, strlen(value) + 1);
+	kvs_free(node->value);
 	node->value = kvalue;
 	
 	return 0;
@@ -205,10 +244,8 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
 	if (head == NULL) return -1; // noexist
 	// head node
 	if (strcmp(head->key, key) == 0) {
-		hashnode_t *tmp = head->next;
-		hash->nodes[idx] = tmp;
-		
-		kvs_free(head);
+		hash->nodes[idx] = head->next;
+		_hash_node_free(hash, head);
 		hash->count --;
 		
 		return 0;
@@ -217,7 +254,6 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
 	hashnode_t *cur = head;
 	while (cur->next != NULL) {
 		if (strcmp(cur->next->key, key) == 0) break; // search node
-		
 		cur = cur->next;
 	}
 
@@ -225,14 +261,10 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
 		
 		return -1;
 	}
-
 	hashnode_t *tmp = cur->next;
 	cur->next = tmp->next;
-#if ENABLE_KEY_POINTER
-	kvs_free(tmp->key);
-	kvs_free(tmp->value);
-#endif
-	kvs_free(tmp);
+
+	_hash_node_free(hash, tmp);
 	
 	hash->count --;
 

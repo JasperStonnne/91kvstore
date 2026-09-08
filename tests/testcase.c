@@ -38,7 +38,7 @@ void testcase(int connfd,char *msg,char *pattern,char *casename){
     recv_msg(connfd,result,MAX_MSG_LENGTH);
 
     if(strcmp(result,pattern)==0){
-        printf("==>PASS-> %s\n",casename);
+        //printf("==>PASS-> %s\n",casename);
     }else{
         printf("==>FAILED-> %s,%s!=%s\n",casename,result,pattern); 
         exit(1);
@@ -179,22 +179,22 @@ void hash_testcase_10w(int connfd){
     struct timeval tv_begin;
     gettimeofday(&tv_begin, NULL);
     for(i=0;i<count;i++){
-    testcase(connfd,"HSET Dad Jasper","OK\r\n","HSET-Dad");
-    testcase(connfd,"HGET Dad","Jasper\r\n","HGET-Dad"); 
-    testcase(connfd,"HMOD Dad Sao","OK\r\n","HMOD-Dad");
-    testcase(connfd,"HGET Dad","Sao\r\n","HGET-Dad");
-    testcase(connfd,"HEXIST Dad","EXIST\r\n","HEXIST-Dad");
-    testcase(connfd,"HDEL Dad","OK\r\n","HDEL-Dad"); 
-    testcase(connfd,"HGET Dad","NO EXIST\r\n","HGET-Dad");
-    testcase(connfd,"HMOD Dad Jasper","NO EXIST\r\n","HMOD-Dad");
-    testcase(connfd,"HEXIST Dad","NO EXIST\r\n","HEXIST-Dad");      
+    testcase(connfd, "HSET Dad Jasper", "OK\r\n", "HSET-Dad");
+    testcase(connfd, "HDEL Dad", "OK\r\n", "HDEL-Dad");
 
 }
     struct timeval tv_end;
     gettimeofday(&tv_end, NULL);
     int time_used=TIME_SUB_MS(tv_end,tv_begin);//ms
-    printf("hash testcase --->time_used: %d,qps: %d",time_used,90000*1000/time_used);
-}
+    int total_requests = count * 2;
+    int qps = total_requests * 1000 / time_used;
+
+    printf("hash allocator benchmark ---> "
+        "requests: %d, time_used: %d ms, qps: %d\n",
+        total_requests,
+        time_used,
+        qps);
+    }
 void skiplist_testcase_10w(int connfd){
     int count =10000;
     int i=0;
