@@ -35,6 +35,11 @@ CPPFLAGS := \
 CFLAGS := -std=gnu11 -Wall -Wextra -g
 BENCH_CFLAGS := $(CFLAGS) -O2 -Werror
 
+ARRAY_USE_JEMALLOC ?= 0
+ARRAY_BENCH_DEFINE := $(if $(filter 1,$(ARRAY_USE_JEMALLOC)),-DKVS_BENCHMARK_JEMALLOC)
+ARRAY_BENCH_LIB := $(if $(filter 1,$(ARRAY_USE_JEMALLOC)),-ljemalloc)
+
+
 LDFLAGS := -L$(NTYCO_DIR)
 LDLIBS := -luring -lntyco -lpthread -ldl
 
@@ -64,6 +69,9 @@ OBJS := \
 	test-skiplist-memory-pool \
 	benchmark-skiplist \
 	benchmark-skiplist-memory \
+	test-array-memory \
+	benchmark-array \
+	benchmark-array-memory \
 	clean
 
 all: $(BIN_DIR)/kvstore
@@ -293,6 +301,36 @@ benchmark-skiplist-memory: | $(BIN_DIR)
 		$(ENGINE_DIR)/kvs_skiplist.c \
 		$(MEMORY_DIR)/memory_pool.c \
 		-o $(BIN_DIR)/benchmark_skiplist_memory
+
+test-array-memory: $(BIN_DIR)/test_array_memory
+	./$(BIN_DIR)/test_array_memory
+
+$(BIN_DIR)/test_array_memory: \
+	$(TEST_DIR)/test_array_memory.c \
+	$(ENGINE_DIR)/kvs_array.c \
+	$(INCLUDE_DIR)/kvstore.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		-fsanitize=address \
+		-fno-omit-frame-pointer \
+		$(TEST_DIR)/test_array_memory.c \
+		$(ENGINE_DIR)/kvs_array.c \
+		-o $@
+
+benchmark-array: | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
+		$(ARRAY_BENCH_DEFINE) \
+		$(TEST_DIR)/benchmark_array_allocator.c \
+		$(ENGINE_DIR)/kvs_array.c \
+		$(ARRAY_BENCH_LIB) \
+		-o $(BIN_DIR)/benchmark_array_allocator
+
+benchmark-array-memory: | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
+		$(ARRAY_BENCH_DEFINE) \
+		$(TEST_DIR)/benchmark_array_memory.c \
+		$(ENGINE_DIR)/kvs_array.c \
+		$(ARRAY_BENCH_LIB) \
+		-o $(BIN_DIR)/benchmark_array_memory
 
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
