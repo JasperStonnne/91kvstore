@@ -19,7 +19,6 @@
 #define NETWORK_SELECT NETWORK_NTYCO
 
 
-
 #define KVS_MAX_TOKENS 128
 #define ENABLE_ARRAY 1
 #define ENABLE_RBTREE 1
@@ -31,7 +30,7 @@
 
 
 
-typedef int (*msg_handler)(char *msg,int length,char *response);
+typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
 typedef int (*kvs_visit_handler)( const char *key,const char *value,void *context);
 
 extern int reactor_start(unsigned short port,msg_handler handler);

@@ -408,10 +408,11 @@ static int kvs_find_crlf(const char *msg,int length){
     return -1;
 }
 
-int kvs_batch_protocol(char *msg,int length,char *response,int response_capacity){
-    if(msg==NULL||length<=0||response==NULL||response_capacity<=0){
+int kvs_batch_protocol(char *msg,int length,char *response,int response_capacity,int *consumed_length){
+    if(msg==NULL||length<=0||response==NULL||response_capacity<=0||consumed_length==NULL){
         return -1;
     }
+    *consumed_length=0;
     int request_offset=0;//处理到请求的什么位置
     int response_offset=0;//当前写入了多少响应
     while(request_offset<length){
@@ -435,12 +436,14 @@ int kvs_batch_protocol(char *msg,int length,char *response,int response_capacity
         response_offset+=response_length;
         request_offset+=command_end+2;
     }
+    *consumed_length = request_offset;
     return response_offset;
     
 }
 
-static int kvs_network_protocol(char *msg,int length,char *response){
-    return kvs_batch_protocol(msg,length,response,1024);
+static int kvs_network_protocol(char *msg,int length,char *response,int response_capacity,int *consumed_length){
+
+    return kvs_batch_protocol(msg,length,response,response_capacity,consumed_length);
 }
 
 int init_kvengine(void){
