@@ -15,26 +15,32 @@
 #include "server.h"
 
 
-#define CONNECTION_SIZE			1048576 // 1024 * 1024
-
 #define MAX_PORTS			20
 
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
 
 #if ENABLE_KVSTORE
 
-typedef int (*msg_handler)(char *msg,int length,char *response);
+typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
 static msg_handler kvs_handler;
 
 int kvs_request(struct conn *c){
-
-    c->wlength=kvs_handler(c->rbuffer,c->rlength,c->wbuffer);
-
-
+	int consumed_length=0;
+	c->output.offset=0;
+    c->output.length=kvs_handler(c->input.data,c->input.length,c->output.data,BUFFER_LENGTH,&consumed_length);
+	if(c->output.length<0){
+		return -1;
+	}
+	if(kvs_input_buffer_consume(&c->input,consumed_length)<0){
+		c->output.length=0;
+		return -1;
+	}
+	return 0;
 }
 
  int kvs_response(struct conn *c){
-
+	(void)c;
+	return 0;
 
 }
 
@@ -64,22 +70,13 @@ struct conn conn_list[CONNECTION_SIZE] = {0};
 
 int set_event(int fd, int event, int flag) {
 
-	if (flag) {  // non-zero add
-
-		struct epoll_event ev;
-		ev.events = event;
-		ev.data.fd = fd;
-		epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-
-	} else {  // zero mod
-
-		struct epoll_event ev;
-		ev.events = event;
-		ev.data.fd = fd;
-		epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-		
+	struct epoll_event ev;
+	ev.events = event;
+	ev.data.fd=fd;
+	if (flag){
+		return epoll_ctl(epfd,EPOLL_CTL_ADD,fd,&ev);
 	}
-	
+	return epoll_ctl (epfd,EPOLL_CTL_MOD,fd,&ev);
 
 }
 
@@ -92,13 +89,15 @@ int event_register(int fd, int event) {
 	conn_list[fd].r_action.recv_callback = recv_cb;
 	conn_list[fd].send_callback = send_cb;
 
-	memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH);
-	conn_list[fd].rlength = 0;
+	memset(conn_list[fd].input.data, 0, BUFFER_LENGTH);
+	conn_list[fd].input.length = 0;
 
-	memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
-	conn_list[fd].wlength = 0;
+	memset(conn_list[fd].output.data, 0, BUFFER_LENGTH);
+	conn_list[fd].output.length = 0;
+	conn_list[fd].output.offset=0;
 
 	set_event(fd, event, 1);
+	return 0;
 }
 
 
@@ -114,7 +113,7 @@ int accept_cb(int fd) {
 		printf("accept errno: %d --> %s\n", errno, strerror(errno));
 		return -1;
 	}
-	
+
 	event_register(clientfd, EPOLLIN);  // | EPOLLET
 
 	if ((clientfd % 1000) == 0) {
@@ -124,7 +123,7 @@ int accept_cb(int fd) {
 
 		int time_used = TIME_SUB_MS(current, begin);
 		memcpy(&begin, &current, sizeof(struct timeval));
-		
+
 
 		printf("accept finshed: %d, time_used: %d\n", clientfd, time_used);
 
@@ -136,8 +135,14 @@ int accept_cb(int fd) {
 
 int recv_cb(int fd) {
 
-	memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH );
-	int count = recv(fd, conn_list[fd].rbuffer, BUFFER_LENGTH, 0);
+	int available = BUFFER_LENGTH-conn_list[fd].input.length;
+	if(available<=0){
+		fprintf(stderr,"request buffer full: %d\n",fd);
+		close(fd);
+		epoll_ctl(epfd,EPOLL_CTL_DEL,fd,NULL);
+		return 0;
+	}
+	int count = recv(fd,conn_list[fd].input.data+conn_list[fd].input.length,available,0);
 	if (count == 0) { // disconnect
 		printf("client disconnect: %d\n", fd);
 		close(fd);
@@ -145,7 +150,7 @@ int recv_cb(int fd) {
 		epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL); // unfinished
 
 		return 0;
-	} else if (count < 0) { // 
+	} else if (count < 0) { //
 
 		printf("count: %d, errno: %d, %s\n", count, errno, strerror(errno));
 		close(fd);
@@ -154,18 +159,11 @@ int recv_cb(int fd) {
 		return 0;
 	}
 
-	
-	conn_list[fd].rlength = count;
-	//printf("RECV: %s\n", conn_list[fd].rbuffer);
 
-#if 0 // echo
+	conn_list[fd].input.length += count;
+	//printf("RECV: %s\n", conn_list[fd].input.data);
 
-	conn_list[fd].wlength = conn_list[fd].rlength;
-	memcpy(conn_list[fd].wbuffer, conn_list[fd].rbuffer, conn_list[fd].wlength);
-
-	printf("[%d]RECV: %s\n", conn_list[fd].rlength, conn_list[fd].rbuffer);
-
-#elif ENABLE_HTTP
+#if ENABLE_HTTP
 
 	http_request(&conn_list[fd]);
 
@@ -174,9 +172,17 @@ int recv_cb(int fd) {
 	ws_request(&conn_list[fd]);
 #elif ENABLE_KVSTORE
 
-	kvs_request(&conn_list[fd]);
+	if (kvs_request(&conn_list[fd]) < 0) {
+    close(fd);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    return -1;
+}
 
-	
+	if(conn_list[fd].output.length==0){
+		set_event(fd,EPOLLIN,0);
+		return count;
+	}
+
 #endif
 
 
@@ -202,31 +208,33 @@ int send_cb(int fd) {
 #endif
 	int count = 0;
 
-#if 0
-	if (conn_list[fd].status == 1) {
-		//printf("SEND: %s\n", conn_list[fd].wbuffer);
-		count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
-		set_event(fd, EPOLLOUT, 0);
-	} else if (conn_list[fd].status == 2) {
-		set_event(fd, EPOLLOUT, 0);
-	} else if (conn_list[fd].status == 0) {
 
-		if (conn_list[fd].wlength != 0) {
-			count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
+
+	int remaining=conn_list[fd].output.length-conn_list[fd].output.offset;
+	if(remaining>0){
+		count=send(fd,conn_list[fd].output.data+conn_list[fd].output.offset,remaining,0);
+	}
+	if(count<0){
+		if(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR){
+			set_event(fd,EPOLLOUT,0);
+			return 0;
 		}
-		
-		set_event(fd, EPOLLIN, 0);
+		epoll_ctl(epfd,EPOLL_CTL_DEL,fd,NULL);
+		close(fd);
+		conn_list[fd].output.length=0;
+		conn_list[fd].output.offset=0;
+		return -1;
 	}
-#else
-
-	if (conn_list[fd].wlength != 0) {
-		count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
+	if(count>0){
+		conn_list[fd].output.offset+=count;//累加本次实际发送的字节数
+		 if(conn_list[fd].output.offset<conn_list[fd].output.length){
+			set_event(fd,EPOLLOUT,0);
+			return count;
+		 }
+		 conn_list[fd].output.length =0;
+		 conn_list[fd].output.offset=0;
 	}
-	
 	set_event(fd, EPOLLIN, 0);
-
-#endif
-	//set_event(fd, EPOLLOUT, 0);
 
 	return count;
 }
@@ -240,14 +248,14 @@ int r_init_server(unsigned short port) {
 	struct sockaddr_in servaddr;
 	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(INADDR_ANY); // 0.0.0.0
-	servaddr.sin_port = htons(port); // 0-1023, 
+	servaddr.sin_port = htons(port); // 0-1023,
 
 	if (-1 == bind(sockfd, (struct sockaddr*)&servaddr, sizeof(struct sockaddr))) {
 		printf("bind failed: %s\n", strerror(errno));
 	}
 
 	listen(sockfd, 10);
-	//printf("listen finshed: %d\n", sockfd); // 3 
+	//printf("listen finshed: %d\n", sockfd); // 3
 
 	return sockfd;
 
@@ -264,12 +272,12 @@ int reactor_start(unsigned short port,msg_handler handler){
 	int i = 0;
 
 	for (i = 0;i < MAX_PORTS;i ++) {
-		
+
 		int sockfd = r_init_server(port + i);
-		
+
 		conn_list[sockfd].fd = sockfd;
 		conn_list[sockfd].r_action.recv_callback = accept_cb;
-		
+
 		set_event(sockfd, EPOLLIN, 1);
 	}
 
@@ -292,10 +300,10 @@ int reactor_start(unsigned short port,msg_handler handler){
 				conn_list[connfd].send_callback(connfd);
 			}
 
-#else 
+#else
 			if (events[i].events & EPOLLIN) {
 				conn_list[connfd].r_action.recv_callback(connfd);
-			} 
+			}
 
 			if (events[i].events & EPOLLOUT) {
 				conn_list[connfd].send_callback(connfd);
@@ -304,7 +312,7 @@ int reactor_start(unsigned short port,msg_handler handler){
 		}
 
 	}
-	
+
 
 }
 

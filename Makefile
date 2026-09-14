@@ -54,7 +54,9 @@ OBJS := \
 	$(BUILD_DIR)/kvs_skiplist.o \
 	$(BUILD_DIR)/aof.o \
 	$(BUILD_DIR)/snapshot.o \
-	$(BUILD_DIR)/memory_pool.o
+	$(BUILD_DIR)/memory_pool.o \
+	$(BUILD_DIR)/buffer.o
+
 
 .PHONY: \
 	all \
@@ -142,6 +144,11 @@ $(BUILD_DIR)/snapshot.o: \
 $(BUILD_DIR)/memory_pool.o: \
 	$(MEMORY_DIR)/memory_pool.c \
 	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/buffer.o: \
+	$(NETWORK_DIR)/buffer.c \
+	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BIN_DIR)/testcase: \
