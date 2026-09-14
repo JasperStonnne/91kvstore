@@ -7,6 +7,7 @@
 #include<string.h>
 #include<unistd.h>
 #include <stdlib.h>
+#include<errno.h>
 #include "server.h"
 
 #define EVENT_ACCEPT 0
@@ -34,7 +35,9 @@ struct conn_info {
 int set_event_send(struct io_uring *ring,int sockfd,void *buf,size_t len,int flags){
 
     struct io_uring_sqe *sqe =io_uring_get_sqe(ring);//把队列理解成数组 就是一个头 返回的时候是一个mmap 在iouring setup的时候 在内核里面已经分配好了一部分空间 用户空间可以直接用 从而少了一步从用户空间copy到内核空间
-
+    if(sqe==NULL){
+        return -1;
+    }
     struct conn_info accept_info={
         .fd=sockfd,
         .event=EVENT_WRITE,
@@ -43,14 +46,15 @@ int set_event_send(struct io_uring *ring,int sockfd,void *buf,size_t len,int fla
     io_uring_prep_send(sqe,sockfd,buf,len,flags);//提交一个请求 准备prepare 往submitqueue里提交节点 accept三个参数 这里是五个参数 底层调用register
     memcpy(&sqe->user_data,&accept_info,sizeof(struct conn_info));
 
-
-
+    return 0;
 }
 
 int set_event_recv(struct io_uring *ring,int sockfd,void *buf,size_t len,int flags){
 
     struct io_uring_sqe *sqe =io_uring_get_sqe(ring);//把队列理解成数组 就是一个头 返回的时候是一个mmap 在iouring setup的时候 在内核里面已经分配好了一部分空间 用户空间可以直接用 从而少了一步从用户空间copy到内核空间
-
+    if (sqe==NULL){
+        return -1;
+    }
     struct conn_info accept_info={
         .fd=sockfd,
         .event=EVENT_READ,
@@ -60,14 +64,16 @@ int set_event_recv(struct io_uring *ring,int sockfd,void *buf,size_t len,int fla
     memcpy(&sqe->user_data,&accept_info,sizeof(struct conn_info));
 
 
-
+    return 0;
 }
 
 
 int set_event_accept(struct io_uring *ring,int sockfd,struct sockaddr *addr, socklen_t *addrlen,int flags){
 
     struct io_uring_sqe *sqe =io_uring_get_sqe(ring);//把队列理解成数组 就是一个头 返回的时候是一个mmap 在iouring setup的时候 在内核里面已经分配好了一部分空间 用户空间可以直接用 从而少了一步从用户空间copy到内核空间
-
+    if(sqe==NULL){
+        return -1;
+    }
     struct conn_info accept_info={
         .fd=sockfd,
         .event=EVENT_ACCEPT,
@@ -77,7 +83,7 @@ int set_event_accept(struct io_uring *ring,int sockfd,struct sockaddr *addr, soc
     memcpy(&sqe->user_data,&accept_info,sizeof(struct conn_info));
 
 
-
+    return 0;
 }
 
 
@@ -205,8 +211,9 @@ int proactor_start(unsigned short port,msg_handler handler){
                     //int kvs_protocol(char *msg,int length,char *response);
                     connection->input.length+=ret;
                     int consumed_length = 0;
-                    connection->wlength=kvs_handler(connection->input.data,connection->input.length,connection->wbuffer,BUFFER_LENGTH,&consumed_length);
-                    if(connection->wlength<0){
+                    connection->output.offset=0;
+                    connection->output.length=kvs_handler(connection->input.data,connection->input.length,connection->output.data,BUFFER_LENGTH,&consumed_length);
+                    if(connection->output.length<0){
                         close(result.fd);
                         free(connection);
                         proactor_connections[result.fd]=NULL;
@@ -218,7 +225,7 @@ int proactor_start(unsigned short port,msg_handler handler){
                 proactor_connections[result.fd] = NULL; // 清除 fd 映射
                 continue;                               // 不再处理这个连接
             }
-            if(connection->wlength==0){
+            if(connection->output.length==0){
                 int available=BUFFER_LENGTH-connection->input.length;//计算剩下的空间
                 if(available<=0){
                     close(result.fd);
@@ -232,7 +239,11 @@ int proactor_start(unsigned short port,msg_handler handler){
                 continue;
 
             }
-                set_event_send(&ring,result.fd,connection->wbuffer,connection->wlength,0);
+                if(set_event_send(&ring,result.fd,connection->output.data,connection->output.length,0)<0){
+                    close(result.fd);
+                    free(connection);
+                    proactor_connections[result.fd]=NULL;
+                }
 
                 }
 
@@ -246,12 +257,35 @@ int proactor_start(unsigned short port,msg_handler handler){
                 if(connection==NULL){
                     continue;
                 }
+                if(ret==-EAGAIN||ret==-EINTR){
+                    int remaining=connection->output.length-connection->output.offset;
+
+                    if(set_event_send(&ring,result.fd,connection->output.data+connection->output.offset,remaining,0)<0){
+                    close(result.fd);
+                    free(connection);
+                    proactor_connections[result.fd]=NULL;
+                    }
+                }
                 if(ret<=0){
                     close(result.fd);
                     free(connection);
                     proactor_connections[result.fd]=NULL;
                     continue;
                 }
+                connection->output.offset+=ret;
+                if(connection->output.offset<connection->output.length){
+                    int remaining=connection->output.length-connection->output.offset;
+
+                    if(set_event_send(&ring,result.fd,connection->output.data+connection->output.offset,remaining,0)<0){
+                        close(result.fd);
+                        free(connection);
+                        proactor_connections[result.fd]=NULL;
+                    }
+                    continue;
+                }
+                connection->output.length=0;
+                connection->output.offset=0;
+
                 int available=BUFFER_LENGTH-connection->input.length;
                 if(available<=0){
                     close(result.fd);

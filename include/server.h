@@ -19,14 +19,19 @@ typedef struct kvs_input_buffer{
 }kvs_input_buffer_t;
 int kvs_input_buffer_consume(kvs_input_buffer_t *buffer,int consumed_length);
 
+typedef struct kvs_output_buffer{
+	char data[BUFFER_LENGTH];
+	int length;
+	int offset;
+}kvs_output_buffer_t;
+
 /*链接状态*/
 struct conn {
 	int fd;
 
 	kvs_input_buffer_t input;
 
-	char wbuffer[BUFFER_LENGTH];
-	int wlength;
+	kvs_output_buffer_t output;
 
 	RCALLBACK send_callback;
 

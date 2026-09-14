@@ -26,19 +26,21 @@ static msg_handler kvs_handler;
 
 int kvs_request(struct conn *c){
 	int consumed_length=0;
-    c->wlength=kvs_handler(c->input.data,c->input.length,c->wbuffer,BUFFER_LENGTH,&consumed_length);
-	if(c->wlength<0){
+	c->output.offset=0;
+    c->output.length=kvs_handler(c->input.data,c->input.length,c->output.data,BUFFER_LENGTH,&consumed_length);
+	if(c->output.length<0){
 		return -1;
 	}
 	if(kvs_input_buffer_consume(&c->input,consumed_length)<0){
-		c->wlength=0;
+		c->output.length=0;
 		return -1;
 	}
 	return 0;
 }
 
  int kvs_response(struct conn *c){
-
+	(void)c;
+	return 0;
 
 }
 
@@ -68,22 +70,13 @@ struct conn conn_list[CONNECTION_SIZE] = {0};
 
 int set_event(int fd, int event, int flag) {
 
-	if (flag) {  // non-zero add
-
-		struct epoll_event ev;
-		ev.events = event;
-		ev.data.fd = fd;
-		epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-
-	} else {  // zero mod
-
-		struct epoll_event ev;
-		ev.events = event;
-		ev.data.fd = fd;
-		epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-
+	struct epoll_event ev;
+	ev.events = event;
+	ev.data.fd=fd;
+	if (flag){
+		return epoll_ctl(epfd,EPOLL_CTL_ADD,fd,&ev);
 	}
-
+	return epoll_ctl (epfd,EPOLL_CTL_MOD,fd,&ev);
 
 }
 
@@ -99,10 +92,12 @@ int event_register(int fd, int event) {
 	memset(conn_list[fd].input.data, 0, BUFFER_LENGTH);
 	conn_list[fd].input.length = 0;
 
-	memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
-	conn_list[fd].wlength = 0;
+	memset(conn_list[fd].output.data, 0, BUFFER_LENGTH);
+	conn_list[fd].output.length = 0;
+	conn_list[fd].output.offset=0;
 
 	set_event(fd, event, 1);
+	return 0;
 }
 
 
@@ -168,14 +163,7 @@ int recv_cb(int fd) {
 	conn_list[fd].input.length += count;
 	//printf("RECV: %s\n", conn_list[fd].input.data);
 
-#if 0 // echo
-
-	conn_list[fd].wlength = conn_list[fd].input.length;
-	memcpy(conn_list[fd].wbuffer, conn_list[fd].input.data, conn_list[fd].wlength);
-
-	printf("[%d]RECV: %s\n", conn_list[fd].input.length, conn_list[fd].input.data);
-
-#elif ENABLE_HTTP
+#if ENABLE_HTTP
 
 	http_request(&conn_list[fd]);
 
@@ -190,7 +178,7 @@ int recv_cb(int fd) {
     return -1;
 }
 
-	if(conn_list[fd].wlength==0){
+	if(conn_list[fd].output.length==0){
 		set_event(fd,EPOLLIN,0);
 		return count;
 	}
@@ -220,31 +208,33 @@ int send_cb(int fd) {
 #endif
 	int count = 0;
 
-#if 0
-	if (conn_list[fd].status == 1) {
-		//printf("SEND: %s\n", conn_list[fd].wbuffer);
-		count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
-		set_event(fd, EPOLLOUT, 0);
-	} else if (conn_list[fd].status == 2) {
-		set_event(fd, EPOLLOUT, 0);
-	} else if (conn_list[fd].status == 0) {
 
-		if (conn_list[fd].wlength != 0) {
-			count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
+
+	int remaining=conn_list[fd].output.length-conn_list[fd].output.offset;
+	if(remaining>0){
+		count=send(fd,conn_list[fd].output.data+conn_list[fd].output.offset,remaining,0);
+	}
+	if(count<0){
+		if(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR){
+			set_event(fd,EPOLLOUT,0);
+			return 0;
 		}
-
-		set_event(fd, EPOLLIN, 0);
+		epoll_ctl(epfd,EPOLL_CTL_DEL,fd,NULL);
+		close(fd);
+		conn_list[fd].output.length=0;
+		conn_list[fd].output.offset=0;
+		return -1;
 	}
-#else
-
-	if (conn_list[fd].wlength != 0) {
-		count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
+	if(count>0){
+		conn_list[fd].output.offset+=count;//累加本次实际发送的字节数
+		 if(conn_list[fd].output.offset<conn_list[fd].output.length){
+			set_event(fd,EPOLLOUT,0);
+			return count;
+		 }
+		 conn_list[fd].output.length =0;
+		 conn_list[fd].output.offset=0;
 	}
-
 	set_event(fd, EPOLLIN, 0);
-
-#endif
-	//set_event(fd, EPOLLOUT, 0);
 
 	return count;
 }
