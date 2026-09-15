@@ -91,7 +91,8 @@ $(BIN_DIR)/kvstore: $(OBJS) $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
 
 $(BUILD_DIR)/kvstore.o: \
 	$(SRC_DIR)/kvstore.c \
-	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/replication.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/reactor.o: \

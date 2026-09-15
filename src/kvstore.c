@@ -2,7 +2,8 @@
 
 #include"kvstore.h"
 #include "persistence.h"
-
+#include "replication.h"
+#include<errno.h>
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
 #endif
@@ -492,11 +493,80 @@ void dest_kvengine(void){
 }
 
 
+static int kvs_parse_port(const char *text,unsigned short *port){
+    if(text==NULL||port==NULL){
+        return -1;
+    }
+    errno=0;
+    char *end =NULL;//字符串解析结束的位置
+    long value =strtol(text,&end,10);//按十进制 把字符转化为long
+    if(errno!=0||end==text||*end!='\0'||value<1||value>65535){
+        return -1;
+    }
+    *port=(unsigned short)value;
+    return 0;
+}
 
 int main(int argc,char *argv[]){
-    if(argc!=2) return -1;
+    kvs_server_config_t config={
+        .role=KVS_ROLE_STANDALONE,
+        .service_port=0,
+        .replication_port=0,
+        .primary_host =NULL
+    };
+    if(argc==2){
 
-    int port =atoi(argv[1]);
+        if(kvs_parse_port(argv[1],&config.service_port)<0){
+            fprintf(stderr,"invalid service port: %s\n",argv[1]);
+            return -1;
+        }
+    }else if(argc==4 &&strcmp(argv[1],"primary")==0){
+        config.role=KVS_ROLE_PRIMARY;
+
+        if(kvs_parse_port(argv[2],&config.service_port)<0){
+            fprintf(stderr,"invalid service port:%s\n",argv[2]);
+            return -1;
+        }
+        if(kvs_parse_port(argv[3],&config.replication_port)<0){
+            fprintf(stderr,"invalid replication port:%s\n",argv[3]);
+            return -1;
+        }
+        if(config.service_port==config.replication_port){
+            fprintf(stderr,"service port and replication port must differ\n");
+            return -1;
+        }
+
+    }else if(argc==5&&strcmp(argv[1],"replica")==0){
+        config.role=KVS_ROLE_REPLICA;
+
+        if(kvs_parse_port(argv[2],&config.service_port)<0){
+            fprintf(stderr,"invalid service port:%s\n",argv[2]);
+            return -1;
+        }
+        if(argv[3][0]=='\0'){
+            fprintf(stderr,"primary host cannot be empty\n");
+            return -1;
+        }
+        config.primary_host =argv[3];
+        if(kvs_parse_port(argv[4],&config.replication_port)<0){
+            fprintf(stderr,"invalid replication port:%s\n",argv[4]);
+            return -1;
+        }
+
+    }else{
+        fprintf(stderr,
+                "usage:\n"
+                "  %s <service-port>\n"
+                "  %s primary <service-port> <replication-port>\n"
+                "  %s replica <service-port> <primary-host> <replication-port>\n",
+                argv[0],
+                argv[0],
+                argv[0]);
+        return -1;
+
+    }
+
+
     init_kvengine();
     aof_replaying =1;
     long long offset=kvs_snapshot_load("snapshot.db",kvs_protocol);
@@ -517,11 +587,11 @@ int main(int argc,char *argv[]){
         return -1;
 }
 #if (NETWORK_SELECT==NETWORK_REACTOR)
-    reactor_start(port,kvs_network_protocol);
+    reactor_start(config.service_port,kvs_network_protocol);
 #elif(NETWORK_SELECT==NETWORK_NTYCO)
-    ntyco_start(port,kvs_network_protocol);
+    ntyco_start(config.service_port,kvs_network_protocol);
 #elif(NETWORK_SELECT==NETWORK_PROACTOR)
-    proactor_start(port,kvs_network_protocol);
+    proactor_start(config.service_port,kvs_network_protocol);
 #endif
 
     dest_kvengine();
