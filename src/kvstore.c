@@ -71,7 +71,6 @@ const char *response[]={
 
 
 };
-static int aof_replaying = 0;
 static int kvs_is_write_command(int cmd){
     if(cmd<KVS_CMD_START||cmd>=KVS_CMD_COUNT){
         return 0;
@@ -114,7 +113,7 @@ int kvs_split_token(char *msg,char*tokens[]){
 //tokens[0]:SET
 //tokens[1]:Key
 //tokens[2]:Value
-int kvs_filter_protocol(char **tokens,int count,char *response){
+int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_source_t source){
 
     if(tokens[0]==NULL||count==0||response==NULL)return -1;
 
@@ -335,7 +334,7 @@ int kvs_filter_protocol(char **tokens,int count,char *response){
     default:
         assert(0);
     }
-    if(!aof_replaying&&ret==0&&kvs_is_write_command(cmd)){
+    if(ret==0&&kvs_is_write_command(cmd)&&source!=KVS_COMMAND_SOURCE_RECOVERY){
         int aof_ret=kvs_aof_append(tokens,count);
         if(aof_ret<0){
             fprintf(stderr,"failed to append AOF\n");
@@ -370,7 +369,7 @@ response:need to send
 
 */
 
-int kvs_protocol(char *msg,int length,char *response){
+static int kvs_execute_command(char *msg,int length,char *response,kvs_command_source_t source){
 
 //SET Key Value
 //GET Key
@@ -394,9 +393,16 @@ int kvs_protocol(char *msg,int length,char *response){
         return sprintf(response, "OK\r\n");
     }
     //memcpy(response,msg,length);
-    return kvs_filter_protocol(tokens,count,response);
+    return kvs_filter_protocol(tokens,count,response,source);
 }
-
+//适配三参数客户端接口 并且补充CLIENT 命令来源（适配起函数
+static int kvs_client_protocol(char *msg,int length,char *response){
+    return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_CLIENT);
+}
+// 适配三参数恢复接口，并补充 RECOVERY 命令来源
+static int kvs_recovery_protocol(char *msg,int length,char *response){
+    return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_RECOVERY);
+}
 static int kvs_find_crlf(const char *msg,int length){
     if(msg==NULL||length<2){
         return -1;
@@ -430,7 +436,7 @@ int kvs_batch_protocol(char *msg,int length,char *response,int response_capacity
         if (response_offset >= response_capacity) {
             return -1;
         }
-        int response_length=kvs_protocol(command_start,command_end,response+response_offset);
+        int response_length=kvs_client_protocol(command_start,command_end,response+response_offset);
         if (response_length < 0 ||response_length > response_capacity - response_offset) {
             return -1;
         }
@@ -568,15 +574,12 @@ int main(int argc,char *argv[]){
 
 
     init_kvengine();
-    aof_replaying =1;
-    long long offset=kvs_snapshot_load("snapshot.db",kvs_protocol);
+    long long offset=kvs_snapshot_load("snapshot.db",kvs_recovery_protocol);
     if(offset<0){
-        aof_replaying=-1;
         fprintf(stderr,"failed to load snapshot\n");
         return -1;
     }
-    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_protocol);
-    aof_replaying=0;
+    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_recovery_protocol);
     if(replay_ret<0){
         fprintf(stderr, "failed to replay AOF\n");
         return -1;

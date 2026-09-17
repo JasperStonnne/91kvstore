@@ -29,6 +29,12 @@
 
 
 
+typedef enum{
+    KVS_COMMAND_SOURCE_CLIENT = 0,//普通客户端发送命令
+    KVS_COMMAND_SOURCE_RECOVERY,//snapshot 或是 aof恢复 命令
+    KVS_COMMAND_SOURCE_REPLICATION //primary 同步给 replica的命令
+
+} kvs_command_source_t;
 
 typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
 typedef int (*kvs_visit_handler)( const char *key,const char *value,void *context);

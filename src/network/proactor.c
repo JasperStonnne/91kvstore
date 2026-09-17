@@ -14,7 +14,6 @@
 #define EVENT_READ 1
 #define EVENT_WRITE 2
 
-extern int kvs_protocol(char *msg,int length,char *response);
 typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
 static msg_handler kvs_handler;
 static struct conn
@@ -208,7 +207,6 @@ int proactor_start(unsigned short port,msg_handler handler){
 
                 }else if(ret>0){
                     //printf("set_event_recv ret: %d,%s\n",ret,buffer);
-                    //int kvs_protocol(char *msg,int length,char *response);
                     connection->input.length+=ret;
                     int consumed_length = 0;
                     connection->output.offset=0;
