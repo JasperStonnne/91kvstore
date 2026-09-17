@@ -71,6 +71,9 @@ const char *response[]={
 
 
 };
+
+static kvs_role_t kvs_server_role = KVS_ROLE_STANDALONE;
+
 static int kvs_is_write_command(int cmd){
     if(cmd<KVS_CMD_START||cmd>=KVS_CMD_COUNT){
         return 0;
@@ -123,6 +126,11 @@ int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_sourc
             break;
         }
     }
+
+    if(kvs_server_role==KVS_ROLE_REPLICA&&source==KVS_COMMAND_SOURCE_CLIENT&&kvs_is_write_command(cmd)){
+        return sprintf(response,"READONLY replica does not accept client writes\r\n");
+    }
+
     int length=0;
     int ret=0;
     char *key=tokens[1];
@@ -572,7 +580,7 @@ int main(int argc,char *argv[]){
 
     }
 
-
+    kvs_server_role = config.role;
     init_kvengine();
     long long offset=kvs_snapshot_load("snapshot.db",kvs_recovery_protocol);
     if(offset<0){
