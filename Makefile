@@ -92,7 +92,8 @@ $(BIN_DIR)/kvstore: $(OBJS) $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
 $(BUILD_DIR)/kvstore.o: \
 	$(SRC_DIR)/kvstore.c \
 	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/replication.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/replication.h \
+	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/reactor.o: \
@@ -106,7 +107,9 @@ $(BUILD_DIR)/proactor.o: \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ntyco.o: \
-	$(NETWORK_DIR)/ntyco.c | $(BUILD_DIR)
+	$(NETWORK_DIR)/ntyco.c \
+	$(INCLUDE_DIR)/server.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kvs_array.o: \

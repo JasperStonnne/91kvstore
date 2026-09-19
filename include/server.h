@@ -2,9 +2,27 @@
 //server.h
 #ifndef __SERVER_H__
 #define __SERVER_H__
-
+#include <stddef.h>
 #define BUFFER_LENGTH		1024
 #define CONNECTION_SIZE (1024*1024)//添加最大链接数量
+
+typedef int (*msg_handler)(
+	char *msg,
+	int length,
+	char *response,
+	int response_capacity,
+	int *consumed_length
+);//通用消息处理函数类型，网络层收到数据后调用
+
+typedef struct {//通用监听器配置，一个监听端口绑定一个消息处理函数
+	unsigned short port;
+	msg_handler handler;
+}kvs_listener_config_t;
+
+int reactor_start(unsigned short port,msg_handler handler);
+int ntyco_start(unsigned short port,msg_handler handler);
+int ntyco_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
+int proactor_start(unsigned short port,msg_handler handler);
 
 
 #define ENABLE_HTTP 0

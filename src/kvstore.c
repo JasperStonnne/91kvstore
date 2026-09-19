@@ -3,6 +3,7 @@
 #include"kvstore.h"
 #include "persistence.h"
 #include "replication.h"
+#include "server.h"
 #include<errno.h>
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
@@ -597,13 +598,22 @@ int main(int argc,char *argv[]){
         fprintf(stderr, "failed to open AOF\n");
         return -1;
 }
+
+int network_ret=-1;
+
 #if (NETWORK_SELECT==NETWORK_REACTOR)
-    reactor_start(config.service_port,kvs_network_protocol);
+    network_ret=reactor_start(config.service_port,kvs_network_protocol);
 #elif(NETWORK_SELECT==NETWORK_NTYCO)
-    ntyco_start(config.service_port,kvs_network_protocol);
+    network_ret=ntyco_start(config.service_port,kvs_network_protocol);
 #elif(NETWORK_SELECT==NETWORK_PROACTOR)
-    proactor_start(config.service_port,kvs_network_protocol);
+    network_ret=proactor_start(config.service_port,kvs_network_protocol);
 #endif
+
+    if(network_ret<0){
+        fprintf(stderr,"failed to start network service\n");
+        dest_kvengine();
+        return -1;
+    }
 
     dest_kvengine();
 

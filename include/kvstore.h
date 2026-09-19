@@ -36,13 +36,8 @@ typedef enum{
 
 } kvs_command_source_t;
 
-typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
+
 typedef int (*kvs_visit_handler)( const char *key,const char *value,void *context);
-
-extern int reactor_start(unsigned short port,msg_handler handler);
-extern int ntyco_start(unsigned short port,msg_handler handler);
-extern int proactor_start(unsigned short port,msg_handler handler);
-
 
 
 #if ENABLE_ARRAY

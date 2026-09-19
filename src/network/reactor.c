@@ -21,7 +21,6 @@
 
 #if ENABLE_KVSTORE
 
-typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
 static msg_handler kvs_handler;
 
 int kvs_request(struct conn *c){

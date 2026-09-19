@@ -8,7 +8,7 @@
 #include <arpa/inet.h>
 #include<errno.h>
 #define NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK 64
-typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
+#define NTYCO_MAX_LISTENER_COUNT 2
 typedef struct {
 	unsigned short port;
 	msg_handler handler;
@@ -20,6 +20,34 @@ typedef struct {
 	msg_handler handler;
 	memory_pool_t *pool;
 } ntyco_connection_context_t;
+static int ntyco_listener_context_init(
+        ntyco_listener_context_t *context,
+        const kvs_listener_config_t *config){
+
+        if(context==NULL||config==NULL||config->port==0||config->handler==NULL){
+                return -1;
+        }
+
+        context->port=config->port;
+        context->handler=config->handler;
+
+        return memory_pool_init(
+                &context->connection_pool,
+                sizeof(ntyco_connection_context_t),
+                NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK
+        );
+}
+
+static void ntyco_listener_context_destroy(
+        ntyco_listener_context_t *context){
+
+        if(context==NULL){
+                return;
+        }
+
+        memory_pool_destory(&context->connection_pool);
+}
+
 void server_reader(void *arg) {
 	ntyco_connection_context_t *context = (ntyco_connection_context_t *)arg;
 	int fd=context->fd;
@@ -122,31 +150,53 @@ void server(void *arg) {
 }
 
 
-
-
-int ntyco_start(unsigned short port,msg_handler handler) {
-
-	//int port = atoi(argv[1]);
-	ntyco_listener_context_t context={
-		.port=port,
-		.handler=handler
-	};
-
-	if(memory_pool_init(&context.connection_pool,sizeof(ntyco_connection_context_t),NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK)!=0){
+int ntyco_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count){
+	if(listeners==NULL||listener_count==0||listener_count>NTYCO_MAX_LISTENER_COUNT){
 		return -1;
-	}
+	}//参数校验
 
-	nty_coroutine *co = NULL;
-	if(nty_coroutine_create(&co, server, &context)!=0){
-		memory_pool_destory(&context.connection_pool);
-		return -1;
+	ntyco_listener_context_t contexts[NTYCO_MAX_LISTENER_COUNT];
+	size_t initialized_count=0;
+	for(size_t i=0;i<listener_count;i++){
+		if(ntyco_listener_context_init(&contexts[i],&listeners[i])!=0){
+			for(size_t j=0;j<initialized_count;j++){
+				ntyco_listener_context_destroy(&contexts[j]);
+
+			}
+			return -1;
+		}
+		initialized_count++;
+	}//将每份通用 config 转换成 NtyCo context
+	for(size_t i=0;i<listener_count;i++){
+		nty_coroutine *co = NULL;
+	if(nty_coroutine_create(&co,server,&contexts[i])!=0){
+		fprintf(stderr,
+				"failed to create listener coroutine for port %u\n",
+				contexts[i].port);
+
+		for(size_t j=0;j<initialized_count;j++){
+			ntyco_listener_context_destroy(&contexts[j]);
+		}
+
+    return -1;
+}
 	}
 	nty_schedule_run();
-	memory_pool_destory(&context.connection_pool);
-
+	for(size_t i=0;i<initialized_count;i++){
+		ntyco_listener_context_destroy(&contexts[i]);
+	}
 	return 0;
 }
 
+
+int ntyco_start(unsigned short port,msg_handler handler) {
+    kvs_listener_config_t listener={
+        .port=port,
+        .handler=handler
+    };
+
+    return ntyco_start_listeners(&listener,1);
+}
 
 
 

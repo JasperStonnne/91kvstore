@@ -14,7 +14,6 @@
 #define EVENT_READ 1
 #define EVENT_WRITE 2
 
-typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
 static msg_handler kvs_handler;
 static struct conn
 *proactor_connections[CONNECTION_SIZE];
