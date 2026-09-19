@@ -4,13 +4,28 @@
 
 #include "nty_coroutine.h"
 #include "server.h"
+#include "memory_pool.h"
 #include <arpa/inet.h>
 #include<errno.h>
+#define NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK 64
 typedef int (*msg_handler)(char *msg,int length,char *response,int response_capacity,int *consumed_length);
-static msg_handler kvs_handler;
+typedef struct {
+	unsigned short port;
+	msg_handler handler;
+	memory_pool_t connection_pool;  // 连接上下文专用池
+}ntyco_listener_context_t;
 
+typedef struct {
+	int fd;
+	msg_handler handler;
+	memory_pool_t *pool;
+} ntyco_connection_context_t;
 void server_reader(void *arg) {
-	int fd = *(int *)arg;
+	ntyco_connection_context_t *context = (ntyco_connection_context_t *)arg;
+	int fd=context->fd;
+	msg_handler handler = context->handler;
+	memory_pool_t *pool = context->pool;
+	memory_pool_free(pool,context);
 	int ret = 0;//保存recv send的返回值
 	kvs_input_buffer_t input={0};//跨循环 保存请求数
 	kvs_output_buffer_t output={0};//保存当前链接尚未发送完的响应
@@ -25,7 +40,7 @@ void server_reader(void *arg) {
 		if (ret > 0) {
 			input.length+=ret;
 			output.offset=0;
-			output.length=kvs_handler(input.data,input.length,output.data,BUFFER_LENGTH,&consumed_length);
+			output.length=handler(input.data,input.length,output.data,BUFFER_LENGTH,&consumed_length);
 			if (output.length<0){
 				close(fd);
 				break;
@@ -66,7 +81,8 @@ void server_reader(void *arg) {
 
 void server(void *arg) {
 
-	unsigned short port = *(unsigned short *)arg;
+	ntyco_listener_context_t *context=(ntyco_listener_context_t *)arg;
+	unsigned short port=context->port;
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) return ;
 
@@ -83,10 +99,23 @@ void server(void *arg) {
 	while (1) {
 		socklen_t len = sizeof(struct sockaddr_in);
 		int cli_fd = accept(fd, (struct sockaddr*)&remote, &len);
+		if(cli_fd<0){
+			continue;
+		}
 
-
+		ntyco_connection_context_t *connection = memory_pool_alloc(&context->connection_pool);
+		if(connection==NULL){
+			close(cli_fd);
+			continue;
+		}
+		connection->fd=cli_fd;
+		connection->handler=context->handler;
+		connection->pool=&context->connection_pool;
 		nty_coroutine *read_co;
-		nty_coroutine_create(&read_co, server_reader, &cli_fd);
+		if(nty_coroutine_create(&read_co, server_reader, connection)!=0){
+			close(cli_fd);
+			memory_pool_free(&context->connection_pool,connection);
+		}
 
 	}
 
@@ -98,12 +127,22 @@ void server(void *arg) {
 int ntyco_start(unsigned short port,msg_handler handler) {
 
 	//int port = atoi(argv[1]);
-	kvs_handler=handler;
+	ntyco_listener_context_t context={
+		.port=port,
+		.handler=handler
+	};
+
+	if(memory_pool_init(&context.connection_pool,sizeof(ntyco_connection_context_t),NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK)!=0){
+		return -1;
+	}
 
 	nty_coroutine *co = NULL;
-	nty_coroutine_create(&co, server, &port);
-
+	if(nty_coroutine_create(&co, server, &context)!=0){
+		memory_pool_destory(&context.connection_pool);
+		return -1;
+	}
 	nty_schedule_run();
+	memory_pool_destory(&context.connection_pool);
 
 	return 0;
 }
