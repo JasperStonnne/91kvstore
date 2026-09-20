@@ -128,6 +128,10 @@ int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_sourc
         }
     }
 
+    if (cmd == KVS_CMD_COUNT) {
+    return sprintf(response, "ERROR unknown command\r\n");
+    }
+
     if(kvs_server_role==KVS_ROLE_REPLICA&&source==KVS_COMMAND_SOURCE_CLIENT&&kvs_is_write_command(cmd)){
         return sprintf(response,"READONLY replica does not accept client writes\r\n");
     }
@@ -457,8 +461,9 @@ int kvs_batch_protocol(char *msg,int length,char *response,int response_capacity
     
 }
 
-static int kvs_network_protocol(char *msg,int length,char *response,int response_capacity,int *consumed_length){
+static int kvs_network_protocol(int connection_fd,char *msg,int length,char *response,int response_capacity,int *consumed_length){
 
+    (void)connection_fd;
     return kvs_batch_protocol(msg,length,response,response_capacity,consumed_length);
 }
 
@@ -598,7 +603,12 @@ int main(int argc,char *argv[]){
         fprintf(stderr, "failed to open AOF\n");
         return -1;
 }
-
+    if (kvs_replication_init(config.role) < 0) {
+    fprintf(stderr, "failed to initialize replication\n");
+    kvs_aof_close();
+    dest_kvengine();
+    return -1;
+}
 int network_ret=-1;
 
 #if (NETWORK_SELECT==NETWORK_REACTOR)
@@ -611,10 +621,13 @@ int network_ret=-1;
 
     if(network_ret<0){
         fprintf(stderr,"failed to start network service\n");
+        kvs_replication_destroy();
+        kvs_aof_close();
         dest_kvengine();
         return -1;
     }
-
+    kvs_replication_destroy();
+kvs_aof_close();
     dest_kvengine();
 
 

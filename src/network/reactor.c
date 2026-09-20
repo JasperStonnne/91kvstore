@@ -26,7 +26,7 @@ static msg_handler kvs_handler;
 int kvs_request(struct conn *c){
 	int consumed_length=0;
 	c->output.offset=0;
-    c->output.length=kvs_handler(c->input.data,c->input.length,c->output.data,BUFFER_LENGTH,&consumed_length);
+    c->output.length=kvs_handler(c->fd,c->input.data,c->input.length,c->output.data,BUFFER_LENGTH,&consumed_length);
 	if(c->output.length<0){
 		return -1;
 	}

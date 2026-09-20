@@ -21,6 +21,14 @@ int kvs_aof_open(const char* path){
     if(aof_fp==NULL){
         return -1;
     }
+
+    if(fseeko(aof_fp,0,SEEK_END)!=0){
+        fclose(aof_fp);
+        aof_fp=NULL;
+        return -1;
+
+    }
+
     return 0;
 }
 int kvs_aof_close(void){

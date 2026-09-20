@@ -68,7 +68,7 @@ void server_reader(void *arg) {
 		if (ret > 0) {
 			input.length+=ret;
 			output.offset=0;
-			output.length=handler(input.data,input.length,output.data,BUFFER_LENGTH,&consumed_length);
+			output.length=handler(fd,input.data,input.length,output.data,BUFFER_LENGTH,&consumed_length);
 			if (output.length<0){
 				close(fd);
 				break;

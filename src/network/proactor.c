@@ -209,7 +209,7 @@ int proactor_start(unsigned short port,msg_handler handler){
                     connection->input.length+=ret;
                     int consumed_length = 0;
                     connection->output.offset=0;
-                    connection->output.length=kvs_handler(connection->input.data,connection->input.length,connection->output.data,BUFFER_LENGTH,&consumed_length);
+                    connection->output.length=kvs_handler(connection->fd,connection->input.data,connection->input.length,connection->output.data,BUFFER_LENGTH,&consumed_length);
                     if(connection->output.length<0){
                         close(result.fd);
                         free(connection);

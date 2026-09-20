@@ -7,6 +7,7 @@
 #define CONNECTION_SIZE (1024*1024)//添加最大链接数量
 
 typedef int (*msg_handler)(
+	int connection_fd,
 	char *msg,
 	int length,
 	char *response,
