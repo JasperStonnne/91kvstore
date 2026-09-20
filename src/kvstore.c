@@ -409,62 +409,47 @@ static int kvs_execute_command(char *msg,int length,char *response,kvs_command_s
     return kvs_filter_protocol(tokens,count,response,source);
 }
 //适配三参数客户端接口 并且补充CLIENT 命令来源（适配起函数
-static int kvs_client_protocol(char *msg,int length,char *response){
+static int kvs_client_protocol(int connection_fd,char *msg,int length,char *response,int response_capacity){
+    (void)connection_fd;
+    (void)response_capacity;
     return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_CLIENT);
 }
 // 适配三参数恢复接口，并补充 RECOVERY 命令来源
 static int kvs_recovery_protocol(char *msg,int length,char *response){
     return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_RECOVERY);
 }
-static int kvs_find_crlf(const char *msg,int length){
-    if(msg==NULL||length<2){
-        return -1;
-    }
-    for(int i=0;i+1<length;i++){
-        if(msg[i]=='\r'&&msg[i+1]=='\n'){
-            return i;
-        }
-    }
-    return -1;
-}
 
-int kvs_batch_protocol(char *msg,int length,char *response,int response_capacity,int *consumed_length){
-    if(msg==NULL||length<=0||response==NULL||response_capacity<=0||consumed_length==NULL){
-        return -1;
-    }
-    *consumed_length=0;
-    int request_offset=0;//处理到请求的什么位置
-    int response_offset=0;//当前写入了多少响应
-    while(request_offset<length){
-        char *command_start=msg+request_offset;
-        int remaining_length=length-request_offset;
-        int command_end=kvs_find_crlf(command_start,remaining_length);
-        if(command_end<0){
-            break;
-        }
-        command_start[command_end]='\0';
-        if(command_end==0){
-            return -1;
-        }
-        if (response_offset >= response_capacity) {
-            return -1;
-        }
-        int response_length=kvs_client_protocol(command_start,command_end,response+response_offset);
-        if (response_length < 0 ||response_length > response_capacity - response_offset) {
-            return -1;
-        }
-        response_offset+=response_length;
-        request_offset+=command_end+2;
-    }
-    *consumed_length = request_offset;
-    return response_offset;
-    
+
+int kvs_batch_protocol(
+    char *msg,
+    int length,
+    char *response,
+    int response_capacity,
+    int *consumed_length)
+{
+    return kvs_line_batch_protocol(
+        -1,                         // 兼容旧接口，这里没有传入连接 fd
+        msg,                        // TCP 输入缓冲区
+        length,                     // 当前已有数据长度
+        response,                   // 响应缓冲区
+        response_capacity,          // 响应缓冲区容量
+        consumed_length,            // 返回已经完整处理的字节数
+        kvs_client_protocol         // 每拆出一条命令，就交给它执行
+    );
 }
 
 static int kvs_network_protocol(int connection_fd,char *msg,int length,char *response,int response_capacity,int *consumed_length){
 
     (void)connection_fd;
-    return kvs_batch_protocol(msg,length,response,response_capacity,consumed_length);
+        return kvs_line_batch_protocol(
+        connection_fd,                 // 保留真实的客户端连接 fd
+        msg,
+        length,
+        response,
+        response_capacity,
+        consumed_length,
+        kvs_client_protocol            // 每条完整命令交给客户端命令处理器
+    );
 }
 
 int init_kvengine(void){
@@ -611,12 +596,41 @@ int main(int argc,char *argv[]){
 }
 int network_ret=-1;
 
-#if (NETWORK_SELECT==NETWORK_REACTOR)
-    network_ret=reactor_start(config.service_port,kvs_network_protocol);
-#elif(NETWORK_SELECT==NETWORK_NTYCO)
-    network_ret=ntyco_start(config.service_port,kvs_network_protocol);
-#elif(NETWORK_SELECT==NETWORK_PROACTOR)
-    network_ret=proactor_start(config.service_port,kvs_network_protocol);
+#if (NETWORK_SELECT == NETWORK_REACTOR)
+    network_ret = reactor_start(
+        config.service_port,
+        kvs_network_protocol
+    );
+
+#elif (NETWORK_SELECT == NETWORK_NTYCO)
+    if (config.role == KVS_ROLE_PRIMARY) {
+        kvs_listener_config_t listeners[] = {
+            {
+                .port = config.service_port,                 // 普通客户端端口
+                .handler = kvs_network_protocol              // 客户端命令协议
+            },
+            {
+                .port = config.replication_port,             // Replica 专用端口
+                .handler = kvs_replication_network_protocol  // 主从复制协议
+            }
+        };
+
+        network_ret = ntyco_start_listeners(
+            listeners,
+            sizeof(listeners) / sizeof(listeners[0])          // 两个监听器配置
+        );
+    } else {
+        network_ret = ntyco_start(
+            config.service_port,
+            kvs_network_protocol                              // 单机和 Replica 的客户端入口
+        );
+    }
+
+#elif (NETWORK_SELECT == NETWORK_PROACTOR)
+    network_ret = proactor_start(
+        config.service_port,
+        kvs_network_protocol
+    );
 #endif
 
     if(network_ret<0){

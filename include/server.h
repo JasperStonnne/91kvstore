@@ -15,6 +15,25 @@ typedef int (*msg_handler)(
 	int *consumed_length
 );//通用消息处理函数类型，网络层收到数据后调用
 
+typedef int (*kvs_frame_handler)(//单命令处理函数类型
+	int connection_fd,
+	char *frame,
+	int frame_length,
+	char *response,
+	int response_capacity
+
+);
+
+int kvs_line_batch_protocol(//公共批处理器
+    int connection_fd,                 // 当前连接
+    char *msg,                          // 整块 TCP 输入数据
+    int length,                         // 输入数据长度
+    char *response,                     // 响应缓冲区
+    int response_capacity,              // 响应缓冲区大小
+    int *consumed_length,               // 本次一共消费多少输入
+    kvs_frame_handler frame_handler     // 每拆出一条命令后调用谁
+);
+
 typedef struct {//通用监听器配置，一个监听端口绑定一个消息处理函数
 	unsigned short port;
 	msg_handler handler;

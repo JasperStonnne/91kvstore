@@ -149,7 +149,8 @@ $(BUILD_DIR)/snapshot.o: \
 $(BUILD_DIR)/replication.o: \
 	$(REPLICATION_DIR)/replication.c \
 	$(INCLUDE_DIR)/replication.h \
-	$(INCLUDE_DIR)/persistence.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memory_pool.o: \

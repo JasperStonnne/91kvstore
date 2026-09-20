@@ -30,6 +30,15 @@ typedef struct {//保存启动配置
 
 }kvs_server_config_t;
 
+int kvs_replication_network_protocol(
+    int connection_fd,
+    char *msg,
+    int length,
+    char *response,
+    int response_capacity,
+    int *consumed_length
+);
+
 int kvs_replication_init(kvs_role_t role);
 void kvs_replication_destroy(void);
 
