@@ -3,17 +3,150 @@
 #include "server.h"
 #include <stdio.h>
 #include <string.h>
+#define KVS_REPLICATION_HOST_MAX_LENGTH 256
+
 typedef struct {
     kvs_role_t role;               // 当前进程是单机、Primary 还是 Replica
     long long replication_offset;  // 当前复制进度
-    int initialized;               // 是否完成初始化
-} kvs_replication_manager_t;
+    char primary_host[KVS_REPLICATION_HOST_MAX_LENGTH];//Replica要链接的primary地址
+    unsigned short primary_port;//primary的复制端口
+    int primary_connection_fd;//与primary通信的socket
+    kvs_replication_state_t state;//当前复制状态
+    int initialized;
+} kvs_replication_manager_t;//复制管理器 保存复制相关信息
 
 static kvs_replication_manager_t replication_manager = {
     .role = KVS_ROLE_STANDALONE,
     .replication_offset = 0,
+    .primary_host = {0},
+    .primary_port = 0,
+    .primary_connection_fd = -1,
+    .state = KVS_REPLICATION_STATE_DISCONNECTED,
     .initialized = 0
+
 };
+
+static int kvs_replication_on_primary_connected(
+    int connection_fd,
+    char *output,
+    int output_capacity)
+{
+    if (!replication_manager.initialized ||             // 复制管理器必须已经初始化
+        replication_manager.role != KVS_ROLE_REPLICA || // 只有 Replica 会主动连接 Primary
+        connection_fd < 0 ||                            // socket 必须有效
+        output == NULL ||
+        output_capacity <= 0) {
+        return -1;
+    }
+
+    int output_length = snprintf(
+        output,
+        output_capacity,
+        "PING\r\n"                                      // 连接成功后的第一条复制消息
+    );
+
+    if (output_length < 0 ||
+        output_length >= output_capacity) {
+        return -1;
+    }
+
+    replication_manager.primary_connection_fd = connection_fd; // 记录上游连接
+    replication_manager.state = KVS_REPLICATION_STATE_HANDSHAKE; // 进入复制握手阶段
+
+    return output_length;                               // 网络层负责发送这些字节
+}
+
+static void kvs_replication_on_primary_disconnected(
+    int connection_fd)
+{
+    if (!replication_manager.initialized ||
+        replication_manager.role != KVS_ROLE_REPLICA) {
+        return;
+    }
+
+    if (replication_manager.primary_connection_fd != connection_fd) {
+        return;                                          // 不处理不属于当前上游的旧连接
+    }
+
+    replication_manager.primary_connection_fd = -1;     // 当前已经没有上游连接
+    replication_manager.state =
+        KVS_REPLICATION_STATE_DISCONNECTED;              // 等待后续重新连接
+}
+
+static int kvs_replication_upstream_frame_protocol(
+    int connection_fd,
+    char *frame,
+    int frame_length,
+    char *response,
+    int response_capacity)
+{
+    (void)response;                                  // 当前收到 PONG 后暂时不生成下一条消息
+    (void)response_capacity;
+
+    if (!replication_manager.initialized ||
+        replication_manager.role != KVS_ROLE_REPLICA ||
+        connection_fd < 0 ||
+        connection_fd != replication_manager.primary_connection_fd ||
+        frame == NULL ||
+        frame_length <= 0) {
+        return -1;
+    }
+
+    if (replication_manager.state !=
+        KVS_REPLICATION_STATE_HANDSHAKE) {           // 当前必须正在进行复制握手
+        return -1;
+    }
+
+    if (frame_length == 4 &&
+        memcmp(frame, "PONG", 4) == 0) {             // Primary 正确回复了 PONG
+        return 0;                                    // PONG 已处理，但暂时没有数据需要回发
+    }
+
+    return -1;                                       // 握手阶段收到未知消息
+}
+
+static int kvs_replication_upstream_network_protocol(
+    int connection_fd,
+    char *msg,
+    int length,
+    char *response,
+    int response_capacity,
+    int *consumed_length)
+{
+    return kvs_line_batch_protocol(
+        connection_fd,
+        msg,
+        length,
+        response,
+        response_capacity,
+        consumed_length,
+        kvs_replication_upstream_frame_protocol      // 每条上游消息交给 PONG 处理函数
+    );
+}
+
+int kvs_replication_build_connector_config(
+    kvs_connector_config_t *connector)
+{
+    if (connector == NULL ||
+        !replication_manager.initialized ||
+        replication_manager.role != KVS_ROLE_REPLICA ||
+        replication_manager.primary_host[0] == '\0' ||
+        replication_manager.primary_port == 0) {
+        return -1;
+    }
+
+    connector->host = replication_manager.primary_host;                // 连接目标地址
+    connector->port = replication_manager.primary_port;                // 连接目标端口
+    connector->open_handler =
+        kvs_replication_on_primary_connected;                           // 连接成功后生成 PING
+    connector->message_handler =
+        kvs_replication_upstream_network_protocol;                      // 收到数据后处理 PONG
+    connector->close_handler =
+        kvs_replication_on_primary_disconnected;                        // 断开后恢复状态
+
+    return 0;
+}
+
 static int kvs_replication_frame_protocol(
     int connection_fd,
     char *frame,
@@ -73,35 +206,71 @@ int kvs_replication_network_protocol(
     );
 }
 
-int kvs_replication_init(kvs_role_t role){
-    if(replication_manager.initialized){
+int kvs_replication_init(const kvs_server_config_t *config)
+{
+    if (config == NULL || replication_manager.initialized) { // 配置必须存在，并且不能重复初始化
         return -1;
     }
 
-    if (role != KVS_ROLE_STANDALONE &&
-    role != KVS_ROLE_PRIMARY &&
-    role != KVS_ROLE_REPLICA) {
-    return -1;
-    }
-
-    long long offset =kvs_aof_get_offset();
-    if(offset<0){
+    if (config->role != KVS_ROLE_STANDALONE &&
+        config->role != KVS_ROLE_PRIMARY &&
+        config->role != KVS_ROLE_REPLICA) {                  // 检查角色是否合法
         return -1;
     }
-    replication_manager.role = role;
+
+    size_t primary_host_length = 0;
+
+    if (config->role == KVS_ROLE_REPLICA) {
+        if (config->primary_host == NULL ||
+            config->primary_host[0] == '\0' ||
+            config->replication_port == 0) {                 // Replica 必须具有有效的 Primary 地址和端口
+            return -1;
+        }
+
+        primary_host_length = strlen(config->primary_host);
+        if (primary_host_length >=
+            sizeof(replication_manager.primary_host)) {      // 地址必须能够放入管理器
+            return -1;
+        }
+    }
+
+    long long offset = kvs_aof_get_offset();                  // 取得本地 AOF 当前末尾位置
+    if (offset < 0) {
+        return -1;
+    }
+
+    replication_manager.role = config->role;
     replication_manager.replication_offset = offset;
+    replication_manager.primary_connection_fd = -1;          // 当前尚未连接 Primary
+    replication_manager.state = KVS_REPLICATION_STATE_DISCONNECTED;
+
+    if (config->role == KVS_ROLE_REPLICA) {
+        memcpy(
+            replication_manager.primary_host,
+            config->primary_host,
+            primary_host_length + 1                           // 连同字符串末尾的 \0 一起复制
+        );
+        replication_manager.primary_port = config->replication_port;
+    } else {
+        replication_manager.primary_host[0] = '\0';           // Primary 和单机没有上游地址
+        replication_manager.primary_port = 0;
+    }
+
     replication_manager.initialized = 1;
 
     return 0;
 }
-
 void kvs_replication_destroy(void)
 {
-    if (!replication_manager.initialized) {
+    if (!replication_manager.initialized) {                   // 未初始化就不需要销毁
         return;
     }
 
-    replication_manager.role = KVS_ROLE_STANDALONE;
+    replication_manager.role = KVS_ROLE_STANDALONE;           // 恢复安全默认角色
     replication_manager.replication_offset = 0;
+    replication_manager.primary_host[0] = '\0';               // 清空 Primary 地址
+    replication_manager.primary_port = 0;
+    replication_manager.primary_connection_fd = -1;           // 当前不存在上游连接
+    replication_manager.state = KVS_REPLICATION_STATE_DISCONNECTED;
     replication_manager.initialized = 0;
 }

@@ -1,6 +1,6 @@
 #ifndef KVS_REPLICATION_H
 #define KVS_REPLICATION_H
-
+#include "server.h"
 typedef enum {
     KVS_ROLE_STANDALONE = 0,
     KVS_ROLE_PRIMARY,
@@ -38,8 +38,8 @@ int kvs_replication_network_protocol(
     int response_capacity,
     int *consumed_length
 );
-
-int kvs_replication_init(kvs_role_t role);
+int kvs_replication_build_connector_config(kvs_connector_config_t *connector);
+int kvs_replication_init(const kvs_server_config_t *config);
 void kvs_replication_destroy(void);
 
 #endif

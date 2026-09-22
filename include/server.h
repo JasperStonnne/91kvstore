@@ -15,6 +15,24 @@ typedef int (*msg_handler)(
 	int *consumed_length
 );//通用消息处理函数类型，网络层收到数据后调用
 
+typedef int (*kvs_connection_open_handler)(
+    int connection_fd,        // 网络层建立成功的 socket
+    char *output,             // 首次发送内容写入这个缓冲区
+    int output_capacity       // output 最多可以写多少字节
+);
+
+typedef void (*kvs_connection_close_handler)(
+    int connection_fd         // 已经断开的 socket
+);
+
+typedef struct {
+    const char *host;                              // 要连接的目标地址
+    unsigned short port;                           // 要连接的目标端口
+    kvs_connection_open_handler open_handler;      // 连接成功后调用
+    msg_handler message_handler;                   // 收到对方数据后调用
+    kvs_connection_close_handler close_handler;    // 连接断开后调用
+} kvs_connector_config_t;
+
 typedef int (*kvs_frame_handler)(//单命令处理函数类型
 	int connection_fd,
 	char *frame,
@@ -42,6 +60,7 @@ typedef struct {//通用监听器配置，一个监听端口绑定一个消息�
 int reactor_start(unsigned short port,msg_handler handler);
 int ntyco_start(unsigned short port,msg_handler handler);
 int ntyco_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
+int ntyco_start_runtime(const kvs_listener_config_t *listeners,size_t listener_count,const kvs_connector_config_t *connectors,size_t connector_count);
 int proactor_start(unsigned short port,msg_handler handler);
 
 

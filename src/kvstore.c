@@ -588,7 +588,7 @@ int main(int argc,char *argv[]){
         fprintf(stderr, "failed to open AOF\n");
         return -1;
 }
-    if (kvs_replication_init(config.role) < 0) {
+    if (kvs_replication_init(&config) < 0) {
     fprintf(stderr, "failed to initialize replication\n");
     kvs_aof_close();
     dest_kvengine();
@@ -619,11 +619,25 @@ int network_ret=-1;
             listeners,
             sizeof(listeners) / sizeof(listeners[0])          // 两个监听器配置
         );
-    } else {
-        network_ret = ntyco_start(
-            config.service_port,
-            kvs_network_protocol                              // 单机和 Replica 的客户端入口
-        );
+    } else if(config.role==KVS_ROLE_REPLICA) {
+        kvs_listener_config_t listener={
+            .port=config.service_port,
+            .handler=kvs_network_protocol
+        };
+
+        kvs_connector_config_t connector;
+
+        if(kvs_replication_build_connector_config(&connector)<0){
+            fprintf(stderr,"failed to build replication connector\n");
+            network_ret=-1;
+        }else{
+            network_ret=ntyco_start_runtime(&listener,1,&connector,1);
+
+        }
+
+
+    }else{
+        network_ret=ntyco_start(config.service_port,kvs_network_protocol);
     }
 
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)
