@@ -3,11 +3,15 @@
 #include "server.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/random.h>
+#include <errno.h>
 #define KVS_REPLICATION_HOST_MAX_LENGTH 256
+#define KVS_REPLICATION_ID_HEX_LENGTH 40 // 20 字节随机数转换成 40 个十六进制字符
 
 typedef struct {
     kvs_role_t role;               // 当前进程是单机、Primary 还是 Replica
     long long replication_offset;  // 当前复制进度
+    char replication_id[KVS_REPLICATION_ID_HEX_LENGTH + 1]; // Primary 当前数据历史的唯一标识
     char primary_host[KVS_REPLICATION_HOST_MAX_LENGTH];//Replica要链接的primary地址
     unsigned short primary_port;//primary的复制端口
     int primary_connection_fd;//与primary通信的socket
@@ -18,6 +22,7 @@ typedef struct {
 static kvs_replication_manager_t replication_manager = {
     .role = KVS_ROLE_STANDALONE,
     .replication_offset = 0,
+    .replication_id={0},
     .primary_host = {0},
     .primary_port = 0,
     .primary_connection_fd = -1,
@@ -80,15 +85,16 @@ static int kvs_replication_upstream_frame_protocol(
     char *response,
     int response_capacity)
 {
-    (void)response;                                  // 当前收到 PONG 后暂时不生成下一条消息
-    (void)response_capacity;
+
 
     if (!replication_manager.initialized ||
         replication_manager.role != KVS_ROLE_REPLICA ||
         connection_fd < 0 ||
         connection_fd != replication_manager.primary_connection_fd ||
         frame == NULL ||
-        frame_length <= 0) {
+        frame_length <= 0||
+        response==NULL||
+        response_capacity<=0) {
         return -1;
     }
 
@@ -97,14 +103,65 @@ static int kvs_replication_upstream_frame_protocol(
         return -1;
     }
 
-    if (frame_length == 4 &&
-        memcmp(frame, "PONG", 4) == 0) {             // Primary 正确回复了 PONG
-        return 0;                                    // PONG 已处理，但暂时没有数据需要回发
+      if(frame_length == 4 &&
+       memcmp(frame,"PONG",4) == 0){
+
+        int response_length=snprintf(
+            response,
+            response_capacity,
+            "PSYNC ? -1\r\n" // 首次同步：不知道 Primary ID，也没有旧 offset
+        );
+
+        if(response_length < 0 ||
+           response_length >= response_capacity){
+            return -1;
+        }
+
+        return response_length; // 网络层会把 PSYNC 发送给 Primary
     }
+        if(frame_length >=11 &&
+       memcmp(frame,"FULLRESYNC ",11) == 0){
 
-    return -1;                                       // 握手阶段收到未知消息
+        char primary_replication_id[
+            KVS_REPLICATION_ID_HEX_LENGTH + 1
+        ] = {0};
+
+        long long primary_offset=-1;
+        int parsed_length=0;
+
+        int matched=sscanf(
+            frame,
+            "FULLRESYNC %40[0-9a-f] %lld%n",
+            primary_replication_id,
+            &primary_offset,
+            &parsed_length
+        );
+
+        if(matched != 2 ||
+           parsed_length != frame_length ||
+           strlen(primary_replication_id) != KVS_REPLICATION_ID_HEX_LENGTH ||
+           primary_offset < 0){
+            return -1; // FULLRESYNC 格式、ID 长度或 offset 不合法
+        }
+
+        memcpy(
+            replication_manager.replication_id,
+            primary_replication_id,
+            sizeof(primary_replication_id)
+        );
+
+        replication_manager.replication_offset=primary_offset;
+        replication_manager.state=KVS_REPLICATION_STATE_FULL_SYNC;
+        printf(
+    "replication: enter FULL_SYNC id=%s offset=%lld fd=%d\n",
+    replication_manager.replication_id,
+    replication_manager.replication_offset,
+    connection_fd
+);
+        return 0; // 已保存全量同步起点，当前暂时没有消息需要回发
+    }
+    return -1; // 握手阶段收到未知的 Primary 响应
 }
-
 static int kvs_replication_upstream_network_protocol(
     int connection_fd,
     char *msg,
@@ -163,7 +220,7 @@ static int kvs_replication_frame_protocol(
     }
 
     int response_length;
-
+    int is_full_resync_response=0; // 标记本次是否生成了 FULLRESYNC 响应
     if (frame_length == 4 &&
         memcmp(frame, "PING", 4) == 0) { // 处理一条完整的 PING
         response_length = snprintf(
@@ -171,8 +228,31 @@ static int kvs_replication_frame_protocol(
             response_capacity,
             "PONG\r\n"
         );
-    } else {
-        response_length = snprintf(
+    } else if(frame_length == 10 &&
+             memcmp(frame,"PSYNC ? -1",10) == 0){
+
+        if(!replication_manager.initialized ||
+           replication_manager.role != KVS_ROLE_PRIMARY ||
+           replication_manager.replication_id[0] == '\0'){
+            return -1;
+        }
+
+        long long current_offset=kvs_aof_get_offset();
+        if(current_offset < 0){
+            return -1;
+        }
+
+        replication_manager.replication_offset=current_offset;
+        response_length=snprintf(
+            response,
+            response_capacity,
+            "FULLRESYNC %s %lld\r\n",
+            replication_manager.replication_id,
+            replication_manager.replication_offset
+        );
+        is_full_resync_response=1;
+    }else{
+        response_length=snprintf(
             response,
             response_capacity,
             "ERROR unknown replication command\r\n"
@@ -183,6 +263,14 @@ static int kvs_replication_frame_protocol(
         response_length >= response_capacity) { // 响应写入失败或者空间不足
         return -1;
     }
+if(is_full_resync_response){
+    printf(
+        "replication: FULLRESYNC response ready id=%s offset=%lld fd=%d\n",
+        replication_manager.replication_id,
+        replication_manager.replication_offset,
+        connection_fd
+    );
+}
 
     return response_length;
 }
@@ -206,6 +294,49 @@ int kvs_replication_network_protocol(
     );
 }
 
+static int kvs_replication_generate_id(
+    char *output,
+    size_t output_capacity)
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned char random_bytes[KVS_REPLICATION_ID_HEX_LENGTH / 2];
+    size_t received_length = 0;
+
+    if(output == NULL ||
+       output_capacity < KVS_REPLICATION_ID_HEX_LENGTH + 1){
+        return -1;
+    }
+
+    // getrandom 也可能只返回部分数据，因此循环读取满 20 字节
+    while(received_length < sizeof(random_bytes)){
+        ssize_t result = getrandom(
+            random_bytes + received_length,
+            sizeof(random_bytes) - received_length,
+            0
+        );
+
+        if(result > 0){
+            received_length += (size_t)result;
+            continue;
+        }
+
+        if(result < 0 && errno == EINTR){
+            continue; // 被信号中断，不算真正失败，继续读取
+        }
+
+        return -1;
+    }
+
+    // 一个字节拆成高 4 位和低 4 位，分别转换成两个十六进制字符
+    for(size_t i = 0;i < sizeof(random_bytes);i++){
+        output[i * 2] = hex[random_bytes[i] >> 4];
+        output[i * 2 + 1] = hex[random_bytes[i] & 0x0f];
+    }
+
+    output[KVS_REPLICATION_ID_HEX_LENGTH] = '\0';
+    return 0;
+}
+
 int kvs_replication_init(const kvs_server_config_t *config)
 {
     if (config == NULL || replication_manager.initialized) { // 配置必须存在，并且不能重复初始化
@@ -219,7 +350,7 @@ int kvs_replication_init(const kvs_server_config_t *config)
     }
 
     size_t primary_host_length = 0;
-
+    char generated_replication_id[KVS_REPLICATION_ID_HEX_LENGTH + 1] = {0};
     if (config->role == KVS_ROLE_REPLICA) {
         if (config->primary_host == NULL ||
             config->primary_host[0] == '\0' ||
@@ -234,13 +365,30 @@ int kvs_replication_init(const kvs_server_config_t *config)
         }
     }
 
-    long long offset = kvs_aof_get_offset();                  // 取得本地 AOF 当前末尾位置
-    if (offset < 0) {
+    long long offset = kvs_aof_get_offset();// 取得本地 AOF 当前末尾位置
+        if (offset < 0) {
         return -1;
     }
+    if(config->role == KVS_ROLE_PRIMARY){
+    if(kvs_replication_generate_id(
+            generated_replication_id,
+            sizeof(generated_replication_id)) < 0){
+        return -1; // Primary 无法生成身份时不继续启动复制模块
+    }
+}
+
 
     replication_manager.role = config->role;
     replication_manager.replication_offset = offset;
+    if(config->role == KVS_ROLE_PRIMARY){
+    memcpy(
+        replication_manager.replication_id,
+        generated_replication_id,
+        sizeof(generated_replication_id)
+    );
+    }else{
+        replication_manager.replication_id[0] = '\0'; // Replica 等待 Primary 返回 ID
+    }
     replication_manager.primary_connection_fd = -1;          // 当前尚未连接 Primary
     replication_manager.state = KVS_REPLICATION_STATE_DISCONNECTED;
 
@@ -268,6 +416,7 @@ void kvs_replication_destroy(void)
 
     replication_manager.role = KVS_ROLE_STANDALONE;           // 恢复安全默认角色
     replication_manager.replication_offset = 0;
+    replication_manager.replication_id[0] = '\0';
     replication_manager.primary_host[0] = '\0';               // 清空 Primary 地址
     replication_manager.primary_port = 0;
     replication_manager.primary_connection_fd = -1;           // 当前不存在上游连接
