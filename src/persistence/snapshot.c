@@ -42,10 +42,14 @@ static int snapshot_write_item(const char *key,const char *value,void *context) 
     }
     return 0;
 }
-int kvs_snapshot_save(const char *path){
+int kvs_snapshot_save(const char *path,kvs_snapshot_metadata_t *metadata){
     if(path==NULL){
         return -1;
     }
+    if(metadata != NULL){
+    metadata->aof_offset=-1;
+    metadata->file_size=-1;
+}
     long long aof_offset=kvs_aof_get_offset();
     if(aof_offset<0){
         return -1;
@@ -65,6 +69,7 @@ int kvs_snapshot_save(const char *path){
         .command="SET"
     };
     int result=0;
+    long long snapshot_file_size=-1;
     int offset_written=fprintf(fp,"AOF_OFFSET %lld\n",aof_offset);
     if(offset_written<0){
         result=-1;
@@ -124,6 +129,14 @@ int kvs_snapshot_save(const char *path){
             result= -1;
         }
     }
+    if(result==0){
+        off_t end_position = ftello(fp);
+        if(end_position==(off_t)-1){
+            result=-1;
+        }else{
+            snapshot_file_size=(long long)end_position;
+        }
+    }
     int close_result=fclose(fp);
     if(close_result!=0){
         result=-1;
@@ -137,6 +150,10 @@ int kvs_snapshot_save(const char *path){
         unlink(temp_path);
         return -1;
     }
+    if(metadata != NULL){
+    metadata->aof_offset=aof_offset;
+    metadata->file_size=snapshot_file_size;
+}
     return 0;
 }
 long long kvs_snapshot_load(const char* path,aof_replay_handler handler){

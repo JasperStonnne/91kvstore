@@ -399,7 +399,7 @@ static int kvs_execute_command(char *msg,int length,char *response,kvs_command_s
     int count=kvs_split_token(msg,tokens);//count的作用是 有多少个tokens
     if (count==-1) return -1;
     if(count==1&&strcmp(tokens[0],"SAVE")==0){
-        int save_result=kvs_snapshot_save("snapshot.db");
+        int save_result=kvs_snapshot_save("snapshot.db",NULL);
         if(save_result<0){
             return sprintf(response,"ERROR\r\n");
         }

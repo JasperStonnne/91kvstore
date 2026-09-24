@@ -11,6 +11,7 @@
 typedef struct {
     kvs_role_t role;               // 当前进程是单机、Primary 还是 Replica
     long long replication_offset;  // 当前复制进度
+    long long snapshot_file_size; // 当前全量同步 Snapshot 文件的总字节数
     char replication_id[KVS_REPLICATION_ID_HEX_LENGTH + 1]; // Primary 当前数据历史的唯一标识
     char primary_host[KVS_REPLICATION_HOST_MAX_LENGTH];//Replica要链接的primary地址
     unsigned short primary_port;//primary的复制端口
@@ -22,6 +23,7 @@ typedef struct {
 static kvs_replication_manager_t replication_manager = {
     .role = KVS_ROLE_STANDALONE,
     .replication_offset = 0,
+    .snapshot_file_size = -1,
     .replication_id={0},
     .primary_host = {0},
     .primary_port = 0,
@@ -127,20 +129,23 @@ static int kvs_replication_upstream_frame_protocol(
         ] = {0};
 
         long long primary_offset=-1;
+        long long primary_snapshot_file_size=-1; // Primary 接下来要发送的 Snapshot 总字节数
         int parsed_length=0;
 
         int matched=sscanf(
             frame,
-            "FULLRESYNC %40[0-9a-f] %lld%n",
+            "FULLRESYNC %40[0-9a-f] %lld %lld%n",
             primary_replication_id,
             &primary_offset,
+            &primary_snapshot_file_size,
             &parsed_length
         );
 
-        if(matched != 2 ||
+        if(matched != 3 ||
            parsed_length != frame_length ||
            strlen(primary_replication_id) != KVS_REPLICATION_ID_HEX_LENGTH ||
-           primary_offset < 0){
+           primary_offset < 0||
+        primary_snapshot_file_size<=0){
             return -1; // FULLRESYNC 格式、ID 长度或 offset 不合法
         }
 
@@ -151,14 +156,16 @@ static int kvs_replication_upstream_frame_protocol(
         );
 
         replication_manager.replication_offset=primary_offset;
+        replication_manager.snapshot_file_size =primary_snapshot_file_size;
         replication_manager.state=KVS_REPLICATION_STATE_FULL_SYNC;
         printf(
-    "replication: enter FULL_SYNC id=%s offset=%lld fd=%d\n",
-    replication_manager.replication_id,
-    replication_manager.replication_offset,
-    connection_fd
-);
-        return 0; // 已保存全量同步起点，当前暂时没有消息需要回发
+            "replication: enter FULL_SYNC id=%s offset=%lld snapshot_size=%lld fd=%d\n",
+            replication_manager.replication_id,
+            replication_manager.replication_offset,
+            replication_manager.snapshot_file_size,
+            connection_fd
+        );
+        return 0;// 已保存全量同步起点，当前暂时没有消息需要回发
     }
     return -1; // 握手阶段收到未知的 Primary 响应
 }
@@ -237,18 +244,23 @@ static int kvs_replication_frame_protocol(
             return -1;
         }
 
-        long long current_offset=kvs_aof_get_offset();
-        if(current_offset < 0){
+        kvs_snapshot_metadata_t snapshot_metadata;
+
+        if(kvs_snapshot_save(
+                "replication.snapshot",
+                &snapshot_metadata) < 0){
             return -1;
         }
 
-        replication_manager.replication_offset=current_offset;
+        replication_manager.replication_offset =snapshot_metadata.aof_offset;
+        replication_manager.snapshot_file_size =snapshot_metadata.file_size;
         response_length=snprintf(
             response,
             response_capacity,
-            "FULLRESYNC %s %lld\r\n",
+            "FULLRESYNC %s %lld %lld\r\n",
             replication_manager.replication_id,
-            replication_manager.replication_offset
+            replication_manager.replication_offset,
+            replication_manager.snapshot_file_size
         );
         is_full_resync_response=1;
     }else{
@@ -263,14 +275,15 @@ static int kvs_replication_frame_protocol(
         response_length >= response_capacity) { // 响应写入失败或者空间不足
         return -1;
     }
-if(is_full_resync_response){
-    printf(
-        "replication: FULLRESYNC response ready id=%s offset=%lld fd=%d\n",
-        replication_manager.replication_id,
-        replication_manager.replication_offset,
-        connection_fd
-    );
-}
+   if(is_full_resync_response){
+        printf(
+            "replication: FULLRESYNC response ready id=%s offset=%lld snapshot_size=%lld fd=%d\n",
+            replication_manager.replication_id,
+            replication_manager.replication_offset,
+            replication_manager.snapshot_file_size,
+            connection_fd
+        );
+    }
 
     return response_length;
 }
@@ -380,6 +393,7 @@ int kvs_replication_init(const kvs_server_config_t *config)
 
     replication_manager.role = config->role;
     replication_manager.replication_offset = offset;
+    replication_manager.snapshot_file_size = -1; // 初始化时还不知道全量快照大小
     if(config->role == KVS_ROLE_PRIMARY){
     memcpy(
         replication_manager.replication_id,
@@ -416,6 +430,7 @@ void kvs_replication_destroy(void)
 
     replication_manager.role = KVS_ROLE_STANDALONE;           // 恢复安全默认角色
     replication_manager.replication_offset = 0;
+    replication_manager.snapshot_file_size = -1; // 销毁时清除上一次同步留下的大小
     replication_manager.replication_id[0] = '\0';
     replication_manager.primary_host[0] = '\0';               // 清空 Primary 地址
     replication_manager.primary_port = 0;
