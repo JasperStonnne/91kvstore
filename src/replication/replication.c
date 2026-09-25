@@ -7,15 +7,26 @@
 #include <errno.h>
 #define KVS_REPLICATION_HOST_MAX_LENGTH 256
 #define KVS_REPLICATION_ID_HEX_LENGTH 40 // 20 字节随机数转换成 40 个十六进制字符
+// Primary 为全量同步生成并发送的 Snapshot
+#define KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH "replication.snapshot"
 
+// Replica 接收期间写入的临时文件，未收完整时不能使用
+#define KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH "snapshot.db.replication.tmp"
+
+// Replica 完整接收后安装成正式的本地 Snapshot
+#define KVS_REPLICATION_REPLICA_SNAPSHOT_PATH "snapshot.db"
 typedef struct {
     kvs_role_t role;               // 当前进程是单机、Primary 还是 Replica
     long long replication_offset;  // 当前复制进度
     long long snapshot_file_size; // 当前全量同步 Snapshot 文件的总字节数
+    kvs_snapshot_reader_t snapshot_reader; // Primary 当前正在分块读取的复制快照
+    kvs_snapshot_writer_t snapshot_writer;
+    int snapshot_connection_fd; // Primary 当前向哪条 Replica 连接发送 Snapshot
     char replication_id[KVS_REPLICATION_ID_HEX_LENGTH + 1]; // Primary 当前数据历史的唯一标识
     char primary_host[KVS_REPLICATION_HOST_MAX_LENGTH];//Replica要链接的primary地址
     unsigned short primary_port;//primary的复制端口
     int primary_connection_fd;//与primary通信的socket
+    kvs_snapshot_install_handler snapshot_install_handler; // Replica 收完整 Snapshot 后调用
     kvs_replication_state_t state;//当前复制状态
     int initialized;
 } kvs_replication_manager_t;//复制管理器 保存复制相关信息
@@ -24,10 +35,18 @@ static kvs_replication_manager_t replication_manager = {
     .role = KVS_ROLE_STANDALONE,
     .replication_offset = 0,
     .snapshot_file_size = -1,
+    .snapshot_reader = {
+    .fd = -1,
+    .remaining = 0},
+        .snapshot_writer = {
+        .fd = -1,
+        .remaining = 0},
+    .snapshot_connection_fd = -1,
     .replication_id={0},
     .primary_host = {0},
     .primary_port = 0,
     .primary_connection_fd = -1,
+        .snapshot_install_handler = NULL,
     .state = KVS_REPLICATION_STATE_DISCONNECTED,
     .initialized = 0
 
@@ -74,7 +93,10 @@ static void kvs_replication_on_primary_disconnected(
     if (replication_manager.primary_connection_fd != connection_fd) {
         return;                                          // 不处理不属于当前上游的旧连接
     }
-
+    kvs_snapshot_writer_abort(
+        &replication_manager.snapshot_writer,
+        KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH
+    );
     replication_manager.primary_connection_fd = -1;     // 当前已经没有上游连接
     replication_manager.state =
         KVS_REPLICATION_STATE_DISCONNECTED;              // 等待后续重新连接
@@ -148,7 +170,17 @@ static int kvs_replication_upstream_frame_protocol(
         primary_snapshot_file_size<=0){
             return -1; // FULLRESYNC 格式、ID 长度或 offset 不合法
         }
+        kvs_snapshot_writer_abort(
+        &replication_manager.snapshot_writer,
+        KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH
+        );
 
+        if(kvs_snapshot_writer_open(
+                &replication_manager.snapshot_writer,
+                KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH,
+                primary_snapshot_file_size) < 0){
+            return -1;
+        }
         memcpy(
             replication_manager.replication_id,
             primary_replication_id,
@@ -177,6 +209,18 @@ static int kvs_replication_upstream_network_protocol(
     int response_capacity,
     int *consumed_length)
 {
+    if(!replication_manager.initialized ||
+    replication_manager.role!=KVS_ROLE_REPLICA ||
+    connection_fd<0 ||
+    connection_fd!=replication_manager.primary_connection_fd ||
+    msg==NULL ||
+    length<=0 ||
+    response==NULL ||
+    response_capacity<=0 ||
+    consumed_length==NULL){
+    return -1;
+    }
+    if(replication_manager.state==KVS_REPLICATION_STATE_HANDSHAKE){
     return kvs_line_batch_protocol(
         connection_fd,
         msg,
@@ -186,6 +230,68 @@ static int kvs_replication_upstream_network_protocol(
         consumed_length,
         kvs_replication_upstream_frame_protocol      // 每条上游消息交给 PONG 处理函数
     );
+    }
+    if(replication_manager.state==KVS_REPLICATION_STATE_FULL_SYNC){
+        int written = kvs_snapshot_writer_write(
+            &replication_manager.snapshot_writer,
+            msg,
+            length
+        );
+        if (written<0){
+            return -1;
+        }
+        *consumed_length=written;
+
+        /*
+         * remaining 变成 0，说明 FULLRESYNC 协商的 Snapshot
+         * 已经一字节不少地写入临时文件。
+         */
+        if(replication_manager.snapshot_writer.remaining==0){
+            if(kvs_snapshot_writer_commit(
+                    &replication_manager.snapshot_writer,
+                    KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH,
+                    KVS_REPLICATION_REPLICA_SNAPSHOT_PATH) < 0){
+
+                /*
+                 * 落盘、关闭或 rename 失败时，
+                 * 删除临时文件，避免下次同步误用半成品。
+                 */
+                kvs_snapshot_writer_abort(
+                    &replication_manager.snapshot_writer,
+                    KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH
+                );
+                return -1;
+            }
+
+                        /*
+             * 文件已经完整提交为 snapshot.db，
+             * 现在通知 kvstore 模块清空旧 Engine 并加载它。
+             */
+            if(replication_manager.snapshot_install_handler==NULL ||
+               replication_manager.snapshot_install_handler(
+                   KVS_REPLICATION_REPLICA_SNAPSHOT_PATH) < 0){
+                return -1;
+            }
+
+            /*
+             * Snapshot 已经写入磁盘并加载进内存。
+             * 接下来需要从 replication_offset 开始补齐增量 AOF。
+             */
+            replication_manager.state =
+                KVS_REPLICATION_STATE_CATCH_UP;
+
+            printf(
+                "replication: Snapshot installed, enter CATCH_UP "
+                "offset=%lld size=%lld fd=%d\n",
+                replication_manager.replication_offset,
+                replication_manager.snapshot_file_size,
+                connection_fd
+            );
+        }
+
+        return 0;
+    }
+    return -1;
 }
 
 int kvs_replication_build_connector_config(
@@ -210,7 +316,52 @@ int kvs_replication_build_connector_config(
 
     return 0;
 }
+int kvs_replication_snapshot_stream(
+    int connection_fd,
+    char *output,
+    int output_capacity)
+{
+    if(!replication_manager.initialized ||
+       replication_manager.role != KVS_ROLE_PRIMARY ||
+       connection_fd<0 ||
+       output==NULL ||
+       output_capacity<=0){
+        return -1;
+    }
 
+    if(replication_manager.snapshot_connection_fd<0){
+        return 0; // 当前还没有 PSYNC 产生的 Snapshot 发送任务
+    }
+
+    if(connection_fd !=
+       replication_manager.snapshot_connection_fd){
+        return 0; // 当前 Snapshot 不属于这条连接
+    }
+
+    int result=kvs_snapshot_reader_read(
+        &replication_manager.snapshot_reader,
+        output,
+        output_capacity
+    );
+
+    if(result<=0){
+        kvs_snapshot_reader_close(
+            &replication_manager.snapshot_reader
+        );
+        replication_manager.snapshot_connection_fd=-1;
+
+        if(result<0){
+            return -1; // Snapshot 未读完就发生错误
+        }
+
+        printf(
+            "replication: Snapshot stream completed fd=%d\n",
+            connection_fd
+        );
+    }
+
+    return result;
+}
 static int kvs_replication_frame_protocol(
     int connection_fd,
     char *frame,
@@ -247,13 +398,23 @@ static int kvs_replication_frame_protocol(
         kvs_snapshot_metadata_t snapshot_metadata;
 
         if(kvs_snapshot_save(
-                "replication.snapshot",
+                KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH,
                 &snapshot_metadata) < 0){
             return -1;
         }
+        kvs_snapshot_reader_close(
+            &replication_manager.snapshot_reader
+        ); // 清理上一次可能残留的读取任务
 
+        if(kvs_snapshot_reader_open(
+                &replication_manager.snapshot_reader,
+                KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH,
+                snapshot_metadata.file_size) < 0){
+            return -1;
+        }
         replication_manager.replication_offset =snapshot_metadata.aof_offset;
         replication_manager.snapshot_file_size =snapshot_metadata.file_size;
+        replication_manager.snapshot_connection_fd =connection_fd; // Snapshot 只能由当前发来 PSYNC 的连接读取
         response_length=snprintf(
             response,
             response_capacity,
@@ -350,7 +511,7 @@ static int kvs_replication_generate_id(
     return 0;
 }
 
-int kvs_replication_init(const kvs_server_config_t *config)
+int kvs_replication_init(const kvs_server_config_t *config,kvs_snapshot_install_handler snapshot_install_handler)
 {
     if (config == NULL || replication_manager.initialized) { // 配置必须存在，并且不能重复初始化
         return -1;
@@ -393,7 +554,11 @@ int kvs_replication_init(const kvs_server_config_t *config)
 
     replication_manager.role = config->role;
     replication_manager.replication_offset = offset;
+    replication_manager.snapshot_install_handler =snapshot_install_handler;
     replication_manager.snapshot_file_size = -1; // 初始化时还不知道全量快照大小
+    replication_manager.snapshot_connection_fd = -1; // 初始化时没有 Snapshot 接收连接
+    replication_manager.snapshot_reader.fd = -1;       // 当前没有打开复制快照
+    replication_manager.snapshot_reader.remaining = 0; // 当前没有待发送字节
     if(config->role == KVS_ROLE_PRIMARY){
     memcpy(
         replication_manager.replication_id,
@@ -430,6 +595,9 @@ void kvs_replication_destroy(void)
 
     replication_manager.role = KVS_ROLE_STANDALONE;           // 恢复安全默认角色
     replication_manager.replication_offset = 0;
+    kvs_snapshot_reader_close(&replication_manager.snapshot_reader); // 如果正在发送 Snapshot，关闭对应文件
+    kvs_snapshot_writer_abort(&replication_manager.snapshot_writer,KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH);
+    replication_manager.snapshot_connection_fd = -1; // 销毁时解除 Snapshot 与连接的绑定
     replication_manager.snapshot_file_size = -1; // 销毁时清除上一次同步留下的大小
     replication_manager.replication_id[0] = '\0';
     replication_manager.primary_host[0] = '\0';               // 清空 Primary 地址

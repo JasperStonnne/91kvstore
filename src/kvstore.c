@@ -493,10 +493,50 @@ void dest_kvengine(void){
 #if ENABLE_SKIPLIST
     kvs_skiplist_destory(&global_skiplist);
 #endif
-
-
 }
 
+/*
+ * 用 Primary 传来的 Snapshot 替换 Replica 当前的内存数据。
+ *
+ * replication 模块只负责在合适的时间调用这个函数；
+ * Engine 的销毁、初始化和恢复仍由 kvstore 模块负责。
+ */
+static int kvs_install_replication_snapshot(
+    const char *snapshot_path)
+{
+    if(snapshot_path==NULL || snapshot_path[0]=='\0'){
+        return -1;
+    }
+
+    // 删除 Replica 内存中原来的完整数据集，避免遗留旧 key。
+    dest_kvengine();
+
+    // 重新创建一个空的 KV Engine。
+    if(init_kvengine()<0){
+        return -1;
+    }
+
+    /*
+     * 逐行读取 Snapshot，并通过 RECOVERY 来源执行 SET/HSET 等命令。
+     * 恢复命令不会被当成普通客户端写入。
+     */
+    long long snapshot_offset=kvs_snapshot_load(
+        snapshot_path,
+        kvs_recovery_protocol
+    );
+
+    if(snapshot_offset<0){
+        /*
+         * 加载失败时，Snapshot 可能只恢复了一部分。
+         * 再次清空，避免对外提供半套数据。
+         */
+        dest_kvengine();
+        init_kvengine();
+        return -1;
+    }
+
+    return 0;
+}
 
 static int kvs_parse_port(const char *text,unsigned short *port){
     if(text==NULL||port==NULL){
@@ -588,7 +628,7 @@ int main(int argc,char *argv[]){
         fprintf(stderr, "failed to open AOF\n");
         return -1;
 }
-    if (kvs_replication_init(&config) < 0) {
+    if (kvs_replication_init(&config,kvs_install_replication_snapshot) < 0) {
     fprintf(stderr, "failed to initialize replication\n");
     kvs_aof_close();
     dest_kvengine();
@@ -607,11 +647,13 @@ int network_ret=-1;
         kvs_listener_config_t listeners[] = {
             {
                 .port = config.service_port,                 // 普通客户端端口
-                .handler = kvs_network_protocol              // 客户端命令协议
+                .handler = kvs_network_protocol,             // 客户端命令协议、
+                .stream_handler = NULL                       // 普通客户端不发送文件流
             },
             {
                 .port = config.replication_port,             // Replica 专用端口
-                .handler = kvs_replication_network_protocol  // 主从复制协议
+                .handler = kvs_replication_network_protocol, // 主从复制协议
+                .stream_handler = kvs_replication_snapshot_stream // 分块提供 Snapshot
             }
         };
 

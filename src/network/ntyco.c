@@ -13,12 +13,14 @@
 typedef struct {
 	unsigned short port;
 	msg_handler handler;
+	kvs_connection_stream_handler stream_handler; // 当前监听器的可选流式输出函数
 	memory_pool_t connection_pool;  // 连接上下文专用池
 }ntyco_listener_context_t;
 
 typedef struct {
 	int fd;
 	msg_handler handler;
+	kvs_connection_stream_handler stream_handler; // 该连接可选的流式输出函数
 	kvs_connection_close_handler close_handler; // 连接关闭时通知业务层，可以为 NULL
 	memory_pool_t *pool;
 } ntyco_connection_context_t;
@@ -67,7 +69,7 @@ static int ntyco_listener_context_init(
 
         context->port=config->port;
         context->handler=config->handler;
-
+		context->stream_handler=config->stream_handler;
         return memory_pool_init(
                 &context->connection_pool,
                 sizeof(ntyco_connection_context_t),
@@ -84,11 +86,36 @@ static void ntyco_listener_context_destroy(
 
         memory_pool_destory(&context->connection_pool);
 }
+static int ntyco_send_all(int fd,const char *data,int length)
+{
+    if(fd<0 || data==NULL || length<0){
+        return -1;
+    }
 
+    int offset=0;
+
+    while(offset<length){
+        int ret=nty_send(fd,data+offset,length-offset,0);
+
+        if(ret>0){
+            offset+=ret;
+            continue;
+        }
+
+        if(ret<0 && errno==EINTR){
+            continue;
+		}
+
+        return -1;
+    }
+
+    return 0;
+}
 void server_reader(void *arg) {
 	ntyco_connection_context_t *context = (ntyco_connection_context_t *)arg;
 	int fd=context->fd;
 	msg_handler handler = context->handler;
+	kvs_connection_stream_handler stream_handler =context->stream_handler;
 	kvs_connection_close_handler close_handler=context->close_handler;
 	memory_pool_t *pool = context->pool;
 	if(pool!=NULL)memory_pool_free(pool,context);
@@ -104,32 +131,50 @@ void server_reader(void *arg) {
 		ret = nty_recv(fd,input.data+input.length,available, 0);
 		if (ret > 0) {
 			input.length+=ret;
+		do{
+			consumed_length=0;
 			output.offset=0;
 			output.length=handler(fd,input.data,input.length,output.data,BUFFER_LENGTH,&consumed_length);
 			if (output.length<0){
-				break;
+				goto connection_closed;
 			}
 			if(kvs_input_buffer_consume(&input,consumed_length)<0){
-				break;
+				goto connection_closed;
 			}
 			if(output.length==0){
 				continue;
 			}
-			while(output.offset<output.length){
-				int remaining=output.length-output.offset;
-				ret=nty_send(fd,output.data+output.offset,remaining,0);
-				if(ret>0){
-				output.offset+=ret;
-				continue;
-				}
-				if(ret<0&&errno==EINTR){
-					continue;
-				}
-				goto connection_closed; // 跳出两层循环，进入统一清理
+			if(ntyco_send_all(fd,output.data,output.length) < 0){
+			goto connection_closed;
 			}
 				output.length=0;
 				output.offset=0;
 
+			if(stream_handler!=NULL){
+				while(1){
+					int stream_length=stream_handler(
+						fd,
+						output.data,
+						BUFFER_LENGTH
+					);
+
+					if(stream_length<0){
+						goto connection_closed;
+					}
+
+					if(stream_length==0){
+						break;
+					}
+
+					if(ntyco_send_all(
+							fd,
+							output.data,
+							stream_length) < 0){
+						goto connection_closed;
+					}
+				}
+			}
+		}while(input.length>0&&consumed_length>0);
 			} else if (ret == 0) {
 					break;                              // 对端正常断开
 			} else if (errno == EINTR) {
@@ -205,6 +250,7 @@ static void ntyco_connector(void *arg)
 	ntyco_connection_context_t connection = {
 		.fd =fd,
 		.handler=context->message_handler,
+		.stream_handler=NULL, // Replica 上游连接当前只接收 Snapshot，不负责流式发送
 		.close_handler=context->close_handler,
 		.pool=NULL
 	};
@@ -247,6 +293,7 @@ void server(void *arg) {
 		}
 		connection->fd=cli_fd;
 		connection->handler=context->handler;
+		connection->stream_handler=context->stream_handler;
 		connection->close_handler=NULL; // 普通客户端连接不需要复制断开通知
 		connection->pool=&context->connection_pool;
 		nty_coroutine *read_co;

@@ -25,6 +25,18 @@ typedef void (*kvs_connection_close_handler)(
     int connection_fd         // 已经断开的 socket
 );
 
+typedef int (*kvs_connection_stream_handler)(
+	int connection_fd,//当前链接 fd
+	char *output,//下一块数据写入这里
+	int output_capacity//本次最多写入多少字节
+);
+/*返回值
+>0 产生的字节数
+=0 数据流已经结束
+<0 生成数据失败
+*/
+
+
 typedef struct {
     const char *host;                              // 要连接的目标地址
     unsigned short port;                           // 要连接的目标端口
@@ -55,6 +67,7 @@ int kvs_line_batch_protocol(//公共批处理器
 typedef struct {//通用监听器配置，一个监听端口绑定一个消息处理函数
 	unsigned short port;
 	msg_handler handler;
+	kvs_connection_stream_handler stream_handler; // 可选：连接响应后继续分块输出数据
 }kvs_listener_config_t;
 
 int reactor_start(unsigned short port,msg_handler handler);

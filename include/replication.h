@@ -29,7 +29,7 @@ typedef struct {//保存启动配置
     const char *primary_host; //要链接的primary地址
 
 }kvs_server_config_t;
-
+typedef int (*kvs_snapshot_install_handler)(const char *snapshot_path);
 int kvs_replication_network_protocol(
     int connection_fd,
     char *msg,
@@ -38,8 +38,10 @@ int kvs_replication_network_protocol(
     int response_capacity,
     int *consumed_length
 );
+int kvs_replication_snapshot_stream(int connection_fd,char *output,int output_capacity);
 int kvs_replication_build_connector_config(kvs_connector_config_t *connector);
-int kvs_replication_init(const kvs_server_config_t *config);
+int kvs_replication_init(const kvs_server_config_t *config,
+                        kvs_snapshot_install_handler snapshot_install_handler);
 void kvs_replication_destroy(void);
 
 #endif
