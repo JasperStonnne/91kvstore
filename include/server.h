@@ -30,12 +30,13 @@ typedef int (*kvs_connection_stream_handler)(
 	char *output,//下一块数据写入这里
 	int output_capacity//本次最多写入多少字节
 );
-/*返回值
->0 产生的字节数
-=0 数据流已经结束
-<0 生成数据失败
-*/
-
+/* 返回值
+ * >0：本次生成的字节数
+ *  0：数据流已经结束
+ * -1：生成数据失败
+ * -2：数据流尚未结束，但当前暂时没有新数据
+ */
+#define KVS_STREAM_WAIT (-2)
 
 typedef struct {
     const char *host;                              // 要连接的目标地址

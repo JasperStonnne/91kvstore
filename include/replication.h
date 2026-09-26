@@ -16,6 +16,8 @@ typedef enum {
     KVS_REPLICATION_STATE_ONLINE             // 已追平，持续接收实时写命令
 } kvs_replication_state_t;
 
+
+
 typedef struct {
     int connection_fd;                    // Primary 与这台 Replica 通信使用的 socket
     kvs_replication_state_t state;        // 当前复制阶段
@@ -30,6 +32,7 @@ typedef struct {//保存启动配置
 
 }kvs_server_config_t;
 typedef int (*kvs_snapshot_install_handler)(const char *snapshot_path);
+typedef int (*kvs_replication_command_handler)(char *msg,int length,char *response);
 int kvs_replication_network_protocol(
     int connection_fd,
     char *msg,
@@ -38,10 +41,9 @@ int kvs_replication_network_protocol(
     int response_capacity,
     int *consumed_length
 );
-int kvs_replication_snapshot_stream(int connection_fd,char *output,int output_capacity);
+int kvs_replication_stream(int connection_fd,char *output,int output_capacity);
 int kvs_replication_build_connector_config(kvs_connector_config_t *connector);
-int kvs_replication_init(const kvs_server_config_t *config,
-                        kvs_snapshot_install_handler snapshot_install_handler);
+int kvs_replication_init(const kvs_server_config_t *config,kvs_snapshot_install_handler snapshot_install_handler,kvs_replication_command_handler command_handler);
 void kvs_replication_destroy(void);
 
 #endif

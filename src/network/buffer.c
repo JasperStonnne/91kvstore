@@ -12,19 +12,36 @@ int kvs_input_buffer_consume(kvs_input_buffer_t *buffer,int consumed_length){
     buffer->length=remaining_length;
     return 0;
 }
-static int kvs_find_crlf(const char *msg, int length)
+/*
+ * 查找一条文本消息的结尾，同时支持：
+ * 1. 网络命令使用的 \r\n
+ * 2. AOF 命令使用的 \n
+ */
+static int kvs_find_line_end(const char *msg,int length,int *delimiter_length)
 {
-    if (msg == NULL || length < 2) {
+    if(msg==NULL ||
+       length<=0 ||
+       delimiter_length==NULL){
         return -1;
     }
 
-    for (int i = 0; i + 1 < length; i++) {
-        if (msg[i] == '\r' && msg[i + 1] == '\n') {
-            return i;                              // 返回 CRLF 中 \r 的位置
+    *delimiter_length=0;
+
+    for(int i=0;i<length;i++){
+        if(msg[i]!='\n'){
+            continue;
         }
+
+        if(i>0 && msg[i-1]=='\r'){
+            *delimiter_length=2;
+            return i-1;
+        }
+
+        *delimiter_length=1;
+        return i;
     }
 
-    return -1;                                     // 当前还没有完整消息
+    return -1;
 }
 
 int kvs_line_batch_protocol(
@@ -54,9 +71,12 @@ int kvs_line_batch_protocol(
         char *frame_start = msg + request_offset;  // 当前帧的起始位置
         int remaining_length = length - request_offset;
 
-        int frame_end = kvs_find_crlf(
+        int delimiter_length=0;
+
+        int frame_end=kvs_find_line_end(
             frame_start,
-            remaining_length
+            remaining_length,
+            &delimiter_length
         );
 
         if (frame_end < 0) {
@@ -90,7 +110,7 @@ int kvs_line_batch_protocol(
         }
 
         response_offset += response_length;         // 累计已经生成的响应长度
-        request_offset += frame_end + 2;            // 跳过消息正文和结尾 CRLF
+        request_offset += frame_end + delimiter_length;            // 跳过消息正文和结尾 CRLF
     }
 
     *consumed_length = request_offset;              // 返回本次共消费多少输入字节

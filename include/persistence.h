@@ -3,12 +3,25 @@
 int kvs_aof_open(const char *path);
 int kvs_aof_append(char **tokens, int count);
 int kvs_aof_close(void);
+/*
+ * 将本地 AOF 文件长度和写入位置调整到指定复制 offset。
+ * Replica 安装全量 Snapshot 后使用。
+ */
+int kvs_aof_reset_to_offset(long long offset);
 typedef int (*aof_replay_handler)(
     char *msg,
     int length,
     char *response
 );
 int kvs_aof_replay(const char *path,long long offset,aof_replay_handler handler);
+typedef struct {
+    int fd;                  // 专门用于读取 AOF 的文件描述符
+    long long offset;       // 下一次从 AOF 的哪个字节位置读取
+    long long remaining;    // 本轮还需要发送多少字节
+} kvs_aof_reader_t;
+int kvs_aof_reader_open(kvs_aof_reader_t *reader,const char *path,long long start_offset,long long end_offset);
+int kvs_aof_reader_read(kvs_aof_reader_t *reader,char *output,int output_capacity);
+void kvs_aof_reader_close(kvs_aof_reader_t *reader);
 typedef struct {
     long long aof_offset; // Snapshot 对应的一致性 AOF 位置
     long long file_size;  // Snapshot 文件最终字节数

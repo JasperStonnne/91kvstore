@@ -419,6 +419,24 @@ static int kvs_recovery_protocol(char *msg,int length,char *response){
     return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_RECOVERY);
 }
 
+/*
+ * 执行 Primary 发送给 Replica 的增量命令。
+ *
+ * 使用 REPLICATION 来源，因此命令会修改内存，
+ * 并通过现有 kvs_aof_append() 保存到 Replica 本地 AOF。
+ */
+static int kvs_replication_command_protocol(
+    char *msg,
+    int length,
+    char *response)
+{
+    return kvs_execute_command(
+        msg,
+        length,
+        response,
+        KVS_COMMAND_SOURCE_REPLICATION
+    );
+}
 
 int kvs_batch_protocol(
     char *msg,
@@ -535,6 +553,18 @@ static int kvs_install_replication_snapshot(
         return -1;
     }
 
+    if(kvs_aof_reset_to_offset(snapshot_offset)<0){
+        /*
+         * AOF 无法对齐时，不能继续提供刚加载的数据，
+         * 否则当前内存与重启后的恢复结果可能不一致。
+         */
+        dest_kvengine();
+        init_kvengine();
+        return -1;
+    }
+
+
+
     return 0;
 }
 
@@ -628,7 +658,7 @@ int main(int argc,char *argv[]){
         fprintf(stderr, "failed to open AOF\n");
         return -1;
 }
-    if (kvs_replication_init(&config,kvs_install_replication_snapshot) < 0) {
+    if (kvs_replication_init(&config,kvs_install_replication_snapshot,kvs_replication_command_protocol) < 0) {
     fprintf(stderr, "failed to initialize replication\n");
     kvs_aof_close();
     dest_kvengine();
@@ -653,7 +683,7 @@ int network_ret=-1;
             {
                 .port = config.replication_port,             // Replica 专用端口
                 .handler = kvs_replication_network_protocol, // 主从复制协议
-                .stream_handler = kvs_replication_snapshot_stream // 分块提供 Snapshot
+                .stream_handler = kvs_replication_stream // 分块提供 Snapshot
             }
         };
 

@@ -10,6 +10,7 @@
 #define NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK 64
 #define NTYCO_MAX_LISTENER_COUNT 2
 #define NTYCO_MAX_CONNECTOR_COUNT 1 // 当前一台 Replica 只连接一个 Primary
+#define NTYCO_STREAM_RETRY_INTERVAL_MS 50
 typedef struct {
 	unsigned short port;
 	msg_handler handler;
@@ -157,7 +158,16 @@ void server_reader(void *arg) {
 						output.data,
 						BUFFER_LENGTH
 					);
-
+				/*
+				* -2 不是错误，只表示长期复制流当前没有新数据。
+				* 当前协程休眠一小段时间，让出 CPU 后再检查。
+				*/
+				if(stream_length==KVS_STREAM_WAIT){
+					nty_coroutine_sleep(
+						NTYCO_STREAM_RETRY_INTERVAL_MS
+					);
+					continue;
+				}
 					if(stream_length<0){
 						goto connection_closed;
 					}
