@@ -72,6 +72,13 @@ typedef struct {//通用监听器配置，一个监听端口绑定一个消息�
 }kvs_listener_config_t;
 
 int reactor_start(unsigned short port,msg_handler handler);
+int reactor_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
+int reactor_start_runtime(
+    const kvs_listener_config_t *listeners,
+    size_t listener_count,
+    const kvs_connector_config_t *connectors,
+    size_t connector_count
+);
 int ntyco_start(unsigned short port,msg_handler handler);
 int ntyco_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
 int ntyco_start_runtime(const kvs_listener_config_t *listeners,size_t listener_count,const kvs_connector_config_t *connectors,size_t connector_count);
@@ -100,6 +107,23 @@ typedef struct kvs_output_buffer{
 struct conn {
 	int fd;
 
+/*
+* 当前 fd 使用的业务协议。
+* 监听 fd 保存端口绑定的协议；
+* accept 出来的连接继承该协议。
+*/
+	msg_handler handler;
+/*
+ * 当前连接可选的流式输出函数。
+ * 普通客户端连接为 NULL，复制连接用于发送 Snapshot/AOF。
+ */
+	kvs_connection_stream_handler stream_handler;
+/*
+ * 当前连接断开时的通知函数。
+ * 普通客户端连接为 NULL；
+ * Replica 到 Primary 的主动连接使用复制 close_handler。
+ */
+kvs_connection_close_handler close_handler;
 	kvs_input_buffer_t input;
 
 	kvs_output_buffer_t output;
