@@ -83,8 +83,8 @@ int ntyco_start(unsigned short port,msg_handler handler);
 int ntyco_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
 int ntyco_start_runtime(const kvs_listener_config_t *listeners,size_t listener_count,const kvs_connector_config_t *connectors,size_t connector_count);
 int proactor_start(unsigned short port,msg_handler handler);
-
-
+int proactor_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
+int proactor_start_runtime(const kvs_listener_config_t *listeners,size_t listener_count,const kvs_connector_config_t *connectors,size_t connector_count);
 #define ENABLE_HTTP 0
 #define ENABLE_WEBSOCKET 0
 #define ENABLE_KVSTORE 1

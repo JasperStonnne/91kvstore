@@ -774,10 +774,70 @@ int network_ret=-1;
     }
 
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)
-    network_ret = proactor_start(
-        config.service_port,
-        kvs_network_protocol
+    if(config.role==KVS_ROLE_PRIMARY){
+        kvs_listener_config_t listeners[]={
+            {
+                .port=config.service_port,
+                .handler=kvs_network_protocol,
+                .stream_handler=NULL
+            },
+            {
+                .port=config.replication_port,
+                .handler=kvs_replication_network_protocol,
+                .stream_handler=kvs_replication_stream
+            }
+        };
+
+        network_ret=proactor_start_listeners(
+            listeners,
+            sizeof(listeners)/sizeof(listeners[0])
+        );
+    }else if(config.role==KVS_ROLE_REPLICA){
+    /*
+     * Replica 监听自己的客户端服务端口。
+     */
+    kvs_listener_config_t listener={
+        .port=config.service_port,
+        .handler=kvs_network_protocol,
+        .stream_handler=NULL
+    };
+
+    /*
+     * replication.c 提供 Primary 地址和复制回调。
+     */
+    kvs_connector_config_t connector;
+
+    if(kvs_replication_build_connector_config(
+            &connector)<0){
+
+        fprintf(
+            stderr,
+            "failed to build replication connector\n"
+        );
+        network_ret=-1;
+    }else{
+        network_ret=proactor_start_runtime(
+            &listener,
+            1,
+            &connector,
+            1
+        );
+    }
+}else{
+    /*
+     * standalone 只监听客户端服务端口。
+     */
+    kvs_listener_config_t listener={
+        .port=config.service_port,
+        .handler=kvs_network_protocol,
+        .stream_handler=NULL
+    };
+
+    network_ret=proactor_start_listeners(
+        &listener,
+        1
     );
+}
 #endif
 
     if(network_ret<0){
