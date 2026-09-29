@@ -15,7 +15,7 @@ ENGINE_DIR := $(SRC_DIR)/engines
 NETWORK_DIR := $(SRC_DIR)/network
 MEMORY_DIR := $(SRC_DIR)/memory
 PERSISTENCE_DIR := $(SRC_DIR)/persistence
-
+REPLICATION_DIR := $(SRC_DIR)/replication
 INCLUDE_DIR := include
 TEST_DIR := tests
 
@@ -54,6 +54,7 @@ OBJS := \
 	$(BUILD_DIR)/kvs_skiplist.o \
 	$(BUILD_DIR)/aof.o \
 	$(BUILD_DIR)/snapshot.o \
+	$(BUILD_DIR)/replication.o \
 	$(BUILD_DIR)/memory_pool.o \
 	$(BUILD_DIR)/buffer.o
 
@@ -91,7 +92,9 @@ $(BIN_DIR)/kvstore: $(OBJS) $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
 
 $(BUILD_DIR)/kvstore.o: \
 	$(SRC_DIR)/kvstore.c \
-	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/replication.h \
+	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/reactor.o: \
@@ -105,7 +108,9 @@ $(BUILD_DIR)/proactor.o: \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ntyco.o: \
-	$(NETWORK_DIR)/ntyco.c | $(BUILD_DIR)
+	$(NETWORK_DIR)/ntyco.c \
+	$(INCLUDE_DIR)/server.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kvs_array.o: \
@@ -139,6 +144,13 @@ $(BUILD_DIR)/snapshot.o: \
 	$(PERSISTENCE_DIR)/snapshot.c \
 	$(INCLUDE_DIR)/persistence.h \
 	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/replication.o: \
+	$(REPLICATION_DIR)/replication.c \
+	$(INCLUDE_DIR)/replication.h \
+	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memory_pool.o: \

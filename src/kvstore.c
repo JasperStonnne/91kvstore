@@ -2,7 +2,9 @@
 
 #include"kvstore.h"
 #include "persistence.h"
-
+#include "replication.h"
+#include "server.h"
+#include<errno.h>
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
 #endif
@@ -70,7 +72,9 @@ const char *response[]={
 
 
 };
-static int aof_replaying = 0;
+
+static kvs_role_t kvs_server_role = KVS_ROLE_STANDALONE;
+
 static int kvs_is_write_command(int cmd){
     if(cmd<KVS_CMD_START||cmd>=KVS_CMD_COUNT){
         return 0;
@@ -113,7 +117,7 @@ int kvs_split_token(char *msg,char*tokens[]){
 //tokens[0]:SET
 //tokens[1]:Key
 //tokens[2]:Value
-int kvs_filter_protocol(char **tokens,int count,char *response){
+int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_source_t source){
 
     if(tokens[0]==NULL||count==0||response==NULL)return -1;
 
@@ -123,6 +127,15 @@ int kvs_filter_protocol(char **tokens,int count,char *response){
             break;
         }
     }
+
+    if (cmd == KVS_CMD_COUNT) {
+    return sprintf(response, "ERROR unknown command\r\n");
+    }
+
+    if(kvs_server_role==KVS_ROLE_REPLICA&&source==KVS_COMMAND_SOURCE_CLIENT&&kvs_is_write_command(cmd)){
+        return sprintf(response,"READONLY replica does not accept client writes\r\n");
+    }
+
     int length=0;
     int ret=0;
     char *key=tokens[1];
@@ -334,7 +347,7 @@ int kvs_filter_protocol(char **tokens,int count,char *response){
     default:
         assert(0);
     }
-    if(!aof_replaying&&ret==0&&kvs_is_write_command(cmd)){
+    if(ret==0&&kvs_is_write_command(cmd)&&source!=KVS_COMMAND_SOURCE_RECOVERY){
         int aof_ret=kvs_aof_append(tokens,count);
         if(aof_ret<0){
             fprintf(stderr,"failed to append AOF\n");
@@ -369,7 +382,7 @@ response:need to send
 
 */
 
-int kvs_protocol(char *msg,int length,char *response){
+static int kvs_execute_command(char *msg,int length,char *response,kvs_command_source_t source){
 
 //SET Key Value
 //GET Key
@@ -386,64 +399,75 @@ int kvs_protocol(char *msg,int length,char *response){
     int count=kvs_split_token(msg,tokens);//count的作用是 有多少个tokens
     if (count==-1) return -1;
     if(count==1&&strcmp(tokens[0],"SAVE")==0){
-        int save_result=kvs_snapshot_save("snapshot.db");
+        int save_result=kvs_snapshot_save("snapshot.db",NULL);
         if(save_result<0){
             return sprintf(response,"ERROR\r\n");
         }
         return sprintf(response, "OK\r\n");
     }
     //memcpy(response,msg,length);
-    return kvs_filter_protocol(tokens,count,response);
+    return kvs_filter_protocol(tokens,count,response,source);
+}
+//适配三参数客户端接口 并且补充CLIENT 命令来源（适配起函数
+static int kvs_client_protocol(int connection_fd,char *msg,int length,char *response,int response_capacity){
+    (void)connection_fd;
+    (void)response_capacity;
+    return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_CLIENT);
+}
+// 适配三参数恢复接口，并补充 RECOVERY 命令来源
+static int kvs_recovery_protocol(char *msg,int length,char *response){
+    return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_RECOVERY);
 }
 
-static int kvs_find_crlf(const char *msg,int length){
-    if(msg==NULL||length<2){
-        return -1;
-    }
-    for(int i=0;i+1<length;i++){
-        if(msg[i]=='\r'&&msg[i+1]=='\n'){
-            return i;
-        }
-    }
-    return -1;
+/*
+ * 执行 Primary 发送给 Replica 的增量命令。
+ *
+ * 使用 REPLICATION 来源，因此命令会修改内存，
+ * 并通过现有 kvs_aof_append() 保存到 Replica 本地 AOF。
+ */
+static int kvs_replication_command_protocol(
+    char *msg,
+    int length,
+    char *response)
+{
+    return kvs_execute_command(
+        msg,
+        length,
+        response,
+        KVS_COMMAND_SOURCE_REPLICATION
+    );
 }
 
-int kvs_batch_protocol(char *msg,int length,char *response,int response_capacity,int *consumed_length){
-    if(msg==NULL||length<=0||response==NULL||response_capacity<=0||consumed_length==NULL){
-        return -1;
-    }
-    *consumed_length=0;
-    int request_offset=0;//处理到请求的什么位置
-    int response_offset=0;//当前写入了多少响应
-    while(request_offset<length){
-        char *command_start=msg+request_offset;
-        int remaining_length=length-request_offset;
-        int command_end=kvs_find_crlf(command_start,remaining_length);
-        if(command_end<0){
-            break;
-        }
-        command_start[command_end]='\0';
-        if(command_end==0){
-            return -1;
-        }
-        if (response_offset >= response_capacity) {
-            return -1;
-        }
-        int response_length=kvs_protocol(command_start,command_end,response+response_offset);
-        if (response_length < 0 ||response_length > response_capacity - response_offset) {
-            return -1;
-        }
-        response_offset+=response_length;
-        request_offset+=command_end+2;
-    }
-    *consumed_length = request_offset;
-    return response_offset;
-    
+int kvs_batch_protocol(
+    char *msg,
+    int length,
+    char *response,
+    int response_capacity,
+    int *consumed_length)
+{
+    return kvs_line_batch_protocol(
+        -1,                         // 兼容旧接口，这里没有传入连接 fd
+        msg,                        // TCP 输入缓冲区
+        length,                     // 当前已有数据长度
+        response,                   // 响应缓冲区
+        response_capacity,          // 响应缓冲区容量
+        consumed_length,            // 返回已经完整处理的字节数
+        kvs_client_protocol         // 每拆出一条命令，就交给它执行
+    );
 }
 
-static int kvs_network_protocol(char *msg,int length,char *response,int response_capacity,int *consumed_length){
+static int kvs_network_protocol(int connection_fd,char *msg,int length,char *response,int response_capacity,int *consumed_length){
 
-    return kvs_batch_protocol(msg,length,response,response_capacity,consumed_length);
+    (void)connection_fd;
+        return kvs_line_batch_protocol(
+        connection_fd,                 // 保留真实的客户端连接 fd
+        msg,
+        length,
+        response,
+        response_capacity,
+        consumed_length,
+        kvs_client_protocol            // 每条完整命令交给客户端命令处理器
+    );
 }
 
 int init_kvengine(void){
@@ -487,26 +511,144 @@ void dest_kvengine(void){
 #if ENABLE_SKIPLIST
     kvs_skiplist_destory(&global_skiplist);
 #endif
-
-
 }
 
+/*
+ * 用 Primary 传来的 Snapshot 替换 Replica 当前的内存数据。
+ *
+ * replication 模块只负责在合适的时间调用这个函数；
+ * Engine 的销毁、初始化和恢复仍由 kvstore 模块负责。
+ */
+static int kvs_install_replication_snapshot(
+    const char *snapshot_path)
+{
+    if(snapshot_path==NULL || snapshot_path[0]=='\0'){
+        return -1;
+    }
 
+    // 删除 Replica 内存中原来的完整数据集，避免遗留旧 key。
+    dest_kvengine();
+
+    // 重新创建一个空的 KV Engine。
+    if(init_kvengine()<0){
+        return -1;
+    }
+
+    /*
+     * 逐行读取 Snapshot，并通过 RECOVERY 来源执行 SET/HSET 等命令。
+     * 恢复命令不会被当成普通客户端写入。
+     */
+    long long snapshot_offset=kvs_snapshot_load(
+        snapshot_path,
+        kvs_recovery_protocol
+    );
+
+    if(snapshot_offset<0){
+        /*
+         * 加载失败时，Snapshot 可能只恢复了一部分。
+         * 再次清空，避免对外提供半套数据。
+         */
+        dest_kvengine();
+        init_kvengine();
+        return -1;
+    }
+
+    if(kvs_aof_reset_to_offset(snapshot_offset)<0){
+        /*
+         * AOF 无法对齐时，不能继续提供刚加载的数据，
+         * 否则当前内存与重启后的恢复结果可能不一致。
+         */
+        dest_kvengine();
+        init_kvengine();
+        return -1;
+    }
+
+
+
+    return 0;
+}
+
+static int kvs_parse_port(const char *text,unsigned short *port){
+    if(text==NULL||port==NULL){
+        return -1;
+    }
+    errno=0;
+    char *end =NULL;//字符串解析结束的位置
+    long value =strtol(text,&end,10);//按十进制 把字符转化为long
+    if(errno!=0||end==text||*end!='\0'||value<1||value>65535){
+        return -1;
+    }
+    *port=(unsigned short)value;
+    return 0;
+}
 
 int main(int argc,char *argv[]){
-    if(argc!=2) return -1;
+    kvs_server_config_t config={
+        .role=KVS_ROLE_STANDALONE,
+        .service_port=0,
+        .replication_port=0,
+        .primary_host =NULL
+    };
+    if(argc==2){
 
-    int port =atoi(argv[1]);
+        if(kvs_parse_port(argv[1],&config.service_port)<0){
+            fprintf(stderr,"invalid service port: %s\n",argv[1]);
+            return -1;
+        }
+    }else if(argc==4 &&strcmp(argv[1],"primary")==0){
+        config.role=KVS_ROLE_PRIMARY;
+
+        if(kvs_parse_port(argv[2],&config.service_port)<0){
+            fprintf(stderr,"invalid service port:%s\n",argv[2]);
+            return -1;
+        }
+        if(kvs_parse_port(argv[3],&config.replication_port)<0){
+            fprintf(stderr,"invalid replication port:%s\n",argv[3]);
+            return -1;
+        }
+        if(config.service_port==config.replication_port){
+            fprintf(stderr,"service port and replication port must differ\n");
+            return -1;
+        }
+
+    }else if(argc==5&&strcmp(argv[1],"replica")==0){
+        config.role=KVS_ROLE_REPLICA;
+
+        if(kvs_parse_port(argv[2],&config.service_port)<0){
+            fprintf(stderr,"invalid service port:%s\n",argv[2]);
+            return -1;
+        }
+        if(argv[3][0]=='\0'){
+            fprintf(stderr,"primary host cannot be empty\n");
+            return -1;
+        }
+        config.primary_host =argv[3];
+        if(kvs_parse_port(argv[4],&config.replication_port)<0){
+            fprintf(stderr,"invalid replication port:%s\n",argv[4]);
+            return -1;
+        }
+
+    }else{
+        fprintf(stderr,
+                "usage:\n"
+                "  %s <service-port>\n"
+                "  %s primary <service-port> <replication-port>\n"
+                "  %s replica <service-port> <primary-host> <replication-port>\n",
+                argv[0],
+                argv[0],
+                argv[0]);
+        return -1;
+
+    }
+
+    kvs_server_role = config.role;
     init_kvengine();
-    aof_replaying =1;
-    long long offset=kvs_snapshot_load("snapshot.db",kvs_protocol);
+    long long offset=kvs_snapshot_load("snapshot.db",kvs_recovery_protocol);
     if(offset<0){
-        aof_replaying=-1;
         fprintf(stderr,"failed to load snapshot\n");
         return -1;
     }
-    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_protocol);
-    aof_replaying=0;
+    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_recovery_protocol);
     if(replay_ret<0){
         fprintf(stderr, "failed to replay AOF\n");
         return -1;
@@ -516,14 +658,197 @@ int main(int argc,char *argv[]){
         fprintf(stderr, "failed to open AOF\n");
         return -1;
 }
-#if (NETWORK_SELECT==NETWORK_REACTOR)
-    reactor_start(port,kvs_network_protocol);
-#elif(NETWORK_SELECT==NETWORK_NTYCO)
-    ntyco_start(port,kvs_network_protocol);
-#elif(NETWORK_SELECT==NETWORK_PROACTOR)
-    proactor_start(port,kvs_network_protocol);
+    if (kvs_replication_init(&config,kvs_install_replication_snapshot,kvs_replication_command_protocol) < 0) {
+    fprintf(stderr, "failed to initialize replication\n");
+    kvs_aof_close();
+    dest_kvengine();
+    return -1;
+}
+int network_ret=-1;
+
+#if (NETWORK_SELECT == NETWORK_REACTOR)
+    if(config.role==KVS_ROLE_PRIMARY){
+        kvs_listener_config_t listeners[] = {
+            {
+                .port=config.service_port,
+                .handler=kvs_network_protocol,
+                .stream_handler=NULL
+            },
+            {
+                .port=config.replication_port,
+                .handler=kvs_replication_network_protocol,
+                .stream_handler=kvs_replication_stream
+            }
+        };
+
+        network_ret=reactor_start_listeners(
+            listeners,
+            sizeof(listeners)/sizeof(listeners[0])
+        );
+        }else if(config.role==KVS_ROLE_REPLICA){
+        /*
+         * Replica 对客户端监听自己的 service_port。
+         * 客户端只能通过这里读取数据。
+         */
+        kvs_listener_config_t listener={
+            .port=config.service_port,
+            .handler=kvs_network_protocol,
+            .stream_handler=NULL
+        };
+
+        /*
+         * replication.c 负责提供 Primary 地址以及
+         * 连接成功、收到消息、连接断开时的业务回调。
+         */
+        kvs_connector_config_t connector;
+
+        if(kvs_replication_build_connector_config(
+                &connector)<0){
+
+            fprintf(
+                stderr,
+                "failed to build replication connector\n"
+            );
+            network_ret=-1;
+        }else{
+            network_ret=reactor_start_runtime(
+                &listener,
+                1,
+                &connector,
+                1
+            );
+        }
+    }else{
+        /*
+         * standalone 没有上游 Primary，只监听客户端端口。
+         */
+        kvs_listener_config_t listener={
+            .port=config.service_port,
+            .handler=kvs_network_protocol,
+            .stream_handler=NULL
+        };
+
+        network_ret=reactor_start_listeners(
+            &listener,
+            1
+        );
+    }
+#elif (NETWORK_SELECT == NETWORK_NTYCO)
+    if (config.role == KVS_ROLE_PRIMARY) {
+        kvs_listener_config_t listeners[] = {
+            {
+                .port = config.service_port,                 // 普通客户端端口
+                .handler = kvs_network_protocol,             // 客户端命令协议、
+                .stream_handler = NULL                       // 普通客户端不发送文件流
+            },
+            {
+                .port = config.replication_port,             // Replica 专用端口
+                .handler = kvs_replication_network_protocol, // 主从复制协议
+                .stream_handler = kvs_replication_stream // 分块提供 Snapshot
+            }
+        };
+
+        network_ret = ntyco_start_listeners(
+            listeners,
+            sizeof(listeners) / sizeof(listeners[0])          // 两个监听器配置
+        );
+    } else if(config.role==KVS_ROLE_REPLICA) {
+        kvs_listener_config_t listener={
+            .port=config.service_port,
+            .handler=kvs_network_protocol
+        };
+
+        kvs_connector_config_t connector;
+
+        if(kvs_replication_build_connector_config(&connector)<0){
+            fprintf(stderr,"failed to build replication connector\n");
+            network_ret=-1;
+        }else{
+            network_ret=ntyco_start_runtime(&listener,1,&connector,1);
+
+        }
+
+
+    }else{
+        network_ret=ntyco_start(config.service_port,kvs_network_protocol);
+    }
+
+#elif (NETWORK_SELECT == NETWORK_PROACTOR)
+    if(config.role==KVS_ROLE_PRIMARY){
+        kvs_listener_config_t listeners[]={
+            {
+                .port=config.service_port,
+                .handler=kvs_network_protocol,
+                .stream_handler=NULL
+            },
+            {
+                .port=config.replication_port,
+                .handler=kvs_replication_network_protocol,
+                .stream_handler=kvs_replication_stream
+            }
+        };
+
+        network_ret=proactor_start_listeners(
+            listeners,
+            sizeof(listeners)/sizeof(listeners[0])
+        );
+    }else if(config.role==KVS_ROLE_REPLICA){
+    /*
+     * Replica 监听自己的客户端服务端口。
+     */
+    kvs_listener_config_t listener={
+        .port=config.service_port,
+        .handler=kvs_network_protocol,
+        .stream_handler=NULL
+    };
+
+    /*
+     * replication.c 提供 Primary 地址和复制回调。
+     */
+    kvs_connector_config_t connector;
+
+    if(kvs_replication_build_connector_config(
+            &connector)<0){
+
+        fprintf(
+            stderr,
+            "failed to build replication connector\n"
+        );
+        network_ret=-1;
+    }else{
+        network_ret=proactor_start_runtime(
+            &listener,
+            1,
+            &connector,
+            1
+        );
+    }
+}else{
+    /*
+     * standalone 只监听客户端服务端口。
+     */
+    kvs_listener_config_t listener={
+        .port=config.service_port,
+        .handler=kvs_network_protocol,
+        .stream_handler=NULL
+    };
+
+    network_ret=proactor_start_listeners(
+        &listener,
+        1
+    );
+}
 #endif
 
+    if(network_ret<0){
+        fprintf(stderr,"failed to start network service\n");
+        kvs_replication_destroy();
+        kvs_aof_close();
+        dest_kvengine();
+        return -1;
+    }
+    kvs_replication_destroy();
+kvs_aof_close();
     dest_kvengine();
 
 
