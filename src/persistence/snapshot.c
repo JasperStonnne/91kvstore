@@ -398,7 +398,7 @@ int kvs_snapshot_save(const char *path,kvs_snapshot_metadata_t *metadata){
 }
     return 0;
 }
-long long kvs_snapshot_load(const char* path,aof_replay_handler handler){
+long long kvs_snapshot_load(const char* path,snapshot_replay_handler handler){
     if(path==NULL||handler==NULL){
         return -1;
     }

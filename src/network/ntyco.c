@@ -125,18 +125,26 @@ void server_reader(void *arg) {
 	kvs_output_buffer_t output={0};//保存当前链接尚未发送完的响应
 	while (1) {
 		int consumed_length=0;
-		int available=BUFFER_LENGTH-input.length;//计算还能接受多少字节
-		if(available<=0){
-			break;
-		}
-		ret = nty_recv(fd,input.data+input.length,available, 0);
+		/* 保留尚未处理的数据；空间满时先扩容，再继续接收。 */
+	if (kvs_input_buffer_ensure_space(&input, 1) < 0) {
+		goto connection_closed;
+	}
+	int available = input.capacity - input.length;
+	ret = nty_recv(fd, input.data + input.length, available, 0);
 		if (ret > 0) {
 			input.length+=ret;
 		do{
 			consumed_length=0;
 			output.offset=0;
-			output.length=handler(fd,input.data,input.length,output.data,BUFFER_LENGTH,&consumed_length);
-			if (output.length<0){
+
+			/* output.data 现在是指针，首次写响应前先分配初始空间。 */
+			if (kvs_output_buffer_ensure_space(&output, BUFFER_LENGTH) < 0) {
+				goto connection_closed;
+			}
+
+			output.length=handler(fd,input.data,input.length,&output,&consumed_length);
+			if (output.length < 0 ||
+				output.length > output.capacity) {
 				goto connection_closed;
 			}
 			if(kvs_input_buffer_consume(&input,consumed_length)<0){
@@ -196,7 +204,8 @@ void server_reader(void *arg) {
 	}
 	connection_closed:
         nty_close(fd);                      // 所有退出路径只关闭一次 socket
-
+		kvs_input_buffer_free(&input);
+		kvs_output_buffer_free(&output);
         if(close_handler!=NULL){
                 close_handler(fd);          // 复制连接断开时通知复制管理器
         }
@@ -229,12 +238,21 @@ static void ntyco_connector(void *arg)
 		return;
 	}
 	kvs_output_buffer_t output={0};
+	/* open_handler 要写入 output.data，先给它有效空间。 */
+	if (kvs_output_buffer_ensure_space(&output, BUFFER_LENGTH) < 0) {
+		nty_close(fd);
+		context->close_handler(fd);
+		context->fd = -1;
+		kvs_output_buffer_free(&output);
+		return;
+	}
 	output.length=context->open_handler(fd,output.data,BUFFER_LENGTH);
 
 	if(output.length<0||output.length>BUFFER_LENGTH){
 		nty_close(fd);
 		context->close_handler(fd);
 		context->fd=-1;
+		kvs_output_buffer_free(&output);
 		return;
 	}
 	while(output.offset<output.length){
@@ -252,9 +270,11 @@ static void ntyco_connector(void *arg)
 		nty_close(fd);
 		context->close_handler(fd);
 		context->fd=-1;
+		kvs_output_buffer_free(&output);
 		return;
 	}
-
+	/* 初始消息已发送完毕，后续接收由 server_reader 管理。 */
+	kvs_output_buffer_free(&output);
 	printf("connect to primary %s:%u\n",context->host,context->port);
 
 	ntyco_connection_context_t connection = {

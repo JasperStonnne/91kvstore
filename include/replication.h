@@ -37,8 +37,7 @@ int kvs_replication_network_protocol(
     int connection_fd,
     char *msg,
     int length,
-    char *response,
-    int response_capacity,
+    kvs_output_buffer_t *response,
     int *consumed_length
 );
 int kvs_replication_stream(int connection_fd,char *output,int output_capacity);

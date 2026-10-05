@@ -6,13 +6,13 @@
 #define BUFFER_LENGTH		1024
 #define CONNECTION_SIZE (1024*1024)//添加最大链接数量
 
+struct kvs_output_buffer;
 typedef int (*msg_handler)(
-	int connection_fd,
-	char *msg,
-	int length,
-	char *response,
-	int response_capacity,
-	int *consumed_length
+    int connection_fd,
+    char *msg,
+    int length,
+    struct kvs_output_buffer *response,
+    int *consumed_length
 );//通用消息处理函数类型，网络层收到数据后调用
 
 typedef int (*kvs_connection_open_handler)(
@@ -91,22 +91,29 @@ int proactor_start_runtime(const kvs_listener_config_t *listeners,size_t listene
 
 typedef int (*RCALLBACK)(int fd);
 /* 通用输入缓冲区 */
-typedef struct kvs_input_buffer{
-	char data[BUFFER_LENGTH];
-	int length;
-}kvs_input_buffer_t;
+/* 输入数据单独分配，空间不足时可以扩容。 */
+typedef struct kvs_input_buffer {
+    char *data;   /* 保存收到的字节 */
+    int length;   /* 已收到、尚未处理的字节数 */
+    int capacity; /* data 当前能容纳的总字节数 */
+} kvs_input_buffer_t;
 int kvs_input_buffer_consume(kvs_input_buffer_t *buffer,int consumed_length);
+int kvs_input_buffer_ensure_space(kvs_input_buffer_t *buffer, int minimum_free);
+void kvs_input_buffer_free(kvs_input_buffer_t *buffer);
 
-typedef struct kvs_output_buffer{
-	char data[BUFFER_LENGTH];
-	int length;
-	int offset;
-}kvs_output_buffer_t;
+/* 响应数据单独分配，可按实际响应大小扩容。 */
+typedef struct kvs_output_buffer {
+    char *data;   /* 待发送的字节 */
+    int length;   /* 本次响应的总字节数 */
+    int offset;   /* 已发送的字节数 */
+    int capacity; /* data 已分配的总字节数 */
+} kvs_output_buffer_t;
+int kvs_output_buffer_ensure_space(kvs_output_buffer_t *buffer, int minimum_free);
+void kvs_output_buffer_free(kvs_output_buffer_t *buffer);
 
 /*链接状态*/
 struct conn {
 	int fd;
-
 /*
 * 当前 fd 使用的业务协议。
 * 监听 fd 保存端口绑定的协议；

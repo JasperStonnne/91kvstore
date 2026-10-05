@@ -45,6 +45,7 @@ LDLIBS := -luring -lntyco -lpthread -ldl
 
 OBJS := \
 	$(BUILD_DIR)/kvstore.o \
+	$(BUILD_DIR)/codec.o \
 	$(BUILD_DIR)/reactor.o \
 	$(BUILD_DIR)/proactor.o \
 	$(BUILD_DIR)/ntyco.o \
@@ -94,7 +95,13 @@ $(BUILD_DIR)/kvstore.o: \
 	$(SRC_DIR)/kvstore.c \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/replication.h \
+	$(INCLUDE_DIR)/protocol.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/codec.o: \
+	$(SRC_DIR)/protocol/codec.c \
+	$(INCLUDE_DIR)/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/reactor.o: \

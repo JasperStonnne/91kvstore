@@ -34,8 +34,7 @@ int kvs_request(struct conn *c){
                 c->fd,
                 c->input.data,
                 c->input.length,
-                c->output.data,
-                BUFFER_LENGTH,
+                &c->output,
                 &consumed_length
         );
 	if(c->output.length<0){
@@ -121,10 +120,13 @@ if(fd<0 || fd>=CONNECTION_SIZE){
 	conn_list[fd].r_action.recv_callback = recv_cb;
 	conn_list[fd].send_callback = send_cb;
 
-	memset(conn_list[fd].input.data, 0, BUFFER_LENGTH);
+
 	conn_list[fd].input.length = 0;
 
-	memset(conn_list[fd].output.data, 0, BUFFER_LENGTH);
+	/* 注册连接时给普通响应准备初始空间。 */
+        if (kvs_output_buffer_ensure_space(&conn_list[fd].output, BUFFER_LENGTH) < 0) {
+        return -1;
+        }
 	conn_list[fd].output.length = 0;
 	conn_list[fd].output.offset=0;
 
@@ -185,9 +187,10 @@ static void reactor_close_connection(int fd)
         conn_list[fd].handler=NULL;
         conn_list[fd].stream_handler=NULL;
         conn_list[fd].close_handler=NULL;
-        conn_list[fd].input.length=0;
-        conn_list[fd].output.length=0;
-        conn_list[fd].output.offset=0;
+        /* 统一关闭路径释放这条连接的动态输入缓冲区。 */
+        kvs_input_buffer_free(&conn_list[fd].input);
+        /* 释放动态输出数据；函数内部也会清零 length 和 offset。 */
+        kvs_output_buffer_free(&conn_list[fd].output);
         conn_list[fd].send_callback=NULL;
         conn_list[fd].r_action.recv_callback=NULL;
 
@@ -240,12 +243,12 @@ int accept_cb(int fd) {
 
 int recv_cb(int fd) {
 
-	int available = BUFFER_LENGTH-conn_list[fd].input.length;
-	if(available<=0){
-		fprintf(stderr,"request buffer full: %d\n",fd);
-		reactor_close_connection(fd);
-		return 0;
-	}
+        /* 本次 recv 前确保至少有一个字节可写。 */
+        if (kvs_input_buffer_ensure_space(&conn_list[fd].input, 1) < 0) {
+        reactor_close_connection(fd);
+        return 0;
+        }
+        int available = conn_list[fd].input.capacity -conn_list[fd].input.length;
 	int count = recv(fd,conn_list[fd].input.data+conn_list[fd].input.length,available,0);
 	if (count == 0) { // disconnect
 		printf("client disconnect: %d\n", fd);

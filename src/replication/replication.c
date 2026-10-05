@@ -315,8 +315,7 @@ static int kvs_replication_upstream_network_protocol(
     int connection_fd,
     char *msg,
     int length,
-    char *response,
-    int response_capacity,
+    kvs_output_buffer_t *response,
     int *consumed_length)
 {
     if(!replication_manager.initialized ||
@@ -326,7 +325,8 @@ static int kvs_replication_upstream_network_protocol(
     msg==NULL ||
     length<=0 ||
     response==NULL ||
-    response_capacity<=0 ||
+    response->capacity<=0 ||
+    response->data == NULL ||
     consumed_length==NULL){
     return -1;
     }
@@ -335,8 +335,8 @@ static int kvs_replication_upstream_network_protocol(
         connection_fd,
         msg,
         length,
-        response,
-        response_capacity,
+        response->data,
+        response->capacity,
         consumed_length,
         kvs_replication_upstream_frame_protocol      // 每条上游消息交给 PONG 处理函数
     );
@@ -408,8 +408,8 @@ if(replication_manager.state==KVS_REPLICATION_STATE_CATCH_UP ||
             connection_fd,
             msg,
             length,
-            response,
-            response_capacity,
+            response->data,
+            response->capacity,
             consumed_length,
             kvs_replication_catch_up_frame_protocol
         );
@@ -770,16 +770,20 @@ int kvs_replication_network_protocol(
     int connection_fd,
     char *msg,
     int length,
-    char *response,
-    int response_capacity,
+    kvs_output_buffer_t *response,
     int *consumed_length)
 {
+    if (response == NULL ||
+    response->data == NULL ||
+    response->capacity <= 0) {
+    return -1;
+}
     return kvs_line_batch_protocol(
         connection_fd,                        // 当前 Replica 连接
         msg,                                  // TCP 输入缓冲区
         length,                               // 当前收到的数据长度
-        response,                             // 响应缓冲区
-        response_capacity,                    // 响应缓冲区容量
+        response->data,                             // 响应缓冲区
+        response->capacity,                    // 响应缓冲区容量
         consumed_length,                      // 本次处理掉的输入字节数
         kvs_replication_frame_protocol        // 每条完整命令交给复制处理器
     );

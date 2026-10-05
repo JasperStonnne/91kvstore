@@ -8,6 +8,7 @@
 #include <sys/stat.h>    // fstat、struct stat、S_ISREG
 #include <sys/syscall.h> // SYS_close，绕过 NtyCo 的 close hook
 #include"persistence.h"
+#include "protocol.h"
 
 static FILE *aof_fp=NULL;
 /*
@@ -223,86 +224,191 @@ void kvs_aof_reader_close(kvs_aof_reader_t *reader)
     reader->offset=0;
     reader->remaining=0;
 }
-int kvs_aof_append(char **tokens, int count){
-    if(aof_fp==NULL){
+int kvs_aof_append(char **tokens, int count)
+{
+    if (aof_fp == NULL ||
+        tokens == NULL ||
+        (count != 2 && count != 3)) {
         return -1;
     }
-    if(tokens==NULL||(count!=2&&count!=3)){
+
+    kvs_slice_t fields[3];
+
+    for (int i = 0; i < count; i++) {
+        if (tokens[i] == NULL) return -1;
+
+        fields[i].data = tokens[i];
+        fields[i].length = strlen(tokens[i]);
+    }
+
+    size_t required = 0;
+    if (kvs_encoded_command_size(
+            fields, (size_t)count, &required) != 0) {
         return -1;
     }
-    if(tokens[0]==NULL||tokens[1]==NULL){
+
+    char *encoded = malloc(required);
+    if (encoded == NULL) return -1;
+
+    size_t encoded_length = 0;
+    if (kvs_encode_command(
+            fields,
+            (size_t)count,
+            encoded,
+            required,
+            &encoded_length) != 0) {
+        free(encoded);
         return -1;
     }
-    if(count==3&&tokens[2]==NULL){
+
+    size_t written = fwrite(encoded, 1, encoded_length, aof_fp);
+    free(encoded);
+
+    if (written != encoded_length ||
+        fflush(aof_fp) != 0 ||
+        fsync(fileno(aof_fp)) != 0) {
         return -1;
     }
-    int written;
-    if(count==2){
-        written = fprintf(aof_fp,"%s %s\n",tokens[0],tokens[1]);
-    }else if(count ==3){
-        written=fprintf(aof_fp,"%s %s %s\n",tokens[0],tokens[1],tokens[2]);
-    }
-    if (written < 0) {
-        return -1;
-    }
-    if (fflush(aof_fp) != 0) {
-        return -1;
-    }
-    if (fsync(fileno(aof_fp)) != 0) {
-        return -1;
-    }
+
     return 0;
 }
+int kvs_aof_replay(
+    const char *path,
+    long long offset,
+    aof_replay_handler handler)
+{
+    if (path == NULL || handler == NULL || offset < 0) {
+        return -1;
+    }
 
-int kvs_aof_replay(const char*path,long long offset,aof_replay_handler handler){
-    if(path==NULL||handler==NULL||offset<0){
-        return -1;
+    /* 使用二进制模式读取，协议解析按字节工作，不依赖文本换行。 */
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return errno == ENOENT ? 0 : -1;
     }
-    FILE *fp=fopen(path,"r");
-    if(fp==NULL){
-        if(errno==ENOENT){
-            return 0;
-        }
-        return -1;
-    }
-    if(fseeko(fp,(off_t)offset,SEEK_SET)!=0){//fp 文件 ，移动字节数 SEEK_SET从文件开头计算位置
+
+    /* 从 Snapshot 对应的 AOF 位置开始回放后续命令。 */
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
         fclose(fp);
         return -1;
     }
-    char *line=NULL;//保存我所读取到的一行
-    size_t capacity=0;//当前分配的内存容量
-    ssize_t line_length;//实际读取到的字符数
-    int replay_result=0;//每次重放的结果
-    while((line_length=getline(&line,&capacity,fp))!=-1){
-        while (line_length > 0 &&(line[line_length - 1] == '\n' ||line[line_length - 1] == '\r')) {
-            line[--line_length] = '\0';
+
+    char *input = NULL;              /* 当前正在读取的命令字节 */
+    size_t input_length = 0;         /* 已读入的命令字节数 */
+    size_t input_capacity = 0;       /* input 当前分配的容量 */
+    int replay_result = 0;
+
+    while (1) {
+        int byte = fgetc(fp);        /* 每次从 AOF 读取一个字节 */
+
+        if (byte == EOF) {
+            /*
+             * EOF 时若还剩半条命令，说明 AOF 末尾不完整；
+             * ferror 则表示读取文件本身发生错误。
+             */
+            if (ferror(fp) || input_length != 0) {
+                replay_result = -1;
+            }
+            break;
+        }
+
+        /* 当前命令占满缓冲区时扩容，避免长字段被固定长度限制。 */
+        if (input_length == input_capacity) {
+            size_t new_capacity = input_capacity == 0
+                ? 1024
+                : input_capacity * 2;
+
+            /* 容量翻倍后变小，表示 size_t 溢出了。 */
+            if (new_capacity < input_capacity) {
+                replay_result = -1;
+                break;
+            }
+
+            char *new_input = realloc(input, new_capacity);
+            if (new_input == NULL) {
+                replay_result = -1;
+                break;
+            }
+
+            input = new_input;
+            input_capacity = new_capacity;
+        }
+
+        /* 把刚读到的字节追加到当前命令末尾。 */
+        input[input_length++] = (char)byte;
+
+        /*
+         * AOF 中保存的是写命令，目前每条最多包含：
+         * 命令名、key、value 三个字段。
+         */
+        kvs_slice_t fields[3];
+        size_t field_count = 0;
+        size_t parsed_bytes = 0;
+
+        int parse_result = kvs_parse_command(
+            input,
+            input_length,
+            fields,
+            3,
+            &field_count,
+            &parsed_bytes
+        );
+
+        if (parse_result == 0) {
+            continue; /* 命令尚未读完整，继续读取后续字节。 */
+        }
+
+        /*
+         * -1 表示格式错误。
+         * parsed_bytes 必须等于当前缓冲区长度，因为我们逐字节读取，
+         * 解析成功时缓冲区里应该刚好只有这一条命令。
+         */
+        if (parse_result < 0 || parsed_bytes != input_length) {
+            replay_result = -1;
+            break;
+        }
+
+        char response[1024] = {0};
+        int response_length = handler(
+            fields,
+            field_count,
+            response,
+            sizeof(response)
+        );
+
+        /* 恢复命令必须成功，并返回约定的 OK 响应。 */
+        if (response_length <= 0 ||
+            response_length > (int)sizeof(response) ||
+            strcmp(response, "OK\r\n") != 0) {
+            replay_result = -1;
+            break;
+        }
+
+        /* 当前命令已解析并执行，清空逻辑长度后读取下一条。 */
+        input_length = 0;
     }
-    if(line_length==0){
-        continue;
-    }
-    char response[1024]={0};
-    int response_length=handler(line,(int)line_length,response);
-    if(response_length<=0||strcmp(response,"OK\r\n")!=0){
-        replay_result=-1;
-        break;
-    }
-}
-    if(ferror(fp))  {
-        replay_result=-1;
-    }
-    free(line);
+
+    /* 释放动态命令缓冲区，并检查文件是否成功关闭。 */
+    free(input);
+
     if (fclose(fp) != 0) {
         replay_result = -1;
     }
+
     return replay_result;
 }
-long long kvs_aof_get_offset(void){
-    if(aof_fp==NULL){
+
+/* 返回当前 AOF 文件的写入位置，供 Snapshot 和复制记录 offset 使用。 */
+long long kvs_aof_get_offset(void)
+{
+    if (aof_fp == NULL) {
         return -1;
     }
-    off_t offset =ftello(aof_fp);
-    if(offset==(off_t)-1){
+
+    off_t offset = ftello(aof_fp);
+    if (offset == (off_t)-1) {
         return -1;
     }
+
     return (long long)offset;
 }

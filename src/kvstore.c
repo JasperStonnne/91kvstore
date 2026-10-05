@@ -4,7 +4,10 @@
 #include "persistence.h"
 #include "replication.h"
 #include "server.h"
+#include "protocol.h"
 #include<errno.h>
+#include<limits.h>
+#include <stdint.h>
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
 #endif
@@ -91,7 +94,41 @@ static int kvs_is_write_command(int cmd){
 }
 
 
+/* 将解析出的字段复制为旧命令执行器使用的 C 字符串。 */
+static int kvs_fields_to_tokens(
+    const kvs_slice_t *fields,
+    size_t field_count,
+    char **tokens,
+    size_t token_capacity)
+{
+    if (fields == NULL || tokens == NULL ||
+        field_count == 0 || field_count > token_capacity) {
+        return -1;
+    }
 
+    for (size_t i = 0; i < field_count; i++) {
+        /* 旧执行器使用 strcmp 等函数，目前不能处理字段内的 NUL。 */
+        if (fields[i].data == NULL ||
+            fields[i].length == SIZE_MAX ||
+            memchr(fields[i].data, '\0', fields[i].length) != NULL) {
+            goto fail;
+        }
+
+        tokens[i] = malloc(fields[i].length + 1);
+        if (tokens[i] == NULL) goto fail;
+
+        memcpy(tokens[i], fields[i].data, fields[i].length);
+        tokens[i][fields[i].length] = '\0';
+    }
+    return 0;
+
+fail:
+    for (size_t i = 0; i < field_count; i++) {
+        free(tokens[i]);
+        tokens[i] = NULL;
+    }
+    return -1;
+}
 
 
 int kvs_split_token(char *msg,char*tokens[]){
@@ -113,6 +150,34 @@ int kvs_split_token(char *msg,char*tokens[]){
 
 
 }
+
+/* 根据读取命令，从对应的存储引擎中取 value。 */
+static char *kvs_get_value(int cmd, char *key)
+{
+    if (key == NULL) return NULL;
+
+    switch (cmd) {
+#if ENABLE_ARRAY
+    case KVS_CMD_GET:
+        return kvs_array_get(&global_array, key);
+#endif
+#if ENABLE_RBTREE
+    case KVS_CMD_RGET:
+        return kvs_rbtree_get(&global_rbtree, key);
+#endif
+#if ENABLE_HASH
+    case KVS_CMD_HGET:
+        return kvs_hash_get(&global_hash, key);
+#endif
+#if ENABLE_SKIPLIST
+    case KVS_CMD_SGET:
+        return kvs_skiplist_get(&global_skiplist, key);
+#endif
+    default:
+        return NULL;
+    }
+}
+
 //SET Key Value
 //tokens[0]:SET
 //tokens[1]:Key
@@ -154,7 +219,7 @@ int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_sourc
         
         break;
     case KVS_CMD_GET:{
-    char *result=kvs_array_get(&global_array,key);
+    char *result = kvs_get_value(cmd, key);
     if(result==NULL){
         length=sprintf(response,"NO EXIST\r\n");
     }else {
@@ -205,7 +270,7 @@ int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_sourc
         
         break;
     case KVS_CMD_RGET:{
-    char *result=kvs_rbtree_get(&global_rbtree,key); 
+    char *result = kvs_get_value(cmd, key); 
     if(result==NULL){
         length=sprintf(response,"NO EXIST\r\n");
     }else {
@@ -255,7 +320,7 @@ int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_sourc
         
         break;
     case KVS_CMD_HGET:{
-    char *result=kvs_hash_get(&global_hash,key); 
+    char *result = kvs_get_value(cmd, key);
     if(result==NULL){
         length=sprintf(response,"NO EXIST\r\n");
     }else {
@@ -305,7 +370,7 @@ int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_sourc
         
         break;
     case KVS_CMD_SGET:{
-    char *result=kvs_skiplist_get(&global_skiplist,key); 
+    char *result = kvs_get_value(cmd, key);
     if(result==NULL){
         length=sprintf(response,"NO EXIST\r\n");
     }else {
@@ -371,7 +436,157 @@ static int kvs_trim_command_end(char *msg,int length){
     return length;
 }
 
+/* 统一执行已经拆好的命令字段，供旧格式和新格式共用。 */
+static int kvs_execute_tokens(
+    char **tokens,
+    int count,
+    char *response,
+    kvs_command_source_t source)
+{
+    if (tokens == NULL || count <= 0 ||
+        tokens[0] == NULL || response == NULL) {
+        return -1;
+    }
 
+    if (count == 1 && strcmp(tokens[0], "SAVE") == 0) {
+        int result = kvs_snapshot_save("snapshot.db", NULL);
+        return sprintf(response, result < 0 ? "ERROR\r\n" : "OK\r\n");
+    }
+
+    return kvs_filter_protocol(tokens, count, response, source);
+}
+
+
+
+
+/* 将读取到的 value 编码成长度格式响应，空间不够时先扩容。 */
+static int kvs_encode_value_to_output(
+    kvs_output_buffer_t *output,
+    const char *value)
+{
+    if (output == NULL || value == NULL) return -1;
+
+    kvs_slice_t value_slice = {
+        .data = value,
+        .length = strlen(value)
+    };
+
+    size_t required = 0;
+    if (kvs_encoded_value_response_size(&value_slice, &required) != 0 ||
+        required > INT_MAX) {
+        return -1;
+    }
+
+    if (kvs_output_buffer_ensure_space(output, (int)required) < 0) {
+        return -1;
+    }
+
+    size_t encoded_bytes = 0;
+    if (kvs_encode_value_response(
+            &value_slice,
+            output->data,
+            (size_t)output->capacity,
+            &encoded_bytes) != 0 ||
+        encoded_bytes > INT_MAX) {
+        return -1;
+    }
+
+    return (int)encoded_bytes;
+}
+
+/* 判断命令是否属于某个存储引擎的读取命令。 */
+static int kvs_is_get_command(const char *name)
+{
+    if (name == NULL) return 0;
+
+    return strcmp(name, "GET") == 0 ||
+           strcmp(name, "RGET") == 0 ||
+           strcmp(name, "HGET") == 0 ||
+           strcmp(name, "SGET") == 0;
+}
+
+/* 将长度协议的字段交给现有命令执行器。 */
+static int kvs_execute_fields(
+    const kvs_slice_t *fields,
+    size_t field_count,
+    kvs_output_buffer_t *response,
+    kvs_command_source_t source)
+{
+    char *tokens[KVS_MAX_TOKENS] = {0};
+
+    if (response == NULL ||
+        response->data == NULL ||
+        response->capacity <= 0 ||
+        field_count > INT_MAX ||
+        kvs_fields_to_tokens(
+            fields, field_count, tokens, KVS_MAX_TOKENS) != 0) {
+        return -1;
+    }
+
+        if (field_count == 2 && kvs_is_get_command(tokens[0])) {
+        int command_id = KVS_CMD_START;
+
+        while (command_id < KVS_CMD_COUNT &&
+               strcmp(tokens[0], command[command_id]) != 0) {
+            command_id++;
+        }
+
+        if (command_id < KVS_CMD_COUNT) {
+            char *value = kvs_get_value(command_id, tokens[1]);
+            int result;
+
+            if (value == NULL) {
+                result = sprintf(response->data, "NO EXIST\r\n");
+            } else {
+                result = kvs_encode_value_to_output(response, value);
+            }
+
+            for (size_t i = 0; i < field_count; i++) {
+                free(tokens[i]);
+            }
+
+            return result;
+        }
+    }
+
+    int result = kvs_execute_tokens(
+        tokens,
+        (int)field_count,
+        response->data,
+        source
+    );
+
+    for (size_t i = 0; i < field_count; i++) {
+        free(tokens[i]);
+    }
+
+    return result;
+}
+
+/* 将 AOF 解析出的字段交给现有恢复命令执行器。 */
+static int kvs_aof_replay_protocol(
+    const kvs_slice_t *fields,
+    size_t field_count,
+    char *response,
+    int response_capacity)
+{
+    if (response == NULL || response_capacity <= 0) {
+        return -1;
+    }
+
+    /* 把 AOF 提供的响应空间包装成命令执行器需要的结构。 */
+    kvs_output_buffer_t output = {
+        .data = response,
+        .capacity = response_capacity
+    };
+
+    return kvs_execute_fields(
+        fields,
+        field_count,
+        &output,
+        KVS_COMMAND_SOURCE_RECOVERY
+    );
+}
 
 
 /*
@@ -398,15 +613,7 @@ static int kvs_execute_command(char *msg,int length,char *response,kvs_command_s
 
     int count=kvs_split_token(msg,tokens);//count的作用是 有多少个tokens
     if (count==-1) return -1;
-    if(count==1&&strcmp(tokens[0],"SAVE")==0){
-        int save_result=kvs_snapshot_save("snapshot.db",NULL);
-        if(save_result<0){
-            return sprintf(response,"ERROR\r\n");
-        }
-        return sprintf(response, "OK\r\n");
-    }
-    //memcpy(response,msg,length);
-    return kvs_filter_protocol(tokens,count,response,source);
+    return kvs_execute_tokens(tokens, count, response, source);
 }
 //适配三参数客户端接口 并且补充CLIENT 命令来源（适配起函数
 static int kvs_client_protocol(int connection_fd,char *msg,int length,char *response,int response_capacity){
@@ -456,20 +663,59 @@ int kvs_batch_protocol(
     );
 }
 
-static int kvs_network_protocol(int connection_fd,char *msg,int length,char *response,int response_capacity,int *consumed_length){
-
-    (void)connection_fd;
-        return kvs_line_batch_protocol(
-        connection_fd,                 // 保留真实的客户端连接 fd
-        msg,
-        length,
-        response,
-        response_capacity,
-        consumed_length,
-        kvs_client_protocol            // 每条完整命令交给客户端命令处理器
-    );
+static int kvs_network_protocol(
+    int connection_fd,
+    char *msg,
+    int length,
+    kvs_output_buffer_t *response,
+    int *consumed_length)
+{
+    if (msg == NULL ||
+    response == NULL ||
+    response->data == NULL ||
+    consumed_length == NULL ||
+    length < 0 ||
+    response->capacity <= 0) {
+    return -1;
 }
 
+    *consumed_length = 0;
+    if (length == 0) return 0;
+
+    if (msg[0] == '*') {
+        kvs_slice_t fields[KVS_MAX_TOKENS];
+        size_t field_count = 0;
+        size_t parsed_bytes = 0;
+
+        int status = kvs_parse_command(
+            msg, (size_t)length,
+            fields, KVS_MAX_TOKENS,
+            &field_count, &parsed_bytes
+        );
+
+        if (status <= 0) return status; /* 0：等更多数据；-1：格式错误 */
+
+        int response_length = kvs_execute_fields(
+    fields,
+    field_count,
+    response,
+    KVS_COMMAND_SOURCE_CLIENT
+);
+        if (response_length < 0 || response_length > response->capacity) {
+            return -1;
+        }
+
+        *consumed_length = (int)parsed_bytes;
+        return response_length;
+    }
+
+    /* 旧格式暂时仍按行处理。 */
+    return kvs_line_batch_protocol(
+        connection_fd, msg, length, response->data,
+        response->capacity, consumed_length,
+        kvs_client_protocol
+    );
+}
 int init_kvengine(void){
 
 #if ENABLE_ARRAY
@@ -648,7 +894,7 @@ int main(int argc,char *argv[]){
         fprintf(stderr,"failed to load snapshot\n");
         return -1;
     }
-    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_recovery_protocol);
+    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_aof_replay_protocol);
     if(replay_ret<0){
         fprintf(stderr, "failed to replay AOF\n");
         return -1;
