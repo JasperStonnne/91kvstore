@@ -1,5 +1,103 @@
 #include<string.h>
+#include <limits.h>
+#include <stdlib.h>
 #include"server.h"
+
+/* 输入、输出缓冲区共用的扩容逻辑；只管理内存，不读写数据。 */
+static int ensure_buffer_space(
+    char **data,
+    int length,
+    int *capacity,
+    int minimum_free)
+{
+    if (data == NULL || capacity == NULL || minimum_free <= 0 ||
+        length < 0 || *capacity < 0 || length > *capacity) {
+        return -1;
+    }
+
+    /* 未分配时为 NULL/0；已分配时指针与容量都有效。 */
+    if ((*capacity == 0 && *data != NULL) ||
+        (*capacity > 0 && *data == NULL)) {
+        return -1;
+    }
+
+    if (*capacity - length >= minimum_free) return 0;
+    if (length > INT_MAX - minimum_free) return -1;
+
+    int required = length + minimum_free;
+    int new_capacity = *capacity > 0 ? *capacity : BUFFER_LENGTH;
+
+    /* 倍增容量，减少反复分配；同时避免整数溢出。 */
+    while (new_capacity < required) {
+        new_capacity = new_capacity > INT_MAX / 2
+            ? required : new_capacity * 2;
+    }
+
+    char *new_data = realloc(*data, (size_t)new_capacity);
+    if (new_data == NULL) return -1;
+
+    *data = new_data;
+    *capacity = new_capacity;
+    return 0;
+}
+
+/* 输入缓冲区保证至少还有 minimum_free 字节可接收。 */
+int kvs_input_buffer_ensure_space(
+    kvs_input_buffer_t *buffer,
+    int minimum_free)
+{
+    if (buffer == NULL) return -1;
+
+    return ensure_buffer_space(
+        &buffer->data,
+        buffer->length,
+        &buffer->capacity,
+        minimum_free
+    );
+}
+
+/* 连接结束时释放输入缓冲区。 */
+void kvs_input_buffer_free(kvs_input_buffer_t *buffer)
+{
+    if (buffer == NULL) return;
+
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->length = 0;
+    buffer->capacity = 0;
+}
+
+/* 输出缓冲区保证至少还有 minimum_free 字节可写。 */
+int kvs_output_buffer_ensure_space(
+    kvs_output_buffer_t *buffer,
+    int minimum_free)
+{
+    if (buffer == NULL ||
+        buffer->offset < 0 ||
+        buffer->offset > buffer->length) {
+        return -1;
+    }
+
+    return ensure_buffer_space(
+        &buffer->data,
+        buffer->length,
+        &buffer->capacity,
+        minimum_free
+    );
+}
+
+/* 连接结束时释放输出缓冲区。 */
+void kvs_output_buffer_free(kvs_output_buffer_t *buffer)
+{
+    if (buffer == NULL) return;
+
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->length = 0;
+    buffer->offset = 0;
+    buffer->capacity = 0;
+}
+
 //删除请求缓冲区前面已经处理的字节，把末尾尚未处理的数据移动到开头。
 int kvs_input_buffer_consume(kvs_input_buffer_t *buffer,int consumed_length){
     if(buffer==NULL||consumed_length>buffer->length||consumed_length<0){

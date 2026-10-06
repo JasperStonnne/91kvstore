@@ -53,94 +53,141 @@ typedef struct snapshot_write_context {
     FILE *fp;
     const char *command;
 } snapshot_write_context_t;
-static int snapshot_write_item(const char *key,const char *value,void *context) {
-    if (key == NULL ||value == NULL ||context == NULL) {
-        return -1;
-    }
-    snapshot_write_context_t *ctx=(snapshot_write_context_t *)context;
-    if(ctx->fp==NULL||ctx->command==NULL){
-        return -1;
-    }
-    int written=0;
-    written=fprintf(ctx->fp,"%s %s %s\n",ctx->command,key,value);
-    if(written<0){
-        return -1;
-    }
-    return 0;
-}
-int kvs_snapshot_reader_open(kvs_snapshot_reader_t *reader,const char *path,long long expected_size){
-        if(reader==NULL ||
-       path==NULL ||
-       path[0]=='\0' ||
-       expected_size<=0){
-        return -1;
-    }
-    reader->fd=-1;
-    reader->remaining=0;
 
-        int fd=open(path,O_RDONLY);
-    if(fd<0){
+/* 将一个键值对编码成长度格式命令并写入 Snapshot。 */
+static int snapshot_write_item(
+    const char *key,
+    const char *value,
+    void *context)
+{
+    if (key == NULL || value == NULL || context == NULL) {
         return -1;
     }
-        struct stat file_info;
-    if(fstat(fd,&file_info)!=0 ||
-       !S_ISREG(file_info.st_mode) ||
-       (long long)file_info.st_size != expected_size){
+
+    snapshot_write_context_t *ctx = context;
+    if (ctx->fp == NULL || ctx->command == NULL) {
+        return -1;
+    }
+
+    /* 三个字段分别是命令名、key 和 value。 */
+    kvs_slice_t fields[3] = {
+        { .data = ctx->command, .length = strlen(ctx->command) },
+        { .data = key,          .length = strlen(key) },
+        { .data = value,        .length = strlen(value) }
+    };
+
+    /* 先算出完整命令大小，再分配恰好够用的临时空间。 */
+    size_t required = 0;
+    if (kvs_encoded_command_size(fields, 3, &required) != 0) {
+        return -1;
+    }
+
+    char *encoded = malloc(required);
+    if (encoded == NULL) {
+        return -1;
+    }
+
+    size_t encoded_length = 0;
+    if (kvs_encode_command(
+            fields, 3, encoded, required, &encoded_length) != 0) {
+        free(encoded);
+        return -1;
+    }
+
+    /* fwrite 按字节写入；帧与帧之间不需要再加换行分隔。 */
+    size_t written = fwrite(encoded, 1, encoded_length, ctx->fp);
+    free(encoded);
+
+    return written == encoded_length ? 0 : -1;
+}
+
+/* 打开 Snapshot 文件，并确认文件大小与协商值一致。 */
+int kvs_snapshot_reader_open(
+    kvs_snapshot_reader_t *reader,
+    const char *path,
+    long long expected_size)
+{
+    if (reader == NULL ||
+        path == NULL ||
+        path[0] == '\0' ||
+        expected_size <= 0) {
+        return -1;
+    }
+
+    reader->fd = -1;
+    reader->remaining = 0;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct stat file_info;
+    if (fstat(fd, &file_info) != 0 ||
+        !S_ISREG(file_info.st_mode) ||
+        (long long)file_info.st_size != expected_size) {
         kvs_snapshot_file_close(fd);
         return -1;
     }
-    reader->fd=fd;
-    reader->remaining=expected_size;
+
+    reader->fd = fd;
+    reader->remaining = expected_size;
     return 0;
 }
-    int kvs_snapshot_reader_read(
+
+/* 读取 Snapshot 的下一块字节，供主从复制发送。 */
+int kvs_snapshot_reader_read(
     kvs_snapshot_reader_t *reader,
     char *output,
     int output_capacity)
 {
-    if(reader==NULL ||
-       reader->fd<0 ||
-       reader->remaining<0 ||
-       output==NULL ||
-       output_capacity<=0){
+    if (reader == NULL ||
+        reader->fd < 0 ||
+        reader->remaining < 0 ||
+        output == NULL ||
+        output_capacity <= 0) {
         return -1;
     }
 
-    if(reader->remaining==0){
-        return 0; // 协商的 Snapshot 字节已经全部读完
+    if (reader->remaining == 0) {
+        return 0; /* Snapshot 已全部读完。 */
     }
 
-    int read_size=output_capacity;
-    if(reader->remaining<read_size){
-        read_size=(int)reader->remaining; // 最后一块只读取剩余字节
+    int read_size = output_capacity;
+    if (reader->remaining < read_size) {
+        read_size = (int)reader->remaining;
     }
 
     ssize_t result;
-    do{
-        result=kvs_snapshot_file_read(reader->fd,output,(size_t)read_size);
-    }while(result<0 && errno==EINTR);
+    do {
+        result = kvs_snapshot_file_read(
+            reader->fd,
+            output,
+            (size_t)read_size
+        );
+    } while (result < 0 && errno == EINTR);
 
-    if(result<=0){
-        return -1; // 文件提前结束或读取失败
+    if (result <= 0) {
+        return -1; /* 文件提前结束或读取失败。 */
     }
 
-    reader->remaining-=result;
+    reader->remaining -= result;
     return (int)result;
 }
 
-void kvs_snapshot_reader_close(
-    kvs_snapshot_reader_t *reader)
+/* 关闭 Snapshot 文件并清空 reader 状态。 */
+void kvs_snapshot_reader_close(kvs_snapshot_reader_t *reader)
 {
-    if(reader==NULL){
+    if (reader == NULL) {
         return;
     }
 
-    if(reader->fd>=0){
+    if (reader->fd >= 0) {
         kvs_snapshot_file_close(reader->fd);
     }
 
-    reader->fd=-1;
-    reader->remaining=0;
+    reader->fd = -1;
+    reader->remaining = 0;
 }
 
 int kvs_snapshot_writer_open(
@@ -398,11 +445,11 @@ int kvs_snapshot_save(const char *path,kvs_snapshot_metadata_t *metadata){
 }
     return 0;
 }
-long long kvs_snapshot_load(const char* path,aof_replay_handler handler){
+long long kvs_snapshot_load(const char* path,snapshot_replay_handler handler){
     if(path==NULL||handler==NULL){
         return -1;
     }
-    FILE *fp=fopen(path,"r");
+    FILE *fp=fopen(path,"rb");
    if (fp == NULL) {
         if (errno == ENOENT) {
             return 0;
@@ -424,22 +471,95 @@ long long kvs_snapshot_load(const char* path,aof_replay_handler handler){
         fclose(fp);
         return -1;
     }
-    int load_result=0;
-    while((line_length=getline(&line,&capacity,fp))!=-1){
-        while(line_length>0&&(line[line_length-1]=='\n'||line[line_length-1]=='\r')){
-            line[--line_length]='\0';
-        }
-        if (line_length == 0) {
-            continue;
-    }
-        char response[1024]={0};
-        int response_length=handler(line,(int)line_length,response);
-        if(response_length<0||strcmp(response, "OK\r\n") != 0){
-            load_result=-1;
+        int load_result = 0;
+
+    /* 头部已经读完，释放 getline 使用的缓冲区。 */
+    free(line);
+    line = NULL;
+    capacity = 0;
+
+    char *input = NULL;             /* 当前 Snapshot 命令的字节 */
+    size_t input_length = 0;        /* 已读入的字节数 */
+    size_t input_capacity = 0;      /* input 当前容量 */
+
+    while (1) {
+        int byte = fgetc(fp);       /* 每次读取一个字节 */
+
+        if (byte == EOF) {
+            /* 文件末尾不能留下半条命令；同时检查文件读取错误。 */
+            if (ferror(fp) || input_length != 0) {
+                load_result = -1;
+            }
             break;
         }
 
+        /* 当前命令缓冲区不够时扩容，支持较长的 key/value。 */
+        if (input_length == input_capacity) {
+            size_t new_capacity = input_capacity == 0
+                ? 1024
+                : input_capacity * 2;
+
+            /* 容量翻倍后变小，表示 size_t 溢出。 */
+            if (new_capacity < input_capacity) {
+                load_result = -1;
+                break;
+            }
+
+            char *new_input = realloc(input, new_capacity);
+            if (new_input == NULL) {
+                load_result = -1;
+                break;
+            }
+
+            input = new_input;
+            input_capacity = new_capacity;
+        }
+
+        input[input_length++] = (char)byte;
+
+        /* Snapshot 每条记录包含命令名、key、value 三个字段。 */
+        kvs_slice_t fields[3];
+        size_t field_count = 0;
+        size_t parsed_bytes = 0;
+
+        int parse_result = kvs_parse_command(
+            input,
+            input_length,
+            fields,
+            3,
+            &field_count,
+            &parsed_bytes
+        );
+
+        if (parse_result == 0) {
+            continue; /* 帧还不完整，继续读文件。 */
+        }
+
+        if (parse_result < 0 || parsed_bytes != input_length) {
+            load_result = -1;
+            break;
+        }
+
+        char response[1024] = {0};
+        int response_length = handler(
+            fields,
+            field_count,
+            response,
+            sizeof(response)
+        );
+
+        if (response_length <= 0 ||
+            response_length > (int)sizeof(response) ||
+            strcmp(response, "OK\r\n") != 0) {
+            load_result = -1;
+            break;
+        }
+
+        /* 当前帧已加载，复用缓冲区读取下一条记录。 */
+        input_length = 0;
     }
+
+    free(input);
     if(ferror(fp)){
         load_result=-1;
     }

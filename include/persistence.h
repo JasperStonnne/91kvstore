@@ -1,5 +1,6 @@
 #ifndef KVS_PERSISTENCE_H
 #define KVS_PERSISTENCE_H
+#include "protocol.h"
 int kvs_aof_open(const char *path);
 int kvs_aof_append(char **tokens, int count);
 int kvs_aof_close(void);
@@ -9,9 +10,17 @@ int kvs_aof_close(void);
  */
 int kvs_aof_reset_to_offset(long long offset);
 typedef int (*aof_replay_handler)(
-    char *msg,
-    int length,
-    char *response
+    const kvs_slice_t *fields,
+    size_t field_count,
+    char *response,
+    int response_capacity
+);
+typedef int (*snapshot_replay_handler)(
+    const kvs_slice_t *fields,
+    size_t field_count,
+    char *response,
+    int response_capacity
+
 );
 int kvs_aof_replay(const char *path,long long offset,aof_replay_handler handler);
 typedef struct {
@@ -44,5 +53,5 @@ void kvs_snapshot_writer_abort(kvs_snapshot_writer_t *writer,const char *temp_pa
 
 int kvs_snapshot_save(const char *path,kvs_snapshot_metadata_t *metadata);
 long long kvs_aof_get_offset(void);
-long long kvs_snapshot_load(const char* path,aof_replay_handler handler);
+long long kvs_snapshot_load(const char* path,snapshot_replay_handler handler);
 #endif

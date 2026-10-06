@@ -51,6 +51,9 @@ static void proactor_close_connection(int fd)
     proactor_connections[fd]=NULL;
 
     close(fd);
+    /* 输入数据已单独分配，先释放它，再释放连接结构体。 */
+    kvs_input_buffer_free(&connection->input);
+    kvs_output_buffer_free(&connection->output);
     free(connection);
 
     if(close_handler!=NULL){
@@ -261,19 +264,18 @@ static int proactor_process_input(
 
         connection->output.offset=0;
         connection->output.length=
-            connection->handler(
-                connection->fd,
-                connection->input.data,
-                connection->input.length,
-                connection->output.data,
-                BUFFER_LENGTH,
-                &consumed_length
-            );
+    connection->handler(
+        connection->fd,
+        connection->input.data,
+        connection->input.length,
+        &connection->output,
+        &consumed_length
+    );
 
-        if(connection->output.length<0 ||
-           connection->output.length>BUFFER_LENGTH){
-            return -1;
-        }
+    if(connection->output.length < 0 ||
+    connection->output.length > connection->output.capacity){
+        return -1;
+    }
 
         if(kvs_input_buffer_consume(
                 &connection->input,
@@ -436,12 +438,18 @@ static int proactor_register_connector(
 
     connection->fd=fd;
     connection->handler=
-        connector->message_handler;
+    connector->message_handler;
     connection->stream_handler=NULL;
     connection->close_handler=
-        connector->close_handler;
+    connector->close_handler;
 
     proactor_connections[fd]=connection;
+
+    /* open_handler 会把初始消息写入 output.data，先分配空间。 */
+    if (kvs_output_buffer_ensure_space(&connection->output, BUFFER_LENGTH) < 0) {
+        proactor_close_connection(fd);
+        return -1;
+    }
 
     /*
      * TCP 连接建立后，让复制模块生成第一条 PING。
@@ -463,7 +471,7 @@ static int proactor_register_connector(
         if(connection->close_handler!=NULL){
             connection->close_handler(fd);
         }
-
+        kvs_output_buffer_free(&connection->output);
         free(connection);
         return -1;
     }
@@ -482,15 +490,20 @@ static int proactor_register_connector(
             connection->output.length,
             0
         );
-    }else{
-        event_result=set_event_recv(
+} else {
+    /* 没有初始消息要发送时，先分配输入空间再提交 RECV。 */
+    if (kvs_input_buffer_ensure_space(&connection->input, 1) < 0) {
+        event_result = -1;
+    } else {
+        event_result = set_event_recv(
             ring,
             fd,
             connection->input.data,
-            BUFFER_LENGTH,
+            connection->input.capacity,
             0
         );
     }
+}
 
     if(event_result<0){
         proactor_connections[fd]=NULL;
@@ -499,7 +512,8 @@ static int proactor_register_connector(
         if(connection->close_handler!=NULL){
             connection->close_handler(fd);
         }
-
+        kvs_input_buffer_free(&connection->input);
+        kvs_output_buffer_free(&connection->output);
         free(connection);
         return -1;
     }
@@ -614,8 +628,24 @@ while(1){
              connection->stream_handler=listener->stream_handler;
              proactor_connections[connfd]=connection;
 
+            if (kvs_output_buffer_ensure_space(
+                    &connection->output, BUFFER_LENGTH) < 0 ||
+                kvs_input_buffer_ensure_space(
+                    &connection->input, 1) < 0) {
+                proactor_close_connection(connfd);
+                continue;
+            }
 
-             set_event_recv(&ring,connfd,connection->input.data,BUFFER_LENGTH,0);
+            /* 输入缓冲区有空间后，只提交一次接收操作。 */
+            if (set_event_recv(
+                    &ring,
+                    connfd,
+                    connection->input.data,
+                    connection->input.capacity,
+                    0) < 0) {
+                proactor_close_connection(connfd);
+                continue;
+            }
 
 
 
@@ -648,18 +678,29 @@ while(1){
                     proactor_close_connection(result.fd);
                     continue;
                 }
-            if(connection->output.length==0){
-                int available=BUFFER_LENGTH-connection->input.length;//计算剩下的空间
-                if(available<=0){
-                    proactor_close_connection(result.fd);
+                if (connection->output.length == 0) {
+                    /*
+                    * 上一次 RECV 已完成；此时没有接收操作使用 data，
+                    * 可以安全扩容，再提交下一次 RECV。
+                    */
+                    if (kvs_input_buffer_ensure_space(&connection->input, 1) < 0) {
+                        proactor_close_connection(result.fd);
+                        continue;
+                    }
+
+                    int available = connection->input.capacity -
+                                    connection->input.length;
+                    if (set_event_recv(
+                            &ring,
+                            result.fd,
+                            connection->input.data + connection->input.length,
+                            available,
+                            0
+                        ) < 0) {
+                        proactor_close_connection(result.fd);
+                    }
                     continue;
                 }
-
-                set_event_recv(&ring,result.fd,connection->input.data+connection->input.length,available,0);
-
-                continue;
-
-            }
                 if(set_event_send(&ring,result.fd,connection->output.data,connection->output.length,0)<0){
                     proactor_close_connection(result.fd);
                 }
@@ -719,14 +760,6 @@ while(1){
                     continue;
                 }
 
-                int available=BUFFER_LENGTH-connection->input.length;
-                if(available<=0){
-                    proactor_close_connection(result.fd);
-                    continue;
-                }
-
-                set_event_recv(&ring,result.fd,connection->input.data+connection->input.length,available,0);
-
             }else if(result.event==EVENT_STREAM_RETRY){
                 /*
                 * timeout 到期时，io_uring 通常返回 -ETIME。
@@ -772,22 +805,21 @@ while(1){
                     continue;
                 }
 
-                /*
-                * stream_result == 0：
-                * 复制流已经结束，重新等待对端输入。
-                */
-                int available=
-                    BUFFER_LENGTH-connection->input.length;
+                /* 流式输出结束后，重新等待对端输入。 */
+                if (kvs_input_buffer_ensure_space(&connection->input, 1) < 0) {
+                    proactor_close_connection(result.fd);
+                    continue;
+                }
 
-                if(available<=0 ||
-                set_event_recv(
+                int available = connection->input.capacity -
+                                connection->input.length;
+                if (set_event_recv(
                         &ring,
                         result.fd,
-                        connection->input.data+
-                            connection->input.length,
+                        connection->input.data + connection->input.length,
                         available,
-                        0)<0){
-
+                        0
+                    ) < 0) {
                     proactor_close_connection(result.fd);
                     continue;
                 }

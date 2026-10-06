@@ -45,6 +45,7 @@ LDLIBS := -luring -lntyco -lpthread -ldl
 
 OBJS := \
 	$(BUILD_DIR)/kvstore.o \
+	$(BUILD_DIR)/codec.o \
 	$(BUILD_DIR)/reactor.o \
 	$(BUILD_DIR)/proactor.o \
 	$(BUILD_DIR)/ntyco.o \
@@ -94,7 +95,13 @@ $(BUILD_DIR)/kvstore.o: \
 	$(SRC_DIR)/kvstore.c \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/replication.h \
+	$(INCLUDE_DIR)/protocol.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/codec.o: \
+	$(SRC_DIR)/protocol/codec.c \
+	$(INCLUDE_DIR)/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/reactor.o: \
@@ -166,6 +173,18 @@ $(BUILD_DIR)/buffer.o: \
 $(BIN_DIR)/testcase: \
 	$(TEST_DIR)/testcase.c | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
+
+test-protocol: $(BIN_DIR)/test_protocol
+	./$(BIN_DIR)/test_protocol
+
+$(BIN_DIR)/test_protocol: \
+        $(TEST_DIR)/test_protocol.c \
+        $(SRC_DIR)/protocol/codec.c \
+        $(INCLUDE_DIR)/protocol.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		$(TEST_DIR)/test_protocol.c \
+		$(SRC_DIR)/protocol/codec.c \
+		-o $@
 
 test-memory-pool: $(BIN_DIR)/test_memory_pool
 	./$(BIN_DIR)/test_memory_pool
