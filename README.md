@@ -1,34 +1,28 @@
 # 91kvstore
 
 ```text
-  999   1   K  K  V   V   SSS  TTTTT   OOO   RRRR   EEEEE
- 9   9 11   K K   V   V  S       T    O   O  R   R  E
-  9999  1   KK    V   V   SSS    T    O   O  RRRR   EEEE
-     9  1   K K    V V       S   T    O   O  R  R   E
-  999  111  K  K    V    SSSS    T     OOO   R   R  EEEEE
+ ███     █    █   █  █   █   ████  █████   ███   ████   █████
+█   █   ██    █  █   █   █  █        █    █   █  █   █  █
+█   █    █    █ █    █   █  █        █    █   █  █   █  █
+ ████    █    ██     █   █   ███     █    █   █  ████   ████
+    █    █    █ █     █ █       █    █    █   █  █ █    █
+   █     █    █  █    █ █       █    █    █   █  █  █   █
+███    █████  █   █    █    ████     █     ███   █   █  █████
 ```
 
-**一个用 C 实现的持久化键值存储实验项目**
+**A persistent key-value store in C, built from engines to replication.**
 
-存储引擎 · TCP 协议 · AOF / Snapshot · 主从复制
+`Linux` · `GNU C11` · `4 storage engines` · `3 network backends` · `AOF + Snapshot` · `Primary-Replica`
 
+91kvstore 是一个用于学习数据库系统的键值存储项目。它不只实现单个数据结构，而是将 **TCP 字节流 → 命令解析 → 存储引擎 → 持久化 → 主从复制** 接成一条可运行、可测试的链路。
 
-91kvstore 用于实践键值数据库的核心链路：命令解析、内存存储、网络事件处理、持久化恢复和 Primary-Replica 复制。项目面向 Linux，目前提供四种内存引擎和三种可选网络后端。
+> 本项目用于学习和实验，不建议用于生产环境。它接受 RESP 风格的长度前缀**请求**，但目前不是完整的 Redis/RESP2 实现，不能保证与 `redis-cli` 兼容。
 
-> 这是学习与实验项目，不建议用于生产环境。
+## 一分钟体验
 
-## 功能概览
+### 1. 构建并启动
 
-- Array、Hash Table、Red-Black Tree、Skip List 四种存储引擎
-- Reactor/epoll、Proactor/io_uring、NtyCo 协程三种网络后端
-- CRLF 行命令及长度前缀命令；处理 TCP 半包、粘包和部分发送
-- AOF 写入与启动重放、Snapshot 保存及基于 AOF offset 的恢复
-- 基于 Snapshot 全量同步和 AOF 增量流的异步主从复制
-- 固定大小节点内存池、协议测试、内存测试和基准测试
-
-## 环境与构建
-
-需要 Linux、GCC（GNU C11）、GNU Make、liburing 和 pthread。Ubuntu/Debian 可安装：
+需要 Linux、GCC、GNU Make、liburing，以及仓库中的 NtyCo 子模块。Ubuntu/Debian 可先安装：
 
 ```bash
 sudo apt update
@@ -39,41 +33,95 @@ sudo apt install -y build-essential git liburing-dev netcat-openbsd
 git clone --recursive https://github.com/JasperStonnne/91kvstore.git
 cd 91kvstore
 make
-```
 
-已有仓库缺少 NtyCo 子模块时，运行 `git submodule update --init --recursive`。
-
-## 快速开始
-
-在独立的工作目录启动服务；`appendonly.aof` 和 `snapshot.db` 保存在**启动时的工作目录**：
-
-```bash
+KVSTORE_BIN="$PWD/bin/kvstore"
 mkdir -p /tmp/91kv-standalone
 cd /tmp/91kv-standalone
-/path/to/91kvstore/bin/kvstore 2000
+"$KVSTORE_BIN" 2000
 ```
 
-另开终端发送旧格式行命令：
+服务在前台运行。另开终端发送命令。AOF 和 Snapshot 文件会写入**启动服务时的工作目录**，因此示例使用独立的 `/tmp/91kv-standalone`。
+
+已有仓库缺少子模块时，运行 `git submodule update --init --recursive`。
+
+### 2. 写入与读取
+
+旧的行命令仍可使用：
 
 ```bash
 printf 'HSET username jasper\r\n' | nc -N 127.0.0.1 2000
+# OK
+
 printf 'HGET username\r\n' | nc -N 127.0.0.1 2000
+# jasper
 ```
 
-也可以发送长度前缀命令。下面的 key 为 `user name`，value 为 `hello world`，字段中的空格不会被拆开：
+长度前缀命令能保留字段中的空格。下面写入 key `user name` 和 value `hello world`：
 
 ```bash
 printf '*3\r\n$4\r\nHSET\r\n$9\r\nuser name\r\n$11\r\nhello world\r\n' |
   nc -N 127.0.0.1 2000
-printf '*2\r\n$4\r\nHGET\r\n$9\r\nuser name\r\n' |
-  nc -N 127.0.0.1 2000
+# OK
 ```
 
-长度前缀请求采用 `*字段数\r\n`，每个字段采用 `$字节数\r\n内容\r\n`。解析器按字节长度识别完整命令，网络层可以分多次接收同一条命令。**这不是完整的 Redis/RESP2 实现**：部分回复仍使用项目自身的文本状态，不能保证 `redis-cli` 兼容；字段也暂不支持嵌入 `\0`。
+```bash
+printf '*2\r\n$4\r\nHGET\r\n$9\r\nuser name\r\n' |
+  nc -N 127.0.0.1 2000
+# $11
+# hello world
+```
 
-## 命令
+`$9` 和 `$11` 是后续字段的**字节长度**，不是命令语法中的固定数字；换成其他内容时也要相应修改。
 
-命令前缀选择存储引擎；`SET` 创建新键，`MOD` 修改已有键。
+## 系统如何工作
+
+```text
+                         TCP client
+                             │
+                             ▼
+             Reactor / Proactor / NtyCo
+                             │
+                             ▼
+                动态输入缓冲区
+                             │
+                             ▼
+            行命令 / 长度前缀命令解析
+                             │
+                             ▼
+                       命令执行
+                  ┌──────────┴──────────┐
+                  ▼                     ▼
+          内存存储引擎          AOF 写入 / Snapshot
+                  │                     │
+                  └──────────┬──────────┘
+                             ▼
+                    动态输出缓冲区
+                             │
+                             ▼
+                         TCP client
+
+          Primary Snapshot + AOF
+                    │
+                    ▼
+          Replica 全量同步 + 增量追赶
+```
+
+网络后端只负责连接、收发和缓冲区；长度前缀解析集中在协议模块。命令执行层根据命令前缀选择引擎，成功的写命令进入 AOF。复制模块复用 Snapshot 和 AOF，将 Primary 的状态传给 Replica。
+
+| 层 | 位置 | 职责 |
+| --- | --- | --- |
+| 协议 | `src/protocol/` | 长度前缀命令解析与编码 |
+| 网络 | `src/network/` | 三种后端、连接与动态缓冲区 |
+| 引擎 | `src/engines/` | Array、Hash、RBTree、Skip List |
+| 持久化 | `src/persistence/` | AOF、Snapshot、启动恢复 |
+| 复制 | `src/replication/` | 握手、全量同步、增量同步 |
+| 内存池 | `src/memory/` | 固定大小节点分配 |
+
+## 命令与协议
+
+### 命令
+
+命令前缀选择存储引擎。`SET` 创建新键；要修改已有值，使用对应的 `MOD`。
 
 | 操作 | Array | Red-Black Tree | Hash Table | Skip List |
 | --- | --- | --- | --- | --- |
@@ -83,72 +131,165 @@ printf '*2\r\n$4\r\nHGET\r\n$9\r\nuser name\r\n' |
 | 删除 | `DEL` | `RDEL` | `HDEL` | `SDEL` |
 | 判断存在 | `EXIST` | `REXIST` | `HEXIST` | `SEXIST` |
 
-创建和修改使用 `命令 key value`；读取、删除和判断存在使用 `命令 key`。`SAVE` 手动保存 Snapshot。行命令中的字段仍按空格拆分；需要在 key/value 中保留空格时使用长度前缀格式。
+创建、修改：`命令 key value`。读取、删除、判断存在：`命令 key`。`SAVE` 手动保存 Snapshot。
 
-## 架构
+### 两种请求格式
 
-```text
-TCP client
-    ↓
-Reactor / Proactor / NtyCo
-    ↓
-输入缓冲区 → 命令帧解析 → 命令执行 → 输出缓冲区
-                              ├→ Array / Hash / RBTree / SkipList
-                              ├→ AOF
-                              └→ Snapshot
-Primary AOF + Snapshot ──复制状态机──→ Replica
-```
+**行命令**以换行结束，字段由现有文本命令处理器拆分：
 
 ```text
-include/             公共接口
-src/protocol/         长度前缀命令编解码
-src/network/          网络后端与缓冲区
-src/engines/          四种存储引擎
-src/persistence/      AOF 与 Snapshot
-src/replication/      主从复制状态机
-src/memory/           节点内存池
-tests/                测试与基准测试
-third_party/NtyCo/    Git 子模块
+HSET username jasper\r\n
 ```
 
-默认网络后端为 NtyCo。可在 `include/kvstore.h` 修改 `NETWORK_SELECT`，然后运行 `make clean && make` 重新构建。
+因此行命令不适合包含空格的 key/value。
+
+**长度前缀命令**以 `*` 开头，每个字段携带字节长度：
+
+```text
+*3\r\n
+$4\r\nHSET\r\n
+$9\r\nuser name\r\n
+$11\r\nhello world\r\n
+```
+
+解析器面对的是 TCP 字节流：一次 `recv` 可能只收到半条命令，也可能收到多条命令。它只在命令完整时交给执行层，并返回本次消费的字节数；未消费的字节继续留在连接的输入缓冲区。
+
+**兼容性边界：** 请求格式借鉴 RESP 的数组和 bulk string，但回复并未全部采用 RESP2 类型。例如部分状态仍返回项目自身的文本回复。因此“能接收长度前缀请求”不等于“可直接用 `redis-cli` 操作所有命令”。字段最终会转换为 C 字符串，目前不支持嵌入 `\0` 的二进制 key/value。
 
 ## 持久化
 
-成功的写命令追加到 `appendonly.aof`；`SAVE` 将当前各引擎的数据写入 `snapshot.db`。两者的命令记录使用长度前缀格式，因此包含空格的字段仍能按原样恢复。
-
-Snapshot 首行记录对应的 `AOF_OFFSET`。服务启动时先加载 Snapshot，再从该 offset 重放 AOF。Snapshot 通过临时文件写入并在完成后替换正式文件。旧版文本格式的持久化文件不应直接与新版混用；迁移前请单独处理原有数据。
-
-## 主从复制
-
-Primary 接收客户端写入；Replica 提供客户端读取并拒绝客户端写入。复制是**异步**的，Primary 不等待 Replica 确认即返回写入结果。
+91kvstore 同时使用 AOF 和 Snapshot：
 
 ```text
-CONNECTING → HANDSHAKE → FULL_SYNC → CATCH_UP → ONLINE
-                         Snapshot    AOF 增量    持续同步
+客户端写入 ──► 内存引擎
+                   └──► appendonly.aof
+
+SAVE ────────► snapshot.db
+                  └── 首行记录 AOF_OFFSET
 ```
 
-分别在两个不同的工作目录启动，避免共用 AOF 和 Snapshot：
+AOF 按顺序记录写命令；Snapshot 保存当前各引擎的全量状态。命令记录采用长度前缀格式，因此包含空格的字段在落盘和恢复时仍有明确边界。
+
+Snapshot 首行示意：
+
+```text
+AOF_OFFSET 189
+```
+
+启动恢复顺序：
+
+```text
+加载 snapshot.db
+      │
+      ▼
+读取 Snapshot 对应的 AOF_OFFSET
+      │
+      ▼
+从该 offset 重放 appendonly.aof
+      │
+      ▼
+启动网络服务
+```
+
+Snapshot 先写入临时文件，再替换正式文件，避免半成品覆盖旧快照。新版长度前缀持久化文件与旧版文本文件不应直接混用；升级已有数据时需要单独规划迁移。
+
+## Primary-Replica 复制
+
+Primary 接收客户端写入；Replica 可处理客户端读取，但拒绝客户端写入。复制是**异步**的：Primary 不等待 Replica 确认即可向客户端返回。
+
+```text
+CONNECTING
+    │ 建立连接
+    ▼
+HANDSHAKE       PING / PONG / PSYNC
+    │
+    ▼
+FULL_SYNC       发送并安装 Snapshot
+    │
+    ▼
+CATCH_UP        从 Snapshot 的 AOF offset 补齐增量
+    │
+    ▼
+ONLINE          持续读取新的 AOF 数据
+```
+
+分别在两个终端、两个不同工作目录中运行，避免共用 AOF 和 Snapshot：
 
 ```bash
-# Primary
-mkdir -p /tmp/91kv-primary && cd /tmp/91kv-primary
-/path/to/91kvstore/bin/kvstore primary 19000 19100
+# Primary：19000 为客户端端口，19100 为复制端口
+mkdir -p /tmp/91kv-primary
+cd /tmp/91kv-primary
+/absolute/path/to/91kvstore/bin/kvstore primary 19000 19100
 ```
 
 ```bash
-# Replica，在另一个终端
-mkdir -p /tmp/91kv-replica && cd /tmp/91kv-replica
-/path/to/91kvstore/bin/kvstore replica 19001 127.0.0.1 19100
+# Replica：19001 为自身客户端端口，连接 Primary 的 19100
+mkdir -p /tmp/91kv-replica
+cd /tmp/91kv-replica
+/absolute/path/to/91kvstore/bin/kvstore replica 19001 127.0.0.1 19100
 ```
 
-`19000` 和 `19001` 是客户端端口；`19100` 是 Primary 的复制端口。
+将示例中的 `/absolute/path/to/91kvstore` 换成实际仓库路径。
+
+## 网络后端
+
+三种后端共用协议和复制逻辑，区别在于等待网络事件的方式：
+
+| 后端 | 模型 | 主要机制 |
+| --- | --- | --- |
+| Reactor | 就绪事件 | `epoll` |
+| Proactor | 完成事件 | `io_uring` |
+| NtyCo | 协程 | 协程调度与网络 hook |
+
+默认使用 NtyCo。要切换后端，在 `include/kvstore.h` 修改 `NETWORK_SELECT`，然后重新构建：
+
+```c
+#define NETWORK_REACTOR  0
+#define NETWORK_PROACTOR 1
+#define NETWORK_NTYCO    2
+
+#define NETWORK_SELECT NETWORK_NTYCO
+```
+
+```bash
+make clean
+make
+```
+
+动态输入缓冲区容纳分段到达的长命令；动态输出缓冲区容纳较长的回复。网络层仍需要处理部分发送，不能假设一次发送就写完全部字节。
+
+## 内存管理
+
+Hash、Red-Black Tree、Skip List 的固定大小节点可使用项目内存池；可变长度的 key/value 等仍使用通用分配器。构建时可以关闭相应内存池，便于测试和比较：
+
+```bash
+make clean
+make HASH_USE_MEMORY_POOL=0 \
+     RBTREE_USE_MEMORY_POOL=0 \
+     SKIPLIST_USE_MEMORY_POOL=0
+```
+
+| 构建变量 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `HASH_USE_MEMORY_POOL` | `1` | Hash 节点 |
+| `RBTREE_USE_MEMORY_POOL` | `1` | 红黑树节点 |
+| `SKIPLIST_USE_MEMORY_POOL` | `1` | 跳表节点 |
+| `ARRAY_USE_JEMALLOC` | `0` | Array 基准测试中的 jemalloc 选项 |
 
 ## 测试
+
+核心验证：
 
 ```bash
 make test-protocol
 bash tests/test_replication.sh
+```
+
+协议测试覆盖完整与不完整命令、错误输入和较长字段。复制集成测试覆盖 Snapshot 全量同步、ONLINE 增量同步、包含空格的字段及 2048 字节 value。复制测试使用端口 `29000`、`29001`、`29100`，运行前需确保端口空闲。
+
+内存相关测试：
+
+```bash
 make test-memory-pool
 make test-hash-memory-pool
 make test-rbtree-memory-pool
@@ -156,16 +297,36 @@ make test-skiplist-memory-pool
 make test-array-memory
 ```
 
-协议测试覆盖完整、分段、错误和较长的命令。复制集成测试覆盖 Snapshot 全量同步、ONLINE 增量同步、含空格字段及 2048 字节 value。复制脚本使用固定测试端口 `29000`、`29001` 和 `29100`，运行前应确保端口空闲。
+仓库还提供 Array、Hash、RBTree、Skip List 的 allocator/memory benchmark 目标；具体目标可在 `Makefile` 中查看。
+
+## 项目结构
+
+```text
+91kvstore/
+├── clients/                 多语言 TCP 客户端示例
+├── include/                 公共头文件
+├── src/
+│   ├── engines/             四种内存引擎
+│   ├── memory/              内存池
+│   ├── network/             Reactor / Proactor / NtyCo / 缓冲区
+│   ├── persistence/         AOF / Snapshot
+│   ├── protocol/            长度前缀编解码
+│   ├── replication/         主从复制
+│   └── kvstore.c            命令执行与程序入口
+├── tests/                   测试与基准测试
+├── third_party/NtyCo/       Git 子模块
+└── Makefile
+```
 
 ## 当前限制
 
-- 不提供完整 Redis 命令语义或 RESP2 回复兼容性
-- 命令字段会转换为 C 字符串，不支持嵌入 `\0` 的二进制 key/value
-- Replica 尚无断线自动重连、部分重同步或自动故障转移
-- 当前主要面向单 Replica 场景；没有 ACK、心跳和认证/TLS
-- Snapshot 与 AOF 文件操作可能阻塞网络事件处理
+- 不完整兼容 Redis 命令语义和 RESP2 回复；`redis-cli` 不是当前受保证的客户端
+- key/value 不支持嵌入 `\0`；行命令也不支持字段中包含空格
+- Replica 尚无断线自动重连、复制 backlog 或部分重同步
+- 当前主要面向单 Replica 场景；尚无 ACK、心跳和自动故障转移
+- Snapshot、AOF 的同步文件操作可能阻塞事件处理
+- 尚未提供认证、访问控制或 TLS
 
 ## 许可证
 
-仓库目前未声明开源许可证；在许可证公布前，保留所有权利。
+仓库目前未声明开源许可证。在发布许可证前，保留所有权利。
