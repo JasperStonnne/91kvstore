@@ -214,7 +214,7 @@ static int kvs_replication_upstream_frame_protocol(
  * 命令交给 kvstore 模块执行；执行成功后返回 0，
  * 表示消费命令但不向 Primary 发送响应。
  */
-static int kvs_replication_catch_up_frame_protocol(
+static int kvs_replication_online_control_frame_protocol(
     int connection_fd,
     char *frame,
     int frame_length,
@@ -227,7 +227,6 @@ static int kvs_replication_catch_up_frame_protocol(
         replication_manager.state!=KVS_REPLICATION_STATE_ONLINE) ||
        connection_fd<0 ||
        connection_fd!=replication_manager.primary_connection_fd ||
-       replication_manager.command_handler==NULL ||
        frame==NULL ||
        frame_length<=0 ||
        response==NULL ||
@@ -279,38 +278,55 @@ static int kvs_replication_catch_up_frame_protocol(
 
         return 0; // 消费 ONLINE 消息，不向 Primary 回包
     }
-    int command_response_length=
-        replication_manager.command_handler(
-            frame,
-            frame_length,
-            response
-        );
+/* KV 增量命令由长度格式解析；这里出现其他文本行就是协议错误。 */
+    return -1;
+}
 
-    /*
-     * 当前 AOF 只记录执行成功的写命令；
-     * 重放成功应当得到 OK\r\n。
-     */
-    if(command_response_length!=4 ||
-       memcmp(response,"OK\r\n",4)!=0){
+/* 执行一条长度格式的复制命令，并更新 Replica 的 AOF offset。 */
+static int kvs_replication_catch_up_command_protocol(
+    int connection_fd,
+    const kvs_slice_t *fields,
+    size_t field_count,
+    char *response,
+    int response_capacity)
+{
+    if (!replication_manager.initialized ||
+        replication_manager.role != KVS_ROLE_REPLICA ||
+        (replication_manager.state != KVS_REPLICATION_STATE_CATCH_UP &&
+         replication_manager.state != KVS_REPLICATION_STATE_ONLINE) ||
+        connection_fd < 0 ||
+        connection_fd != replication_manager.primary_connection_fd ||
+        replication_manager.command_handler == NULL ||
+        fields == NULL ||
+        field_count == 0 ||
+        response == NULL ||
+        response_capacity <= 0) {
         return -1;
     }
-        /*
-     * command_handler 已经执行命令并通过 kvs_aof_append()
-     * 写入 Replica 本地 AOF，因此当前文件末尾就是最新复制进度。
-     */
-    long long current_offset=kvs_aof_get_offset();
 
-    if(current_offset<0){
+    /* 执行字段；成功的写命令会由 kvstore 追加到 Replica 本地 AOF。 */
+    int response_length = replication_manager.command_handler(
+        fields,
+        field_count,
+        response,
+        response_capacity
+    );
+
+    if (response_length != 4 ||
+        memcmp(response, "OK\r\n", 4) != 0) {
         return -1;
     }
 
-    replication_manager.replication_offset=current_offset;
-    /*
-     * 这里的 0 表示网络响应长度为 0。
-     * 命令已经执行并写入 Replica 本地 AOF。
-     */
+    /* 本地 AOF 已追加这条命令，当前位置就是最新复制进度。 */
+    long long current_offset = kvs_aof_get_offset();
+    if (current_offset < 0) {
+        return -1;
+    }
+
+    replication_manager.replication_offset = current_offset;
     return 0;
 }
+
 static int kvs_replication_upstream_network_protocol(
     int connection_fd,
     char *msg,
@@ -401,19 +417,57 @@ static int kvs_replication_upstream_network_protocol(
 
         return 0;
     }
-if(replication_manager.state==KVS_REPLICATION_STATE_CATCH_UP ||
-   replication_manager.state==KVS_REPLICATION_STATE_ONLINE){
+if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
+    replication_manager.state == KVS_REPLICATION_STATE_ONLINE) {
 
-        return kvs_line_batch_protocol(
-            connection_fd,
+    /* AOF 增量命令以 * 开头，按长度字段解析。 */
+    if (msg[0] == '*') {
+        kvs_slice_t fields[3];
+        size_t field_count = 0;
+        size_t parsed_bytes = 0;
+
+        int parse_result = kvs_parse_command(
             msg,
-            length,
-            response->data,
-            response->capacity,
-            consumed_length,
-            kvs_replication_catch_up_frame_protocol
+            (size_t)length,
+            fields,
+            3,
+            &field_count,
+            &parsed_bytes
         );
+
+        if (parse_result == 0) {
+            *consumed_length = 0; /* 命令还没收完整，等后续网络数据。 */
+            return 0;
+        }
+        if (parse_result < 0) {
+            return -1; /* AOF 中出现格式错误。 */
+        }
+
+        /* 完整命令交给字段回调执行，并追加到 Replica 本地 AOF。 */
+        if (kvs_replication_catch_up_command_protocol(
+                connection_fd,
+                fields,
+                field_count,
+                response->data,
+                response->capacity) < 0) {
+            return -1;
+        }
+
+        *consumed_length = (int)parsed_bytes;
+        return 0; /* 复制命令不需要向 Primary 返回普通响应。 */
     }
+
+    /* 非 * 开头的数据仍按行处理，用于 ONLINE 状态控制消息。 */
+    return kvs_line_batch_protocol(
+        connection_fd,
+        msg,
+        length,
+        response->data,
+        response->capacity,
+        consumed_length,
+        kvs_replication_online_control_frame_protocol
+    );
+}
     return -1;
 }
 

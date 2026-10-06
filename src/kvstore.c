@@ -270,7 +270,7 @@ int kvs_filter_protocol(char **tokens,int count,char *response,kvs_command_sourc
         
         break;
     case KVS_CMD_RGET:{
-    char *result = kvs_get_value(cmd, key); 
+    char *result = kvs_get_value(cmd, key);
     if(result==NULL){
         length=sprintf(response,"NO EXIST\r\n");
     }else {
@@ -563,8 +563,8 @@ static int kvs_execute_fields(
     return result;
 }
 
-/* 将 AOF 解析出的字段交给现有恢复命令执行器。 */
-static int kvs_aof_replay_protocol(
+
+static int kvs_recovery_fields_protocol(
     const kvs_slice_t *fields,
     size_t field_count,
     char *response,
@@ -621,26 +621,28 @@ static int kvs_client_protocol(int connection_fd,char *msg,int length,char *resp
     (void)response_capacity;
     return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_CLIENT);
 }
-// 适配三参数恢复接口，并补充 RECOVERY 命令来源
-static int kvs_recovery_protocol(char *msg,int length,char *response){
-    return kvs_execute_command(msg,length,response,KVS_COMMAND_SOURCE_RECOVERY);
-}
 
-/*
- * 执行 Primary 发送给 Replica 的增量命令。
- *
- * 使用 REPLICATION 来源，因此命令会修改内存，
- * 并通过现有 kvs_aof_append() 保存到 Replica 本地 AOF。
- */
+/* 执行 Replica 从 Primary 收到的长度格式增量命令。 */
 static int kvs_replication_command_protocol(
-    char *msg,
-    int length,
-    char *response)
+    const kvs_slice_t *fields,
+    size_t field_count,
+    char *response,
+    int response_capacity)
 {
-    return kvs_execute_command(
-        msg,
-        length,
-        response,
+    if (response == NULL || response_capacity <= 0) {
+        return -1;
+    }
+
+    /* 将复制模块提供的响应空间包装成统一的输出缓冲区。 */
+    kvs_output_buffer_t output = {
+        .data = response,
+        .capacity = response_capacity
+    };
+
+    return kvs_execute_fields(
+        fields,
+        field_count,
+        &output,
         KVS_COMMAND_SOURCE_REPLICATION
     );
 }
@@ -786,7 +788,7 @@ static int kvs_install_replication_snapshot(
      */
     long long snapshot_offset=kvs_snapshot_load(
         snapshot_path,
-        kvs_recovery_protocol
+        kvs_recovery_fields_protocol
     );
 
     if(snapshot_offset<0){
@@ -889,12 +891,12 @@ int main(int argc,char *argv[]){
 
     kvs_server_role = config.role;
     init_kvengine();
-    long long offset=kvs_snapshot_load("snapshot.db",kvs_recovery_protocol);
+    long long offset=kvs_snapshot_load("snapshot.db", kvs_recovery_fields_protocol);
     if(offset<0){
         fprintf(stderr,"failed to load snapshot\n");
         return -1;
     }
-    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_aof_replay_protocol);
+    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_recovery_fields_protocol);
     if(replay_ret<0){
         fprintf(stderr, "failed to replay AOF\n");
         return -1;

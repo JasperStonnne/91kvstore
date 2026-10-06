@@ -1,6 +1,7 @@
 #ifndef KVS_REPLICATION_H
 #define KVS_REPLICATION_H
 #include "server.h"
+#include "protocol.h"
 typedef enum {
     KVS_ROLE_STANDALONE = 0,
     KVS_ROLE_PRIMARY,
@@ -32,7 +33,12 @@ typedef struct {//保存启动配置
 
 }kvs_server_config_t;
 typedef int (*kvs_snapshot_install_handler)(const char *snapshot_path);
-typedef int (*kvs_replication_command_handler)(char *msg,int length,char *response);
+typedef int (*kvs_replication_command_handler)(
+    const kvs_slice_t *fields,
+    size_t field_count,
+    char *response,
+    int response_capacity
+);
 int kvs_replication_network_protocol(
     int connection_fd,
     char *msg,

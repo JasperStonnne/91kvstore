@@ -79,6 +79,46 @@ send_command()
         tr -d '\r\n'
 }
 
+# 发送已经编码好的 RESP 字节帧。
+send_resp_frame()
+{
+    local port=$1
+    local frame=$2
+
+    printf '%b' "$frame" |
+        timeout 3 nc -N 127.0.0.1 "$port" |
+        tr -d '\r\n'
+}
+
+# 用 RESP 编码并发送 HSET，字段长度由脚本按字节内容计算。
+send_resp_hset()
+{
+    local port=$1
+    local key=$2
+    local value=$3
+
+    {
+        printf '*3\r\n$4\r\nHSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n' \
+    "${#key}" "$key" "${#value}" "$value"
+    } |
+        timeout 3 nc -N 127.0.0.1 "$port" |
+        tr -d '\r\n'
+}
+
+# 用 RESP 编码并发送 HGET。
+send_resp_hget()
+{
+    local port=$1
+    local key=$2
+
+    {
+        printf '*2\r\n$4\r\nHGET\r\n$%d\r\n%s\r\n' \
+            "${#key}" "$key"
+    } |
+        timeout 3 nc -N 127.0.0.1 "$port" |
+        tr -d '\r\n'
+}
+
 wait_for_value()
 {
     local port=$1
@@ -130,19 +170,33 @@ wait_for_log "$PRIMARY_LOG" "listen port : $REPLICATION_PORT" ||
 echo "[PASS] Primary started"
 
 #
-# Replica 启动前先向 Primary 写入数据。
-# 这条数据只能通过 Snapshot 全量同步到 Replica。
+# Replica 启动前，用 RESP 写入含空格的 key/value。
+# 这条数据应通过 Snapshot 全量同步到 Replica。
 #
 primary_response=$(
-    send_command "$PRIMARY_PORT" \
-        "HSET fullsync_test before_sync"
+    send_resp_frame "$PRIMARY_PORT" \
+        '*3\r\n$4\r\nHSET\r\n$13\r\nfullsync_test\r\n$17\r\nbefore sync value\r\n'
 )
 
 if [ "$primary_response" != "OK" ]; then
-    fail "Primary returned unexpected response: $primary_response"
+    fail "Primary returned unexpected RESP response: $primary_response"
 fi
 
-echo "[PASS] Initial data written to Primary"
+echo "[PASS] Initial RESP data written to Primary"
+
+
+# 准备一个超过旧固定缓冲区的 value。
+large_value=$(printf '%2048s' '' | tr ' ' 'v')
+
+large_write_response=$(
+    send_resp_hset "$PRIMARY_PORT" "large_fullsync" "$large_value"
+)
+
+if [ "$large_write_response" != "OK" ]; then
+    fail "Primary rejected the 2048-byte value: $large_write_response"
+fi
+
+echo "[PASS] 2048-byte value written to Primary"
 
 #
 # 启动 Replica。
@@ -166,36 +220,51 @@ wait_for_log "$REPLICA_LOG" "replication: enter ONLINE" ||
 echo "[PASS] Replica entered ONLINE"
 
 #
-# 验证 Snapshot 全量同步。
+# 验证 Snapshot 全量同步保留了 value 中的空格。
 #
 wait_for_value \
     "$REPLICA_PORT" \
     "HGET fullsync_test" \
-    "before_sync" ||
-    fail "Snapshot data was not installed on Replica"
+    "before sync value" ||
+    fail "Snapshot did not preserve the value containing spaces"
 
-echo "[PASS] Snapshot full synchronization"
+echo "[PASS] Snapshot full synchronization with spaces"
+
+
+# RESP bulk string 响应去掉 CR/LF 后，应为 $长度 加上完整 value。
+large_expected_response="\$2048${large_value}"
+
+large_read_response=$(
+    send_resp_hget "$REPLICA_PORT" "large_fullsync"
+)
+
+if [ "$large_read_response" != "$large_expected_response" ]; then
+    fail "Snapshot replication did not preserve the 2048-byte value"
+fi
+
+echo "[PASS] Snapshot full synchronization with a 2048-byte value"
 
 #
-# ONLINE 后再向 Primary 写入。
-# 这条数据必须通过持续 AOF 复制到 Replica。
+# Replica 进入 ONLINE 后，再通过 RESP 写入含空格的数据。
+# 这条数据应通过 AOF 增量复制到 Replica。
 #
 online_response=$(
-    send_command "$PRIMARY_PORT" \
-        "HSET online_test after_online"
+    send_resp_frame "$PRIMARY_PORT" \
+        '*3\r\n$4\r\nHSET\r\n$11\r\nonline_test\r\n$18\r\nafter online value\r\n'
+
 )
 
 if [ "$online_response" != "OK" ]; then
-    fail "Primary ONLINE write failed: $online_response"
+    fail "Primary returned unexpected online RESP response: $online_response"
 fi
 
 wait_for_value \
     "$REPLICA_PORT" \
     "HGET online_test" \
-    "after_online" ||
-    fail "ONLINE data was not replicated"
+    "after online value" ||
+    fail "ONLINE replication did not preserve the value containing spaces"
 
-echo "[PASS] ONLINE incremental synchronization"
+echo "[PASS] ONLINE incremental synchronization with spaces"
 
 echo
 echo "replication integration test passed"

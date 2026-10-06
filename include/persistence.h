@@ -16,9 +16,11 @@ typedef int (*aof_replay_handler)(
     int response_capacity
 );
 typedef int (*snapshot_replay_handler)(
-    char *msg,
-    int length,
-    char *response
+    const kvs_slice_t *fields,
+    size_t field_count,
+    char *response,
+    int response_capacity
+
 );
 int kvs_aof_replay(const char *path,long long offset,aof_replay_handler handler);
 typedef struct {

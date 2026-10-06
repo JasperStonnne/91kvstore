@@ -174,6 +174,18 @@ $(BIN_DIR)/testcase: \
 	$(TEST_DIR)/testcase.c | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
 
+test-protocol: $(BIN_DIR)/test_protocol
+	./$(BIN_DIR)/test_protocol
+
+$(BIN_DIR)/test_protocol: \
+        $(TEST_DIR)/test_protocol.c \
+        $(SRC_DIR)/protocol/codec.c \
+        $(INCLUDE_DIR)/protocol.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		$(TEST_DIR)/test_protocol.c \
+		$(SRC_DIR)/protocol/codec.c \
+		-o $@
+
 test-memory-pool: $(BIN_DIR)/test_memory_pool
 	./$(BIN_DIR)/test_memory_pool
 
