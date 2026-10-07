@@ -54,7 +54,25 @@ int kvs_request(struct conn *c){
 }
 
 
+/* 处理已缓存输入；产生回复或需要更多数据时暂停。 */
+static int reactor_process_input(struct conn *c)
+{
+    if (c == NULL) return -1;
 
+    while (c->input.length > 0) {
+        int before = c->input.length;
+
+        if (kvs_request(c) < 0) return -1;
+
+        if (c->output.length > 0 ||
+            c->input.length == 0 ||
+            c->input.length >= before) {
+            break;
+        }
+    }
+
+    return 0;
+}
 
 
 
@@ -275,55 +293,15 @@ int recv_cb(int fd) {
 	ws_request(&conn_list[fd]);
 #elif ENABLE_KVSTORE
 
-	/*
- * 一次 recv 可能同时包含两个协议阶段的数据，例如：
- *
- * [Snapshot 最后一块][ONLINE 33\r\n]
- *
- * 每次处理后，只要：
- * 1. 没有响应等待发送；
- * 2. 输入缓冲区仍有数据；
- * 3. 本轮确实消费了数据；
- *
- * 就立即用新的复制状态继续处理剩余输入。
- */
-while(1){
-        int previous_input_length=
-            conn_list[fd].input.length;
+    if (reactor_process_input(&conn_list[fd]) < 0) {
+        reactor_close_connection(fd);
+        return -1;
+    }
 
-        if(kvs_request(&conn_list[fd])<0){
-                reactor_close_connection(fd);
-                return -1;
-        }
-
-        /*
-         * 已经产生响应时先退出。
-         * 响应必须由 send_cb() 发完，不能被下一轮覆盖。
-         */
-        if(conn_list[fd].output.length>0){
-                break;
-        }
-
-        /* 输入已经全部处理完成。 */
-        if(conn_list[fd].input.length==0){
-                break;
-        }
-
-        /*
-         * 输入长度没有减少，说明剩余数据还不是完整消息；
-         * 等下一次 recv 补充，避免在这里无限循环。
-         */
-        if(conn_list[fd].input.length>=
-           previous_input_length){
-                break;
-        }
-}
-
-	if(conn_list[fd].output.length==0){
-		set_event(fd,EPOLLIN,0);
-		return count;
-	}
-
+    if (conn_list[fd].output.length == 0) {
+        set_event(fd, EPOLLIN, 0);
+        return count;
+    }
 #endif
 
 
@@ -440,13 +418,28 @@ int send_cb(int fd) {
         return count;
         }
 
-        if(stream_length<0){
-			reactor_close_connection(fd);
+        if (stream_length < 0) {
+        reactor_close_connection(fd);
+        return -1;
         }
 
-	set_event(fd, EPOLLIN, 0);
+        #if ENABLE_KVSTORE
+        /* 第一条回复已发完，处理上次 recv 留在输入缓冲区里的命令。 */
+        if (conn_list[fd].input.length > 0) {
+        if (reactor_process_input(&conn_list[fd]) < 0) {
+                reactor_close_connection(fd);
+                return -1;
+        }
 
-	return count;
+        if (conn_list[fd].output.length > 0) {
+                set_event(fd, EPOLLOUT, 0);
+                return count;
+        }
+        }
+        #endif
+
+        set_event(fd, EPOLLIN, 0);
+        return count;
 }
 
 

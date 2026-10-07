@@ -760,6 +760,43 @@ while(1){
                     continue;
                 }
 
+                /* 当前回复已发完，先处理上次 recv 留下的命令。 */
+                if (proactor_process_input(connection) < 0) {
+                    proactor_close_connection(result.fd);
+                    continue;
+                }
+
+                if (connection->output.length > 0) {
+                    /* 又生成了回复：先发送，之后再处理下一条。 */
+                    if (set_event_send(
+                            &ring,
+                            result.fd,
+                            connection->output.data,
+                            connection->output.length,
+                            0) < 0) {
+                        proactor_close_connection(result.fd);
+                    }
+                    continue;
+                }
+
+                /* 没有完整命令可回复时，才提交下一次接收。 */
+                if (kvs_input_buffer_ensure_space(&connection->input, 1) < 0) {
+                    proactor_close_connection(result.fd);
+                    continue;
+                }
+
+                int available = connection->input.capacity -
+                                connection->input.length;
+                if (set_event_recv(
+                        &ring,
+                        result.fd,
+                        connection->input.data + connection->input.length,
+                        available,
+                        0) < 0) {
+                    proactor_close_connection(result.fd);
+                }
+                continue;
+
             }else if(result.event==EVENT_STREAM_RETRY){
                 /*
                 * timeout 到期时，io_uring 通常返回 -ETIME。
