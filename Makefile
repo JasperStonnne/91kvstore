@@ -372,3 +372,48 @@ benchmark-array-memory: | $(BIN_DIR)
 
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
+
+UNIT_TEST_TARGETS := \
+	test-protocol \
+	test-memory-pool \
+	test-hash-memory-pool \
+	test-rbtree-memory-pool \
+	test-skiplist-memory-pool \
+	test-array-memory
+
+.PHONY: test-unit test-integration test
+
+test-unit:
+	@count=0; \
+	for target in $(UNIT_TEST_TARGETS); do \
+		if output=$$($(MAKE) --no-print-directory "$$target" 2>&1); then \
+			printf '[PASS] %s\n' "$$target"; \
+			count=$$((count + 1)); \
+		else \
+			status=$$?; \
+			printf '[FAIL] %s (exit %s)\n%s\n' "$$target" "$$status" "$$output" >&2; \
+			exit "$$status"; \
+		fi; \
+	done; \
+	printf 'Unit tests: %s passed\n' "$$count"
+
+test-integration: $(BIN_DIR)/kvstore
+	@if output=$$(python3 -B $(TEST_DIR)/test_standalone.py 2>&1); then \
+		printf '[PASS] standalone integration\n'; \
+	else \
+		status=$$?; \
+		printf '[FAIL] standalone integration (exit %s)\n%s\n' "$$status" "$$output" >&2; \
+		exit "$$status"; \
+	fi
+	@if output=$$(bash $(TEST_DIR)/test_replication.sh 2>&1); then \
+		printf '[PASS] replication integration\n'; \
+	else \
+		status=$$?; \
+		printf '[FAIL] replication integration (exit %s)\n%s\n' "$$status" "$$output" >&2; \
+		exit "$$status"; \
+	fi
+	@printf 'Integration tests: 2 passed\n'
+
+test:
+	@$(MAKE) --no-print-directory test-unit
+	@$(MAKE) --no-print-directory test-integration

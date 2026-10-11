@@ -607,7 +607,6 @@ static int kvs_execute_command(char *msg,int length,char *response,kvs_command_s
     if(length<=0){
         return -1;
     }
-    printf("recv: %d: %s\n",length,msg);
 
     char *tokens[KVS_MAX_TOKENS]={0};
 
