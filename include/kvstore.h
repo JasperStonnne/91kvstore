@@ -12,13 +12,6 @@
 #include <assert.h>
 #include<memory_pool.h>
 
-#define NETWORK_REACTOR 0
-#define NETWORK_PROACTOR 1
-#define NETWORK_NTYCO 2
-
-#define NETWORK_SELECT NETWORK_NTYCO
-
-
 #define KVS_MAX_TOKENS 128
 #define ENABLE_ARRAY 1
 #define ENABLE_RBTREE 1

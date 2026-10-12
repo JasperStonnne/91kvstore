@@ -71,20 +71,11 @@ typedef struct {//通用监听器配置，一个监听端口绑定一个消息�
 	kvs_connection_stream_handler stream_handler; // 可选：连接响应后继续分块输出数据
 }kvs_listener_config_t;
 
-int reactor_start(unsigned short port,msg_handler handler);
-int reactor_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
-int reactor_start_runtime(
-    const kvs_listener_config_t *listeners,
-    size_t listener_count,
-    const kvs_connector_config_t *connectors,
-    size_t connector_count
-);
+
 int ntyco_start(unsigned short port,msg_handler handler);
 int ntyco_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
 int ntyco_start_runtime(const kvs_listener_config_t *listeners,size_t listener_count,const kvs_connector_config_t *connectors,size_t connector_count);
-int proactor_start(unsigned short port,msg_handler handler);
-int proactor_start_listeners(const kvs_listener_config_t *listeners,size_t listener_count);
-int proactor_start_runtime(const kvs_listener_config_t *listeners,size_t listener_count,const kvs_connector_config_t *connectors,size_t connector_count);
+
 #define ENABLE_HTTP 0
 #define ENABLE_WEBSOCKET 0
 #define ENABLE_KVSTORE 1

@@ -41,13 +41,11 @@ ARRAY_BENCH_LIB := $(if $(filter 1,$(ARRAY_USE_JEMALLOC)),-ljemalloc)
 
 
 LDFLAGS := -L$(NTYCO_DIR)
-LDLIBS := -luring -lntyco -lpthread -ldl
+LDLIBS := -lntyco -lpthread -ldl
 
 OBJS := \
 	$(BUILD_DIR)/kvstore.o \
 	$(BUILD_DIR)/codec.o \
-	$(BUILD_DIR)/reactor.o \
-	$(BUILD_DIR)/proactor.o \
 	$(BUILD_DIR)/ntyco.o \
 	$(BUILD_DIR)/kvs_array.o \
 	$(BUILD_DIR)/kvs_rbtree.o \
@@ -102,16 +100,6 @@ $(BUILD_DIR)/kvstore.o: \
 $(BUILD_DIR)/codec.o: \
 	$(SRC_DIR)/protocol/codec.c \
 	$(INCLUDE_DIR)/protocol.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/reactor.o: \
-	$(NETWORK_DIR)/reactor.c \
-	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/proactor.o: \
-	$(NETWORK_DIR)/proactor.c \
-	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ntyco.o: \

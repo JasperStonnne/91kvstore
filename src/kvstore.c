@@ -913,74 +913,6 @@ int main(int argc,char *argv[]){
 }
 int network_ret=-1;
 
-#if (NETWORK_SELECT == NETWORK_REACTOR)
-    if(config.role==KVS_ROLE_PRIMARY){
-        kvs_listener_config_t listeners[] = {
-            {
-                .port=config.service_port,
-                .handler=kvs_network_protocol,
-                .stream_handler=NULL
-            },
-            {
-                .port=config.replication_port,
-                .handler=kvs_replication_network_protocol,
-                .stream_handler=kvs_replication_stream
-            }
-        };
-
-        network_ret=reactor_start_listeners(
-            listeners,
-            sizeof(listeners)/sizeof(listeners[0])
-        );
-        }else if(config.role==KVS_ROLE_REPLICA){
-        /*
-         * Replica 对客户端监听自己的 service_port。
-         * 客户端只能通过这里读取数据。
-         */
-        kvs_listener_config_t listener={
-            .port=config.service_port,
-            .handler=kvs_network_protocol,
-            .stream_handler=NULL
-        };
-
-        /*
-         * replication.c 负责提供 Primary 地址以及
-         * 连接成功、收到消息、连接断开时的业务回调。
-         */
-        kvs_connector_config_t connector;
-
-        if(kvs_replication_build_connector_config(
-                &connector)<0){
-
-            fprintf(
-                stderr,
-                "failed to build replication connector\n"
-            );
-            network_ret=-1;
-        }else{
-            network_ret=reactor_start_runtime(
-                &listener,
-                1,
-                &connector,
-                1
-            );
-        }
-    }else{
-        /*
-         * standalone 没有上游 Primary，只监听客户端端口。
-         */
-        kvs_listener_config_t listener={
-            .port=config.service_port,
-            .handler=kvs_network_protocol,
-            .stream_handler=NULL
-        };
-
-        network_ret=reactor_start_listeners(
-            &listener,
-            1
-        );
-    }
-#elif (NETWORK_SELECT == NETWORK_NTYCO)
     if (config.role == KVS_ROLE_PRIMARY) {
         kvs_listener_config_t listeners[] = {
             {
@@ -1020,73 +952,6 @@ int network_ret=-1;
         network_ret=ntyco_start(config.service_port,kvs_network_protocol);
     }
 
-#elif (NETWORK_SELECT == NETWORK_PROACTOR)
-    if(config.role==KVS_ROLE_PRIMARY){
-        kvs_listener_config_t listeners[]={
-            {
-                .port=config.service_port,
-                .handler=kvs_network_protocol,
-                .stream_handler=NULL
-            },
-            {
-                .port=config.replication_port,
-                .handler=kvs_replication_network_protocol,
-                .stream_handler=kvs_replication_stream
-            }
-        };
-
-        network_ret=proactor_start_listeners(
-            listeners,
-            sizeof(listeners)/sizeof(listeners[0])
-        );
-    }else if(config.role==KVS_ROLE_REPLICA){
-    /*
-     * Replica 监听自己的客户端服务端口。
-     */
-    kvs_listener_config_t listener={
-        .port=config.service_port,
-        .handler=kvs_network_protocol,
-        .stream_handler=NULL
-    };
-
-    /*
-     * replication.c 提供 Primary 地址和复制回调。
-     */
-    kvs_connector_config_t connector;
-
-    if(kvs_replication_build_connector_config(
-            &connector)<0){
-
-        fprintf(
-            stderr,
-            "failed to build replication connector\n"
-        );
-        network_ret=-1;
-    }else{
-        network_ret=proactor_start_runtime(
-            &listener,
-            1,
-            &connector,
-            1
-        );
-    }
-}else{
-    /*
-     * standalone 只监听客户端服务端口。
-     */
-    kvs_listener_config_t listener={
-        .port=config.service_port,
-        .handler=kvs_network_protocol,
-        .stream_handler=NULL
-    };
-
-    network_ret=proactor_start_listeners(
-        &listener,
-        1
-    );
-}
-#endif
-
     if(network_ret<0){
         fprintf(stderr,"failed to start network service\n");
         kvs_replication_destroy();
@@ -1095,7 +960,7 @@ int network_ret=-1;
         return -1;
     }
     kvs_replication_destroy();
-kvs_aof_close();
+    kvs_aof_close();
     dest_kvengine();
 
 
