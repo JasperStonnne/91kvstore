@@ -1,14 +1,8 @@
 # 91kvstore
 
-```text
- ███     █    █   █  █   █   ████  █████   ███   ████   █████
-█   █   ██    █  █   █   █  █        █    █   █  █   █  █
-█   █    █    █ █    █   █  █        █    █   █  █   █  █
- ████    █    ██     █   █   ███     █    █   █  ████   ████
-    █    █    █ █     █ █       █    █    █   █  █ █    █
-   █     █    █  █    █ █       █    █    █   █  █  █   █
-███    █████  █   █    █    ████     █     ███   █   █  █████
-```
+<p align="center">
+  <img src="assets/91kvstore-logo.png" alt="91kvstore logo" width="720">
+</p>
 
 **A persistent key-value store in C, built from engines to replication.**
 
