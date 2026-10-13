@@ -1,4 +1,3 @@
-# 91kvstore
 
 <p align="center">
   <img src="assets/91kvstore-logo.png" alt="91kvstore logo" width="720">
