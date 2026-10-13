@@ -23,6 +23,21 @@ int kvs_parse_command(
 );
 
 /*
+ * 解析输入开头的一条命令，并限制这一条命令的总字节数。
+ * max_command_bytes 只针对当前命令，不把后面粘着的 pipeline 算进去。
+ * 返回值与 kvs_parse_command 相同；超过上限返回 -1。
+ */
+int kvs_parse_command_limited(
+    const char *input,
+    size_t input_length,
+    kvs_slice_t *fields,
+    size_t field_capacity,
+    size_t *field_count,
+    size_t *parsed_bytes,
+    size_t max_command_bytes
+);
+
+/*
  * 计算 fields 编码成一条命令所需的字节数。
  * 返回 0：计算成功；-1：参数错误或长度溢出。
  */

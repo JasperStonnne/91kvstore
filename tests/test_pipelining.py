@@ -38,7 +38,7 @@ def test_pipelined(port):
     """同一连接一次发送两条命令，两条都应得到回复。"""
     key = ("pipeline_" + uuid.uuid4().hex).encode()
     request = command(b"HSET", key, b"v") + command(b"HGET", key)
-    expected = b"OK\r\n$1\r\nv\r\n"
+    expected = b"+OK\r\n$1\r\nv\r\n"
 
     with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
         sock.settimeout(2)
@@ -52,7 +52,7 @@ def test_pipelined(port):
 def test_subsequent_recv(port):
     """先收到第一条回复，再在同一连接发送下一条命令。"""
     key = ("sequential_" + uuid.uuid4().hex).encode()
-    expected_first = b"OK\r\n"
+    expected_first = b"+OK\r\n"
     expected_second = b"$1\r\nv\r\n"
 
     with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:

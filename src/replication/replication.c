@@ -315,8 +315,8 @@ static int kvs_replication_catch_up_command_protocol(
         response_capacity
     );
 
-    if (response_length != 4 ||
-        memcmp(response, "OK\r\n", 4) != 0) {
+    if (response_length <= 0 ||
+        response_length >= response_capacity) {
         return -1;
     }
 

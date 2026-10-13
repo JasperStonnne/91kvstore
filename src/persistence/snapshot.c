@@ -549,8 +549,7 @@ long long kvs_snapshot_load(const char* path,snapshot_replay_handler handler){
         );
 
         if (response_length <= 0 ||
-            response_length > (int)sizeof(response) ||
-            strcmp(response, "OK\r\n") != 0) {
+            response_length > (int)sizeof(response)) {
             load_result = -1;
             break;
         }

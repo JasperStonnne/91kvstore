@@ -44,7 +44,8 @@ static int parse_field(
     const char *input,
     size_t input_length,
     size_t *offset,
-    kvs_slice_t *field)
+    kvs_slice_t *field,
+    size_t max_command_bytes)
 {
     size_t pos = *offset;
 
@@ -55,6 +56,12 @@ static int parse_field(
     size_t length = 0;
     int result = parse_number(input, input_length, &pos, &length);
     if (result <= 0) return result;
+        /* pos 已越过 $长度\r\n；内容和结尾 \r\n 也必须装进本条命令限额。 */
+    if (pos > max_command_bytes ||
+        max_command_bytes - pos < 2 ||
+        length > max_command_bytes - pos - 2) {
+        return -1;
+    }
 
     /* 先检查剩余字节，避免用超长 length 计算位置时溢出。 */
     size_t remaining = input_length - pos;
@@ -72,17 +79,18 @@ static int parse_field(
 }
 
 /* 解析输入开头的一条完整命令，不修改输入，也不执行命令。 */
-int kvs_parse_command(
+int kvs_parse_command_limited(
     const char *input,
     size_t input_length,
     kvs_slice_t *fields,
     size_t field_capacity,
     size_t *field_count,
-    size_t *parsed_bytes)
+    size_t *parsed_bytes,
+    size_t max_command_bytes)
 {
     if (input == NULL || fields == NULL ||
         field_count == NULL || parsed_bytes == NULL ||
-        field_capacity == 0) {
+        field_capacity == 0||max_command_bytes == 0) {
         return -1;
     }
 
@@ -96,16 +104,31 @@ int kvs_parse_command(
     size_t count = 0;
     int result = parse_number(input, input_length, &offset, &count);
     if (result <= 0) return result;
+    if (offset > max_command_bytes) return -1;
     if (count == 0 || count > field_capacity) return -1;
 
     for (size_t i = 0; i < count; i++) {
-        result = parse_field(input, input_length, &offset, &fields[i]);
+        result = parse_field(input, input_length, &offset, &fields[i], max_command_bytes);
         if (result <= 0) return result;
     }
 
     *field_count = count;
     *parsed_bytes = offset;
     return 1;
+}
+
+int kvs_parse_command(
+    const char *input,
+    size_t input_length,
+    kvs_slice_t *fields,
+    size_t field_capacity,
+    size_t *field_count,
+    size_t *parsed_bytes)
+{
+    return kvs_parse_command_limited(
+        input, input_length, fields, field_capacity,
+        field_count, parsed_bytes, SIZE_MAX
+    );
 }
 
 /* 计算十进制数字需要几个字符，例如 11 需要 2 个。 */

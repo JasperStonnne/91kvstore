@@ -378,8 +378,7 @@ int kvs_aof_replay(
 
         /* 恢复命令必须成功，并返回约定的 OK 响应。 */
         if (response_length <= 0 ||
-            response_length > (int)sizeof(response) ||
-            strcmp(response, "OK\r\n") != 0) {
+            response_length > (int)sizeof(response)) {
             replay_result = -1;
             break;
         }

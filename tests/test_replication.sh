@@ -105,17 +105,6 @@ wait_for_log()
     return 1
 }
 
-# 发送当前项目支持的文本命令，去掉回复中的 CR/LF。
-send_command()
-{
-    local port=$1
-    local command=$2
-
-    printf '%s\r\n' "$command" |
-        timeout 3 nc -N 127.0.0.1 "$port" |
-        tr -d '\r\n'
-}
-
 # 发送已经编码好的 RESP 字节帧。
 send_resp_frame()
 {
@@ -160,14 +149,16 @@ send_resp_hget()
 wait_for_value()
 {
     local port=$1
-    local command=$2
+    local key=$2
     local expected=$3
+    local expected_frame
+    printf -v expected_frame '$%d%s' "${#expected}" "$expected"
     local response=""
     local deadline=$((SECONDS + 15))
 
     while (( SECONDS < deadline )); do
-        if response=$(send_command "$port" "$command" 2>/dev/null) &&
-           [ "$response" = "$expected" ]; then
+        if response=$(send_resp_hget "$port" "$key" 2>/dev/null) &&
+           [ "$response" = "$expected_frame" ]; then
             return 0
         fi
 
@@ -242,7 +233,7 @@ primary_response=$(
         '*3\r\n$4\r\nHSET\r\n$13\r\nfullsync_test\r\n$17\r\nbefore sync value\r\n'
 ) || fail "Initial RESP HSET request failed or timed out"
 
-if [ "$primary_response" != "OK" ]; then
+if [ "$primary_response" != "+OK" ]; then
     fail "Primary returned unexpected RESP response: $primary_response"
 fi
 echo "[PASS] Initial RESP data written to Primary"
@@ -253,7 +244,7 @@ large_write_response=$(
     send_resp_hset "$PRIMARY_PORT" "large_fullsync" "$large_value"
 ) || fail "2048-byte HSET request failed or timed out"
 
-if [ "$large_write_response" != "OK" ]; then
+if [ "$large_write_response" != "+OK" ]; then
     fail "Primary rejected the 2048-byte value: $large_write_response"
 fi
 echo "[PASS] 2048-byte value written to Primary"
@@ -283,7 +274,7 @@ wait_for_log "$REPLICA_LOG" "replication: enter ONLINE" "$REPLICA_PID" ||
     fail "Replica did not enter ONLINE"
 echo "[PASS] Replica entered ONLINE"
 
-wait_for_value "$REPLICA_PORT" "HGET fullsync_test" "before sync value" ||
+wait_for_value "$REPLICA_PORT" "fullsync_test" "before sync value"||
     fail "Snapshot did not preserve the value containing spaces"
 echo "[PASS] Snapshot full synchronization with spaces"
 
@@ -304,13 +295,15 @@ online_response=$(
         '*3\r\n$4\r\nHSET\r\n$11\r\nonline_test\r\n$18\r\nafter online value\r\n'
 ) || fail "ONLINE RESP HSET request failed or timed out"
 
-if [ "$online_response" != "OK" ]; then
+if [ "$online_response" != "+OK" ]; then
     fail "Primary returned unexpected online RESP response: $online_response"
 fi
 
-wait_for_value "$REPLICA_PORT" "HGET online_test" "after online value" ||
+wait_for_value "$REPLICA_PORT" "online_test" "after online value" ||
     fail "ONLINE replication did not preserve the value containing spaces"
 echo "[PASS] ONLINE incremental synchronization with spaces"
+
+
 
 echo
 echo "replication integration test passed"

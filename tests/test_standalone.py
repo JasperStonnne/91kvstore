@@ -85,26 +85,38 @@ def test_bind_ip(port):
     )
 
 def test_basic_commands(port):
-    """用当前项目的文本命令和回复格式检查写、读、改、删。"""
-    key = "basic_" + uuid.uuid4().hex
+    """用 RESP2 请求和回复检查写、读、改、删。"""
+    key = ("basic_" + uuid.uuid4().hex).encode("ascii")
     cases = [
-        ("initially missing", f"GET {key}", b"NO EXIST\r\n"),
-        ("write", f"SET {key} first", b"OK\r\n"),
-        ("read", f"GET {key}", b"first\r\n"),
-        ("modify", f"MOD {key} second", b"OK\r\n"),
-        ("read modified value", f"GET {key}", b"second\r\n"),
-        ("delete", f"DEL {key}", b"OK\r\n"),
-        ("missing after delete", f"GET {key}", b"NO EXIST\r\n"),
+        ("initially missing", (b"GET", key), b"$-1\r\n"),
+        ("write", (b"SET", key, b"first"), b"+OK\r\n"),
+        ("read", (b"GET", key), b"$5\r\nfirst\r\n"),
+        ("modify", (b"MOD", key, b"second"), b"+OK\r\n"),
+        ("read modified value", (b"GET", key), b"$6\r\nsecond\r\n"),
+        ("delete", (b"DEL", key), b":1\r\n"),
+        ("missing after delete", (b"GET", key), b"$-1\r\n"),
     ]
 
     with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
         connection.settimeout(3)
         with connection.makefile("rb") as replies:
-            for name, request, expected in cases:
+            for name, fields, expected in cases:
+                request = b"*" + str(len(fields)).encode("ascii") + b"\r\n"
+                for field in fields:
+                    request += (
+                        b"$" + str(len(field)).encode("ascii")
+                        + b"\r\n" + field + b"\r\n"
+                    )
+
                 try:
-                    connection.sendall((request + "\r\n").encode("ascii"))
-                    actual = replies.readline()
-                except OSError as exc:
+                    connection.sendall(request)
+                    first_line = replies.readline()
+                    if first_line.startswith(b"$") and first_line != b"$-1\r\n":
+                        value_length = int(first_line[1:-2])
+                        actual = first_line + replies.read(value_length + 2)
+                    else:
+                        actual = first_line
+                except (OSError, ValueError) as exc:
                     raise TestFailure(f"basic commands / {name}: {exc}") from exc
 
                 if actual != expected:
@@ -113,7 +125,6 @@ def test_basic_commands(port):
                         f"expected {expected!r}, got {actual!r}"
                     )
                 print(f"[PASS] basic commands / {name}")
-
 
 def test_pipelining(port):
     """运行仓库原有的两项流水线测试，并检查其退出码。"""
@@ -173,10 +184,10 @@ def test_other_log_level(test_dir, level):
             # 两种日志级别下服务都必须照常处理命令。
             with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
                 connection.settimeout(3)
-                connection.sendall(b"GET log_level_probe\r\n")
+                connection.sendall(b"*2\r\n$3\r\nGET\r\n$15\r\nlog_level_probe\r\n")
                 with connection.makefile("rb") as replies:
                     response = replies.readline()
-            if response != b"NO EXIST\r\n":
+            if response != b"$-1\r\n":
                 raise TestFailure(
                     f"{level}-level server replied {response!r}; log: {log_path}"
                 )
@@ -258,6 +269,326 @@ def test_invalid_config_startup(test_dir):
 
     print("[PASS] invalid config rejected before listening")
 
+def test_oversized_bulk_header(port):
+    """只发送超大长度声明，服务不能无限等待后续内容。"""
+    request = b"*2\r\n$3\r\nGET\r\n$1000000000\r\n"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
+        connection.settimeout(2)
+        connection.sendall(request)
+        with connection.makefile("rb") as replies:
+            try:
+                reply = replies.readline()
+            except OSError as exc:
+                raise TestFailure(
+                    f"oversized Bulk header received no timely reply: {exc}"
+                ) from exc
+
+    if not reply.startswith(b"-ERR ") or not reply.endswith(b"\r\n"):
+        raise TestFailure(f"oversized Bulk header returned {reply!r}")
+    print("[PASS] oversized Bulk header rejected promptly")
+
+def test_resp2_ping(port):
+    """RESP2 PING 应返回 Simple String，而不是旧文本。"""
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+        with connection.makefile("rb") as replies:
+            actual = replies.readline()
+
+    if actual != b"+PONG\r\n":
+        raise TestFailure(f"RESP2 PING: expected b'+PONG\\r\\n', got {actual!r}")
+    print("[PASS] RESP2 PING")
+
+def test_resp2_missing_get(port):
+    """RESP2 GET 找不到 key 时返回 Nil Bulk String。"""
+    key = ("missing_" + uuid.uuid4().hex).encode("ascii")
+    request = b"*2\r\n$3\r\nGET\r\n$" + str(len(key)).encode("ascii")
+    request += b"\r\n" + key + b"\r\n"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(request)
+        with connection.makefile("rb") as replies:
+            actual = replies.readline()
+
+    if actual != b"$-1\r\n":
+        raise TestFailure(f"RESP2 missing GET: expected nil, got {actual!r}")
+    print("[PASS] RESP2 missing GET returns nil")
+
+def test_resp2_write_commands(port):
+    key = ("resp_set_" + uuid.uuid4().hex).encode("ascii")
+    request = (
+        b"*3\r\n$3\r\nSET\r\n"
+        + b"$" + str(len(key)).encode("ascii") + b"\r\n" + key + b"\r\n"
+        + b"$1\r\nv\r\n"
+    )
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(request)
+        with connection.makefile("rb") as replies:
+            actual = replies.readline()
+
+    if actual != b"+OK\r\n":
+        raise TestFailure(f"RESP2 SET: expected b'+OK\\r\\n', got {actual!r}")
+    print("[PASS] RESP2 SET returns Simple String")
+    key_field = b"$" + str(len(key)).encode("ascii") + b"\r\n" + key + b"\r\n"
+    duplicate_request = b"*3\r\n$3\r\nSET\r\n" + key_field + b"$1\r\nx\r\n"
+    get_request = b"*2\r\n$3\r\nGET\r\n" + key_field
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        with connection.makefile("rb") as replies:
+            connection.sendall(duplicate_request)
+            duplicate_reply = replies.readline()
+
+            connection.sendall(get_request)
+            value_header = replies.readline()
+            value_body = replies.readline()
+
+    if duplicate_reply != b"-ERR key already exists\r\n":
+        raise TestFailure(f"duplicate SET returned {duplicate_reply!r}")
+    if (value_header, value_body) != (b"$1\r\n", b"v\r\n"):
+        raise TestFailure(
+            f"duplicate SET changed existing value: {value_header!r} {value_body!r}"
+        )
+    print("[PASS] duplicate RESP2 SET returns Error and preserves value")
+    mod_request = b"*3\r\n$3\r\nMOD\r\n" + key_field + b"$1\r\nx\r\n"
+    missing_key = key + b"_missing"
+    missing_field = (
+        b"$" + str(len(missing_key)).encode("ascii")
+        + b"\r\n" + missing_key + b"\r\n"
+    )
+    missing_mod_request = (
+        b"*3\r\n$3\r\nMOD\r\n" + missing_field + b"$1\r\nx\r\n"
+    )
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(mod_request + get_request + missing_mod_request)
+        with connection.makefile("rb") as replies:
+            mod_reply = replies.readline()
+            value_header = replies.readline()
+            value_body = replies.readline()
+            missing_reply = replies.readline()
+
+    if (mod_reply, value_header, value_body, missing_reply) != (
+        b"+OK\r\n", b"$1\r\n", b"x\r\n", b"-ERR key not found\r\n"
+    ):
+        raise TestFailure(
+            f"RESP2 MOD replies: {mod_reply!r}, {value_header!r}, "
+            f"{value_body!r}, {missing_reply!r}"
+        )
+    print("[PASS] RESP2 MOD succeeds or reports missing key")
+    delete_request = b"*2\r\n$3\r\nDEL\r\n" + key_field
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(delete_request + delete_request)
+        with connection.makefile("rb") as replies:
+            first = replies.readline()
+            second = replies.readline()
+
+    if (first, second) != (b":1\r\n", b":0\r\n"):
+        raise TestFailure(
+            f"RESP2 DEL replies: expected :1 then :0, got {first!r}, {second!r}"
+        )
+    print("[PASS] RESP2 DEL returns 1 then 0 in pipeline order")
+
+    exist_request = b"*2\r\n$5\r\nEXIST\r\n" + key_field
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(exist_request + request + exist_request)
+        with connection.makefile("rb") as replies:
+            before = replies.readline()
+            set_reply = replies.readline()
+            after = replies.readline()
+
+    if (before, set_reply, after) != (b":0\r\n", b"+OK\r\n", b":1\r\n"):
+        raise TestFailure(
+            f"RESP2 EXIST replies: {before!r}, {set_reply!r}, {after!r}"
+        )
+    print("[PASS] RESP2 EXIST returns 0 then 1 in pipeline order")
+
+def test_resp2_wrong_arity(port):
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        with connection.makefile("rb") as replies:
+            connection.sendall(b"*1\r\n$3\r\nSET\r\n")
+            error = replies.readline()
+            if error != b"-ERR wrong number of arguments for SET\r\n":
+                raise TestFailure(f"SET without arguments returned {error!r}")
+
+            connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+            pong = replies.readline()
+            if pong != b"+PONG\r\n":
+                raise TestFailure(f"connection failed after bad SET: {pong!r}")
+
+    print("[PASS] wrong SET arity returns Error; connection remains usable")
+
+def test_legacy_text_rejected(port):
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        with connection.makefile("rb") as replies:
+            connection.sendall(b"GET legacy_probe\r\n")
+            error = replies.readline()
+            if error != b"-ERR invalid or oversized request\r\n":
+                raise TestFailure(f"old text command returned {error!r}")
+
+            connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+            pong = replies.readline()
+            if pong != b"+PONG\r\n":
+                raise TestFailure(f"connection failed after old text: {pong!r}")
+
+    print("[PASS] old client text protocol rejected; connection remains usable")
+
+def test_unknown_resp2_command(port):
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        with connection.makefile("rb") as replies:
+            connection.sendall(b"*1\r\n$5\r\nBOGUS\r\n")
+            error = replies.readline()
+            if error != b"-ERR unknown command\r\n":
+                raise TestFailure(f"unknown command returned {error!r}")
+
+            connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+            pong = replies.readline()
+            if pong != b"+PONG\r\n":
+                raise TestFailure(f"connection failed after unknown command: {pong!r}")
+
+    print("[PASS] unknown RESP2 command returns Error; connection remains usable")
+
+def test_resp2_save(port, test_dir):
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        with connection.makefile("rb") as replies:
+            connection.sendall(b"*1\r\n$4\r\nSAVE\r\n")
+            save_reply = replies.readline()
+
+            connection.sendall(b"*2\r\n$4\r\nSAVE\r\n$1\r\nx\r\n")
+            wrong_arity = replies.readline()
+
+    if save_reply != b"+OK\r\n":
+        raise TestFailure(f"RESP2 SAVE returned {save_reply!r}")
+    if wrong_arity != b"-ERR wrong number of arguments for SAVE\r\n":
+        raise TestFailure(f"RESP2 SAVE wrong arity returned {wrong_arity!r}")
+    if not (test_dir / "snapshot.db").is_file():
+        raise TestFailure("RESP2 SAVE did not create snapshot.db")
+
+    print("[PASS] RESP2 SAVE reply, arity and Snapshot file")
+
+def test_resp2_nul_rejected(port):
+    request = (
+        b"*3\r\n"
+        b"$3\r\nSET\r\n"
+        b"$7\r\nnul_key\r\n"
+        b"$3\r\na\x00b\r\n"
+    )
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        with connection.makefile("rb") as replies:
+            connection.sendall(request)
+            error = replies.readline()
+
+            if error != b"-ERR NUL bytes are not supported\r\n":
+                raise TestFailure(f"NUL-containing request returned {error!r}")
+
+            connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+            pong = replies.readline()
+
+    if pong != b"+PONG\r\n":
+        raise TestFailure(f"connection unusable after NUL error: {pong!r}")
+    print("[PASS] NUL-containing Bulk rejected; connection remains usable")
+
+def test_fragmented_resp2_with_crlf(port):
+    """请求从 value 的 CRLF 中间断开，服务须等完整后再回复。"""
+    def encode(*fields):
+        parts = [b"*" + str(len(fields)).encode("ascii") + b"\r\n"]
+        for field in fields:
+            parts.extend((
+                b"$" + str(len(field)).encode("ascii") + b"\r\n",
+                field,
+                b"\r\n",
+            ))
+        return b"".join(parts)
+
+    key = ("fragment_" + uuid.uuid4().hex).encode("ascii")
+    value = b"first line\r\nsecond line with spaces"
+    request = encode(b"SET", key, value)
+    split_at = request.index(value) + value.index(b"\r\n") + 1
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.sendall(request[:split_at])
+
+        connection.settimeout(0.2)
+        try:
+            early_reply = connection.recv(1)
+        except socket.timeout:
+            pass
+        else:
+            raise TestFailure(
+                f"server replied before complete request: {early_reply!r}"
+            )
+
+        connection.settimeout(3)
+        connection.sendall(request[split_at:])
+        with connection.makefile("rb") as replies:
+            set_reply = replies.readline()
+
+            connection.sendall(encode(b"GET", key))
+            header = replies.readline()
+            body = replies.read(len(value) + 2)
+
+    expected_header = b"$" + str(len(value)).encode("ascii") + b"\r\n"
+    if (set_reply != b"+OK\r\n" or
+        header != expected_header or
+        body != value + b"\r\n"):
+        raise TestFailure(
+            f"fragmented RESP2 result: {set_reply!r}, {header!r}, {body!r}"
+        )
+    print("[PASS] fragmented RESP2 request and CRLF value")
+
+def test_empty_and_malformed_resp2(port):
+    key = ("empty_" + uuid.uuid4().hex).encode("ascii")
+    key_field = b"$" + str(len(key)).encode("ascii") + b"\r\n" + key + b"\r\n"
+    set_empty = b"*3\r\n$3\r\nSET\r\n" + key_field + b"$0\r\n\r\n"
+    get_value = b"*2\r\n$3\r\nGET\r\n" + key_field
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        with connection.makefile("rb") as replies:
+            connection.sendall(set_empty)
+            set_reply = replies.readline()
+
+            connection.sendall(get_value)
+            get_header = replies.readline()
+            get_body = replies.read(2)
+
+            connection.sendall(b"*1\r\n$X\r\n")
+            bad_number = replies.readline()
+
+            # 声明长度 3，实际字段 PING 有 4 字节。
+            connection.sendall(b"*1\r\n$3\r\nPING\r\n")
+            bad_length = replies.readline()
+
+            connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+            pong = replies.readline()
+
+    expected_error = b"-ERR invalid or oversized request\r\n"
+    if (set_reply != b"+OK\r\n" or
+        get_header != b"$0\r\n" or get_body != b"\r\n" or
+        bad_number != expected_error or
+        bad_length != expected_error or
+        pong != b"+PONG\r\n"):
+        raise TestFailure(
+            f"empty/malformed RESP2: {set_reply!r}, {get_header!r}, "
+            f"{get_body!r}, {bad_number!r}, {bad_length!r}, {pong!r}"
+        )
+    print("[PASS] empty Bulk and malformed frames; connection remains usable")
+
 def main():
     if not os.access(KVSTORE_BIN, os.X_OK):
         print(f"[FAIL] missing executable: {KVSTORE_BIN}; run make first", file=sys.stderr)
@@ -323,6 +654,17 @@ def main():
         test_other_log_level(test_dir, "error")
         test_other_log_level(test_dir, "debug")
         test_invalid_config_startup(test_dir)
+        test_oversized_bulk_header(port)
+        test_resp2_ping(port)
+        test_resp2_missing_get(port)
+        test_resp2_write_commands(port)
+        test_resp2_wrong_arity(port)
+        test_legacy_text_rejected(port)
+        test_unknown_resp2_command(port)
+        test_resp2_save(port, test_dir)
+        test_resp2_nul_rejected(port)
+        test_fragmented_resp2_with_crlf(port)
+        test_empty_and_malformed_resp2(port)
         result = 0
 
     except (OSError, TestFailure) as exc:

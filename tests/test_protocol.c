@@ -49,6 +49,26 @@ static void test_parse_command_with_crlf_value(void)
     /* value 中的 CRLF 是字段内容，不是命令结束符。 */
     assert(fields[2].length == 4);
     assert(memcmp(fields[2].data, "a\r\nb", 4) == 0);
+
+    /* 从第一条命令之后继续解析，验证粘包中的第二条命令。 */
+    size_t second_bytes = 0;
+    field_count = 0;
+    result = kvs_parse_command(
+        input + parsed_bytes,
+        sizeof(input) - 1 - parsed_bytes,
+        fields,
+        3,
+        &field_count,
+        &second_bytes
+    );
+
+    assert(result == 1);
+    assert(field_count == 2);
+    assert(second_bytes == sizeof(input) - 1 - parsed_bytes);
+    assert(fields[0].length == 3);
+    assert(memcmp(fields[0].data, "GET", 3) == 0);
+    assert(fields[1].length == 3);
+    assert(memcmp(fields[1].data, "key", 3) == 0);
 }
 
 /* 验证半条命令会被识别为“还需要更多输入”。 */
@@ -141,12 +161,58 @@ static void test_large_value(void)
     free(encoded);
     free(value);
 }
+
+/* 空 Bulk String 是合法字段；是否允许空 key 由命令层决定。 */
+static void test_empty_bulk_string(void)
+{
+    static const char command[] =
+        "*2\r\n"
+        "$3\r\nGET\r\n"
+        "$0\r\n\r\n";
+
+    kvs_slice_t fields[2] = {0};
+    size_t field_count = 0;
+    size_t parsed_bytes = 0;
+
+    int result = kvs_parse_command(
+        command, sizeof(command) - 1,
+        fields, 2, &field_count, &parsed_bytes
+    );
+
+    assert(result == 1);
+    assert(field_count == 2);
+    assert(parsed_bytes == sizeof(command) - 1);
+    assert(fields[1].length == 0);
+}
+
+static void test_limited_parser_rejects_large_header(void)
+{
+    static const char command[] =
+        "*2\r\n"
+        "$3\r\nGET\r\n"
+        "$1000000000\r\n"; /* 故意不发送字段内容。 */
+
+    kvs_slice_t fields[2] = {0};
+    size_t field_count = 0;
+    size_t parsed_bytes = 0;
+
+    int result = kvs_parse_command_limited(
+        command, sizeof(command) - 1,
+        fields, 2, &field_count, &parsed_bytes,
+        1024 /* 本测试限定一条命令最多 1024 字节。 */
+    );
+
+    assert(result == -1);
+}
+
 int main(void)
 {
     test_parse_command_with_crlf_value();
     test_incomplete_command();
     test_invalid_field_length();
     test_large_value();
+    test_empty_bulk_string();
+    test_limited_parser_rejects_large_header();
     puts("protocol parser tests passed");
     return 0;
 }
