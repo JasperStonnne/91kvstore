@@ -69,6 +69,7 @@ typedef struct {//通用监听器配置，一个监听端口绑定一个消息�
 	unsigned short port;
 	msg_handler handler;
 	kvs_connection_stream_handler stream_handler; // 可选：连接响应后继续分块输出数据
+    const char *bind_ip;/* 本监听器要绑定的 IPv4 地址；NULL 表示旧行为 0.0.0.0。 */
 }kvs_listener_config_t;
 
 

@@ -5,6 +5,9 @@
 #include "replication.h"
 #include "server.h"
 #include "protocol.h"
+#include "config.h"
+#include "log.h"
+#include <string.h>
 #include<errno.h>
 #include<limits.h>
 #include <stdint.h>
@@ -815,88 +818,44 @@ static int kvs_install_replication_snapshot(
     return 0;
 }
 
-static int kvs_parse_port(const char *text,unsigned short *port){
-    if(text==NULL||port==NULL){
-        return -1;
-    }
-    errno=0;
-    char *end =NULL;//字符串解析结束的位置
-    long value =strtol(text,&end,10);//按十进制 把字符转化为long
-    if(errno!=0||end==text||*end!='\0'||value<1||value>65535){
-        return -1;
-    }
-    *port=(unsigned short)value;
-    return 0;
-}
-
-int main(int argc,char *argv[]){
-    kvs_server_config_t config={
-        .role=KVS_ROLE_STANDALONE,
-        .service_port=0,
-        .replication_port=0,
-        .primary_host =NULL
-    };
-    if(argc==2){
-
-        if(kvs_parse_port(argv[1],&config.service_port)<0){
-            fprintf(stderr,"invalid service port: %s\n",argv[1]);
-            return -1;
-        }
-    }else if(argc==4 &&strcmp(argv[1],"primary")==0){
-        config.role=KVS_ROLE_PRIMARY;
-
-        if(kvs_parse_port(argv[2],&config.service_port)<0){
-            fprintf(stderr,"invalid service port:%s\n",argv[2]);
-            return -1;
-        }
-        if(kvs_parse_port(argv[3],&config.replication_port)<0){
-            fprintf(stderr,"invalid replication port:%s\n",argv[3]);
-            return -1;
-        }
-        if(config.service_port==config.replication_port){
-            fprintf(stderr,"service port and replication port must differ\n");
-            return -1;
-        }
-
-    }else if(argc==5&&strcmp(argv[1],"replica")==0){
-        config.role=KVS_ROLE_REPLICA;
-
-        if(kvs_parse_port(argv[2],&config.service_port)<0){
-            fprintf(stderr,"invalid service port:%s\n",argv[2]);
-            return -1;
-        }
-        if(argv[3][0]=='\0'){
-            fprintf(stderr,"primary host cannot be empty\n");
-            return -1;
-        }
-        config.primary_host =argv[3];
-        if(kvs_parse_port(argv[4],&config.replication_port)<0){
-            fprintf(stderr,"invalid replication port:%s\n",argv[4]);
-            return -1;
-        }
-
-    }else{
-        fprintf(stderr,
-                "usage:\n"
-                "  %s <service-port>\n"
-                "  %s primary <service-port> <replication-port>\n"
-                "  %s replica <service-port> <primary-host> <replication-port>\n",
-                argv[0],
-                argv[0],
-                argv[0]);
-        return -1;
-
+int main(int argc, char *argv[])
+{
+    /* 唯一正式入口：启动参数必须是配置文件路径。 */
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <config-file>\n", argv[0]);
+        return 1;
     }
 
+    /*
+     * 配置模块负责默认值、解析和校验。
+     * config 自己持有地址字符串，直到 main() 结束都有效。
+     */
+    kvs_config_t config = {0};
+    char error[256] = {0};
+
+    if (kvs_config_load(argv[1], &config, error, sizeof(error)) < 0) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+
+        /* 配置解析成功后，运行日志采用配置文件指定的级别。 */
+    kvs_log_set_level(config.log_level);
+
+        /* 保持原有的 Snapshot + AOF 混合恢复流程。 */
     kvs_server_role = config.role;
     init_kvengine();
-    long long offset=kvs_snapshot_load("snapshot.db", kvs_recovery_fields_protocol);
-    if(offset<0){
-        fprintf(stderr,"failed to load snapshot\n");
+
+    long long offset = kvs_snapshot_load(
+        "snapshot.db", kvs_recovery_fields_protocol
+    );
+    if (offset < 0) {
+        fprintf(stderr, "failed to load snapshot\n");
         return -1;
     }
-    int replay_ret=kvs_aof_replay("appendonly.aof",offset,kvs_recovery_fields_protocol);
-    if(replay_ret<0){
+
+    if (kvs_aof_replay(
+            "appendonly.aof", offset, kvs_recovery_fields_protocol
+        ) < 0) {
         fprintf(stderr, "failed to replay AOF\n");
         return -1;
     }
@@ -904,52 +863,72 @@ int main(int argc,char *argv[]){
     if (kvs_aof_open("appendonly.aof") < 0) {
         fprintf(stderr, "failed to open AOF\n");
         return -1;
-}
-    if (kvs_replication_init(&config,kvs_install_replication_snapshot,kvs_replication_command_protocol) < 0) {
-    fprintf(stderr, "failed to initialize replication\n");
-    kvs_aof_close();
-    dest_kvengine();
-    return -1;
-}
-int network_ret=-1;
+    }
+    /* 以下恢复、复制和网络启动代码继续共用这份配置。 */
+
+if (kvs_replication_init(
+        config.role,
+        config.primary_host,
+        config.primary_port,
+        kvs_install_replication_snapshot,
+        kvs_replication_command_protocol
+    ) < 0) {
+            fprintf(stderr, "failed to initialize replication\n");
+            kvs_aof_close();
+            dest_kvengine();
+            return -1;
+        }
+    int network_ret=-1;
 
     if (config.role == KVS_ROLE_PRIMARY) {
         kvs_listener_config_t listeners[] = {
             {
                 .port = config.service_port,                 // 普通客户端端口
+                .bind_ip = config.bind_ip,
                 .handler = kvs_network_protocol,             // 客户端命令协议、
                 .stream_handler = NULL                       // 普通客户端不发送文件流
             },
             {
                 .port = config.replication_port,             // Replica 专用端口
+                .bind_ip = config.bind_ip,
                 .handler = kvs_replication_network_protocol, // 主从复制协议
                 .stream_handler = kvs_replication_stream // 分块提供 Snapshot
             }
         };
 
+         /* Primary 同时开启客户端端口和复制端口。 */
         network_ret = ntyco_start_listeners(
             listeners,
-            sizeof(listeners) / sizeof(listeners[0])          // 两个监听器配置
+            sizeof(listeners) / sizeof(listeners[0])
         );
-    } else if(config.role==KVS_ROLE_REPLICA) {
-        kvs_listener_config_t listener={
-            .port=config.service_port,
-            .handler=kvs_network_protocol
+    } else if (config.role == KVS_ROLE_REPLICA) {
+        /* Replica 监听客户端端口，同时需要连接上游 Primary。 */
+        kvs_listener_config_t listener = {
+            .port = config.service_port,
+            .bind_ip = config.bind_ip,
+            .handler = kvs_network_protocol,
+            .stream_handler = NULL
         };
 
         kvs_connector_config_t connector;
 
-        if(kvs_replication_build_connector_config(&connector)<0){
-            fprintf(stderr,"failed to build replication connector\n");
-            network_ret=-1;
-        }else{
-            network_ret=ntyco_start_runtime(&listener,1,&connector,1);
-
+        if (kvs_replication_build_connector_config(&connector) < 0) {
+            fprintf(stderr, "failed to build replication connector\n");
+            network_ret = -1;
+        } else {
+            network_ret = ntyco_start_runtime(
+                &listener, 1, &connector, 1
+            );
         }
-
-
-    }else{
-        network_ret=ntyco_start(config.service_port,kvs_network_protocol);
+    } else {
+        /* Standalone 只有一个监听器，没有上游连接器。 */
+        kvs_listener_config_t listener = {
+            .port = config.service_port,
+            .bind_ip = config.bind_ip,
+            .handler = kvs_network_protocol,
+            .stream_handler = NULL
+        };
+        network_ret = ntyco_start_listeners(&listener, 1);
     }
 
     if(network_ret<0){

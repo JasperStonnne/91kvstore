@@ -18,6 +18,8 @@ TEST_DIR=$(mktemp -d /tmp/91kv-replication-test.XXXXXX)
 PRIMARY_DIR="$TEST_DIR/primary"
 REPLICA_DIR="$TEST_DIR/replica"
 PRIMARY_LOG="$TEST_DIR/primary.log"
+PRIMARY_CONFIG="$PRIMARY_DIR/primary.conf"
+REPLICA_CONFIG="$REPLICA_DIR/replica.conf"
 REPLICA_LOG="$TEST_DIR/replica.log"
 
 # 这里只会保存本脚本亲自启动的进程号。
@@ -209,11 +211,21 @@ for port in "$PRIMARY_PORT" "$REPLICA_PORT" "$REPLICATION_PORT"; do
     fi
 done
 
+# 配置文件也放在测试临时目录中，不写入仓库。
+# Primary 保持现有的双端口：客户端端口 + Replica 专用复制端口。
+cat >"$PRIMARY_CONFIG" <<EOF
+role = primary
+bind_ip = 127.0.0.1
+service_port = $PRIMARY_PORT
+replication_port = $REPLICATION_PORT
+log_level = info
+persistence_mode = legacy_hybrid
+EOF
+
 # 启动 Primary。工作目录是临时目录，PID 是本脚本启动的进程。
 (
     cd "$PRIMARY_DIR"
-    exec stdbuf -oL "$KVSTORE_BIN" \
-        primary "$PRIMARY_PORT" "$REPLICATION_PORT"
+    exec stdbuf -oL "$KVSTORE_BIN" "$PRIMARY_CONFIG"
 ) </dev/null >"$PRIMARY_LOG" 2>&1 &
 PRIMARY_PID=$!
 
@@ -246,11 +258,22 @@ if [ "$large_write_response" != "OK" ]; then
 fi
 echo "[PASS] 2048-byte value written to Primary"
 
+# Replica 的客户端监听端口属于自己；primary_host/primary_port
+# 指向它要连接的 Primary 复制端口。
+cat >"$REPLICA_CONFIG" <<EOF
+role = replica
+bind_ip = 127.0.0.1
+service_port = $REPLICA_PORT
+primary_host = 127.0.0.1
+primary_port = $REPLICATION_PORT
+log_level = info
+persistence_mode = legacy_hybrid
+EOF
+
 # 启动 Replica，它的数据文件位于另一个临时目录。
 (
     cd "$REPLICA_DIR"
-    exec stdbuf -oL "$KVSTORE_BIN" \
-        replica "$REPLICA_PORT" 127.0.0.1 "$REPLICATION_PORT"
+    exec stdbuf -oL "$KVSTORE_BIN" "$REPLICA_CONFIG"
 ) </dev/null >"$REPLICA_LOG" 2>&1 &
 REPLICA_PID=$!
 

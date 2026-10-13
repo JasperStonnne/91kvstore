@@ -1,6 +1,7 @@
 #include "replication.h"
 #include "persistence.h"
 #include "server.h"
+#include "log.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/random.h>
@@ -197,13 +198,14 @@ static int kvs_replication_upstream_frame_protocol(
         replication_manager.replication_offset=primary_offset;
         replication_manager.snapshot_file_size =primary_snapshot_file_size;
         replication_manager.state=KVS_REPLICATION_STATE_FULL_SYNC;
-        printf(
-            "replication: enter FULL_SYNC id=%s offset=%lld snapshot_size=%lld fd=%d\n",
-            replication_manager.replication_id,
-            replication_manager.replication_offset,
-            replication_manager.snapshot_file_size,
-            connection_fd
-        );
+kvs_log_message(
+    KVS_LOG_INFO,
+    "replication: enter FULL_SYNC id=%s offset=%lld snapshot_size=%lld fd=%d\n",
+    replication_manager.replication_id,
+    replication_manager.replication_offset,
+    replication_manager.snapshot_file_size,
+    connection_fd
+);
         return 0;// 已保存全量同步起点，当前暂时没有消息需要回发
     }
     return -1; // 握手阶段收到未知的 Primary 响应
@@ -270,7 +272,8 @@ static int kvs_replication_online_control_frame_protocol(
         replication_manager.replication_offset=local_offset;
         replication_manager.state=KVS_REPLICATION_STATE_ONLINE;
 
-        printf(
+        kvs_log_message(
+            KVS_LOG_INFO,
             "replication: enter ONLINE offset=%lld fd=%d\n",
             local_offset,
             connection_fd
@@ -406,7 +409,8 @@ static int kvs_replication_upstream_network_protocol(
             replication_manager.state =
                 KVS_REPLICATION_STATE_CATCH_UP;
 
-            printf(
+            kvs_log_message(
+                KVS_LOG_INFO,
                 "replication: Snapshot installed, enter CATCH_UP "
                 "offset=%lld size=%lld fd=%d\n",
                 replication_manager.replication_offset,
@@ -566,7 +570,8 @@ int kvs_replication_stream(
             return -1;
         }
 
-        printf(
+        kvs_log_message(
+            KVS_LOG_INFO,
             "replication: Snapshot stream completed, "
             "start AOF catch-up range=[%lld,%lld) fd=%d\n",
             replication_manager.replication_offset,
@@ -630,7 +635,8 @@ int kvs_replication_stream(
             return -1;
         }
 
-        printf(
+        kvs_log_message(
+            KVS_LOG_DEBUG,
             "replication: continue AOF catch-up "
             "range=[%lld,%lld) fd=%d\n",
             sent_offset,
@@ -664,7 +670,8 @@ int kvs_replication_stream(
         replication_manager.replication_offset=sent_offset;
         replication_manager.state=KVS_REPLICATION_STATE_ONLINE;
 
-        printf(
+        kvs_log_message(
+            KVS_LOG_INFO,
             "replication: AOF catch-up completed, "
             "enter ONLINE offset=%lld fd=%d\n",
             sent_offset,
@@ -806,7 +813,8 @@ static int kvs_replication_frame_protocol(
         return -1;
     }
    if(is_full_resync_response){
-        printf(
+        kvs_log_message(
+            KVS_LOG_DEBUG,
             "replication: FULLRESYNC response ready id=%s offset=%lld snapshot_size=%lld fd=%d\n",
             replication_manager.replication_id,
             replication_manager.replication_offset,
@@ -886,28 +894,34 @@ static int kvs_replication_generate_id(
     return 0;
 }
 
-int kvs_replication_init(const kvs_server_config_t *config,kvs_snapshot_install_handler snapshot_install_handler, kvs_replication_command_handler command_handler)
+int kvs_replication_init(
+    kvs_role_t role,
+    const char *primary_host,
+    unsigned short primary_port,
+    kvs_snapshot_install_handler snapshot_install_handler,
+    kvs_replication_command_handler command_handler
+)
 {
-    if (config == NULL || command_handler == NULL||replication_manager.initialized) { // 配置必须存在，并且不能重复初始化
+    if (command_handler == NULL||replication_manager.initialized) { // 配置必须存在，并且不能重复初始化
         return -1;
     }
 
-    if (config->role != KVS_ROLE_STANDALONE &&
-        config->role != KVS_ROLE_PRIMARY &&
-        config->role != KVS_ROLE_REPLICA) {                  // 检查角色是否合法
+    if (role != KVS_ROLE_STANDALONE &&
+        role != KVS_ROLE_PRIMARY &&
+        role != KVS_ROLE_REPLICA) {                  // 检查角色是否合法
         return -1;
     }
 
     size_t primary_host_length = 0;
     char generated_replication_id[KVS_REPLICATION_ID_HEX_LENGTH + 1] = {0};
-    if (config->role == KVS_ROLE_REPLICA) {
-        if (config->primary_host == NULL ||
-            config->primary_host[0] == '\0' ||
-            config->replication_port == 0) {                 // Replica 必须具有有效的 Primary 地址和端口
+    if (role == KVS_ROLE_REPLICA) {
+        if (primary_host == NULL ||
+            primary_host[0] == '\0' ||
+            primary_port == 0) {                 // Replica 必须具有有效的 Primary 地址和端口
             return -1;
         }
 
-        primary_host_length = strlen(config->primary_host);
+        primary_host_length = strlen(primary_host);
         if (primary_host_length >=
             sizeof(replication_manager.primary_host)) {      // 地址必须能够放入管理器
             return -1;
@@ -918,7 +932,7 @@ int kvs_replication_init(const kvs_server_config_t *config,kvs_snapshot_install_
         if (offset < 0) {
         return -1;
     }
-    if(config->role == KVS_ROLE_PRIMARY){
+    if(role == KVS_ROLE_PRIMARY){
     if(kvs_replication_generate_id(
             generated_replication_id,
             sizeof(generated_replication_id)) < 0){
@@ -927,7 +941,7 @@ int kvs_replication_init(const kvs_server_config_t *config,kvs_snapshot_install_
 }
 
 
-    replication_manager.role = config->role;
+    replication_manager.role = role;
     replication_manager.replication_offset = offset;
     replication_manager.snapshot_install_handler =snapshot_install_handler;
     replication_manager.command_handler = command_handler;
@@ -938,7 +952,7 @@ int kvs_replication_init(const kvs_server_config_t *config,kvs_snapshot_install_
     replication_manager.aof_reader.fd = -1;        // 当前没有打开增量 AOF
     replication_manager.aof_reader.offset = 0;     // 当前没有增量读取位置
     replication_manager.aof_reader.remaining = 0;  // 当前没有待发送的增量字节
-    if(config->role == KVS_ROLE_PRIMARY){
+    if(role == KVS_ROLE_PRIMARY){
     memcpy(
         replication_manager.replication_id,
         generated_replication_id,
@@ -950,13 +964,13 @@ int kvs_replication_init(const kvs_server_config_t *config,kvs_snapshot_install_
     replication_manager.primary_connection_fd = -1;          // 当前尚未连接 Primary
     replication_manager.state = KVS_REPLICATION_STATE_DISCONNECTED;
 
-    if (config->role == KVS_ROLE_REPLICA) {
+    if (role == KVS_ROLE_REPLICA) {
         memcpy(
             replication_manager.primary_host,
-            config->primary_host,
+            primary_host,
             primary_host_length + 1                           // 连同字符串末尾的 \0 一起复制
         );
-        replication_manager.primary_port = config->replication_port;
+        replication_manager.primary_port = primary_port;
     } else {
         replication_manager.primary_host[0] = '\0';           // Primary 和单机没有上游地址
         replication_manager.primary_port = 0;

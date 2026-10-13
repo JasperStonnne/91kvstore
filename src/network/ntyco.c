@@ -5,14 +5,19 @@
 #include "nty_coroutine.h"
 #include "server.h"
 #include "memory_pool.h"
+#include "log.h"
 #include <arpa/inet.h>
 #include<errno.h>
+#include <string.h>
+#include <unistd.h>
 #define NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK 64
 #define NTYCO_MAX_LISTENER_COUNT 2
 #define NTYCO_MAX_CONNECTOR_COUNT 1 // 当前一台 Replica 只连接一个 Primary
 #define NTYCO_STREAM_RETRY_INTERVAL_MS 50
 typedef struct {
 	unsigned short port;
+	const char *bind_ip;/* 指向启动配置中的 IP；NULL 沿用 0.0.0.0。 */
+	int listen_fd; /* 本监听器拥有的 socket；-1 表示尚未创建。 */
 	msg_handler handler;
 	kvs_connection_stream_handler stream_handler; // 当前监听器的可选流式输出函数
 	memory_pool_t connection_pool;  // 连接上下文专用池
@@ -69,6 +74,8 @@ static int ntyco_listener_context_init(
         }
 
         context->port=config->port;
+		context->bind_ip = config->bind_ip;
+		context->listen_fd = -1;
         context->handler=config->handler;
 		context->stream_handler=config->stream_handler;
         return memory_pool_init(
@@ -84,9 +91,63 @@ static void ntyco_listener_context_destroy(
         if(context==NULL){
                 return;
         }
-
+		if (context->listen_fd >= 0) {
+			close(context->listen_fd);
+			context->listen_fd = -1;
+		}
         memory_pool_destory(&context->connection_pool);
 }
+
+/*
+ * 在协程启动之前，创建并绑定一个监听 socket。
+ *
+ * 成功：把 fd 交给 context->listen_fd，由 context_destroy() 负责关闭。
+ * 失败：本函数关闭自己创建的 fd，context->listen_fd 仍保持 -1。
+ */
+static int ntyco_listener_open(ntyco_listener_context_t *context)
+{
+    /* 旧调用方没有指定 IP 时，维持原来的“监听所有网卡”。 */
+    const char *ip =
+        context->bind_ip != NULL ? context->bind_ip : "0.0.0.0";
+
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(context->port);
+
+    if (inet_pton(AF_INET, ip, &local.sin_addr) != 1) {
+        fprintf(stderr, "invalid listener IP: %s\n", ip);
+        return -1;
+    }
+
+    /* nty_socket() 会建立 NtyCo 所需的非阻塞 socket。 */
+    int fd = nty_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "failed to create listener for %s:%u\n",
+                ip, context->port);
+        return -1;
+    }
+
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+        int saved_errno = errno;
+        fprintf(stderr, "failed to bind %s:%u: %s\n",
+                ip, context->port, strerror(saved_errno));
+        close(fd);
+        return -1;
+    }
+
+    if (listen(fd, 20) < 0) {
+        int saved_errno = errno;
+        fprintf(stderr, "failed to listen on %s:%u: %s\n",
+                ip, context->port, strerror(saved_errno));
+        close(fd);
+        return -1;
+    }
+
+    /* 只有全部成功，才转交 fd 的所有权。 */
+    context->listen_fd = fd;
+    return 0;
+}
+
 static int ntyco_send_all(int fd,const char *data,int length)
 {
     if(fd<0 || data==NULL || length<0){
@@ -171,9 +232,13 @@ void server_reader(void *arg) {
 				* 当前协程休眠一小段时间，让出 CPU 后再检查。
 				*/
 				if(stream_length==KVS_STREAM_WAIT){
-					nty_coroutine_sleep(
-						NTYCO_STREAM_RETRY_INTERVAL_MS
-					);
+					/*
+					* 某些 NtyCo 版本的非零 sleep 只登记定时器、不主动让出协程。
+					* 在适配层明确完成这两步，避免复制流空闲时阻塞其他连接。
+					*/
+					nty_coroutine *co = nty_coroutine_get_sched()->curr_thread;
+					nty_schedule_sched_sleepdown(co, NTYCO_STREAM_RETRY_INTERVAL_MS);
+					nty_coroutine_yield(co);
 					continue;
 				}
 					if(stream_length<0){
@@ -275,7 +340,10 @@ static void ntyco_connector(void *arg)
 	}
 	/* 初始消息已发送完毕，后续接收由 server_reader 管理。 */
 	kvs_output_buffer_free(&output);
-	printf("connect to primary %s:%u\n",context->host,context->port);
+	kvs_log_message(
+    KVS_LOG_INFO, "connect to primary %s:%u\n",
+    context->host, context->port
+);
 
 	ntyco_connection_context_t connection = {
 		.fd =fd,
@@ -294,20 +362,22 @@ static void ntyco_connector(void *arg)
 
 void server(void *arg) {
 
-	ntyco_listener_context_t *context=(ntyco_listener_context_t *)arg;
-	unsigned short port=context->port;
-	int fd = nty_socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) return ;
+	ntyco_listener_context_t *context =
+		(ntyco_listener_context_t *)arg;
 
-	struct sockaddr_in local, remote;
-	local.sin_family = AF_INET;
-	local.sin_port = htons(port);
-	local.sin_addr.s_addr = INADDR_ANY;
-	bind(fd, (struct sockaddr*)&local, sizeof(struct sockaddr_in));
+	/*
+	* socket 应已由 ntyco_start_runtime() 在启动协程前完成绑定。
+	* 这里仅使用它接收连接，不再重复 socket()/bind()/listen()。
+	*/
+	int fd = context->listen_fd;
+	if (fd < 0) {
+		fprintf(stderr, "listener for port %u has no socket\n",
+				context->port);
+		return;
+	}
 
-	listen(fd, 20);
-	printf("listen port : %d\n", port);
-
+	struct sockaddr_in remote;
+	kvs_log_message(KVS_LOG_INFO, "listen port : %u\n", context->port);
 
 	while (1) {
 		socklen_t len = sizeof(struct sockaddr_in);
@@ -315,7 +385,8 @@ void server(void *arg) {
 		if(cli_fd<0){
 			continue;
 		}
-
+		/* 只在 DEBUG 下记录连接建立；不打印每条请求或请求内容。 */
+		kvs_log_message(KVS_LOG_DEBUG, "client accepted fd=%d\n", cli_fd);
 		ntyco_connection_context_t *connection = memory_pool_alloc(&context->connection_pool);
 		if(connection==NULL){
 			nty_close(cli_fd);
@@ -370,19 +441,34 @@ int ntyco_start_runtime(const kvs_listener_config_t *listeners,size_t listener_c
                         return -1;
                 }
         }//将每份连接器 config 转换成 NtyCo connector context
-	for(size_t i=0;i<listener_count;i++){
-		nty_coroutine *co = NULL;
-	if(nty_coroutine_create(&co,server,&contexts[i])!=0){
-		fprintf(stderr,
-				"failed to create listener coroutine for port %u\n",
-				contexts[i].port);
 
-		for(size_t j=0;j<initialized_count;j++){
-			ntyco_listener_context_destroy(&contexts[j]);
+		/*
+		* 先把所有监听端口绑定好，再创建协程。
+		* Primary 有两个端口：任意一个失败，就释放已打开的端口，
+		* 不允许服务器只启动一半。
+		*/
+		for (size_t i = 0; i < listener_count; ++i) {
+			if (ntyco_listener_open(&contexts[i]) < 0) {
+				for (size_t j = 0; j < initialized_count; ++j) {
+					ntyco_listener_context_destroy(&contexts[j]);
+				}
+				return -1;
+			}
 		}
 
-    return -1;
-}
+		for(size_t i=0;i<listener_count;i++){
+			nty_coroutine *co = NULL;
+		if(nty_coroutine_create(&co,server,&contexts[i])!=0){
+			fprintf(stderr,
+					"failed to create listener coroutine for port %u\n",
+					contexts[i].port);
+
+			for(size_t j=0;j<initialized_count;j++){
+				ntyco_listener_context_destroy(&contexts[j]);
+			}
+
+		return -1;
+	}
 	}
 	for(size_t i=0;i<connector_count;i++){
 		nty_coroutine *co=NULL;

@@ -2,11 +2,7 @@
 #define KVS_REPLICATION_H
 #include "server.h"
 #include "protocol.h"
-typedef enum {
-    KVS_ROLE_STANDALONE = 0,
-    KVS_ROLE_PRIMARY,
-    KVS_ROLE_REPLICA
-} kvs_role_t;
+#include "role.h"
 
 typedef enum {
     KVS_REPLICATION_STATE_DISCONNECTED = 0, // 尚未建立复制连接
@@ -25,13 +21,6 @@ typedef struct {
     long long acknowledged_offset;        // Replica 已确认处理完成的位置
 } kvs_replica_connection_t;
 
-typedef struct {//保存启动配置
-    kvs_role_t role;//当前进程角色
-    unsigned short service_port;//客户端链接端口
-    unsigned short replication_port;//主从复制链接使用的端口
-    const char *primary_host; //要链接的primary地址
-
-}kvs_server_config_t;
 typedef int (*kvs_snapshot_install_handler)(const char *snapshot_path);
 typedef int (*kvs_replication_command_handler)(
     const kvs_slice_t *fields,
@@ -48,7 +37,17 @@ int kvs_replication_network_protocol(
 );
 int kvs_replication_stream(int connection_fd,char *output,int output_capacity);
 int kvs_replication_build_connector_config(kvs_connector_config_t *connector);
-int kvs_replication_init(const kvs_server_config_t *config,kvs_snapshot_install_handler snapshot_install_handler,kvs_replication_command_handler command_handler);
+/*
+ * Replica 使用 primary_host/primary_port 连接上游；
+ * 其他角色不使用这两个参数。初始化时会复制地址内容。
+ */
+int kvs_replication_init(
+    kvs_role_t role,
+    const char *primary_host,
+    unsigned short primary_port,
+    kvs_snapshot_install_handler snapshot_install_handler,
+    kvs_replication_command_handler command_handler
+);
 void kvs_replication_destroy(void);
 
 #endif

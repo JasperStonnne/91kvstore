@@ -45,6 +45,8 @@ LDLIBS := -lntyco -lpthread -ldl
 
 OBJS := \
 	$(BUILD_DIR)/kvstore.o \
+	$(BUILD_DIR)/config.o \
+	$(BUILD_DIR)/log.o \
 	$(BUILD_DIR)/codec.o \
 	$(BUILD_DIR)/ntyco.o \
 	$(BUILD_DIR)/kvs_array.o \
@@ -94,7 +96,19 @@ $(BUILD_DIR)/kvstore.o: \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/replication.h \
 	$(INCLUDE_DIR)/protocol.h \
+	$(INCLUDE_DIR)/config.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/config.o: \
+        $(SRC_DIR)/config/config.c \
+        $(INCLUDE_DIR)/config.h \
+        $(INCLUDE_DIR)/role.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/log.o: \
+        $(SRC_DIR)/log/log.c \
+        $(INCLUDE_DIR)/log.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/codec.o: \
@@ -363,6 +377,7 @@ clean:
 
 UNIT_TEST_TARGETS := \
 	test-protocol \
+	test-config \
 	test-memory-pool \
 	test-hash-memory-pool \
 	test-rbtree-memory-pool \
@@ -405,3 +420,17 @@ test-integration: $(BIN_DIR)/kvstore
 test:
 	@$(MAKE) --no-print-directory test-unit
 	@$(MAKE) --no-print-directory test-integration
+
+.PHONY: test-config
+test-config: $(BIN_DIR)/test_config
+	./$(BIN_DIR)/test_config
+
+$(BIN_DIR)/test_config: \
+        $(TEST_DIR)/test_config.c \
+        $(SRC_DIR)/config/config.c \
+        $(INCLUDE_DIR)/config.h \
+        $(INCLUDE_DIR)/role.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+                $(TEST_DIR)/test_config.c \
+                $(SRC_DIR)/config/config.c \
+                -o $@
