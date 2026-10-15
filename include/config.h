@@ -11,11 +11,13 @@
 #define KVS_CONFIG_PRIMARY_HOST_CAPACITY 256
 
 /*
- * 当前只实现 Snapshot 恢复 + AOF 回放的混合模式。
- * 配置文件写入其他模式时，解析器必须报错，不能静默忽略。
+ * standalone 支持以下三种持久化模式。
+ * primary/replica 当前只允许 legacy_hybrid，以保留现有复制流程。
  */
 typedef enum {
-    KVS_PERSISTENCE_LEGACY_HYBRID = 0
+    KVS_PERSISTENCE_LEGACY_HYBRID = 0,
+    KVS_PERSISTENCE_SNAPSHOT,
+    KVS_PERSISTENCE_AOF
 } kvs_persistence_mode_t;
 
 /*

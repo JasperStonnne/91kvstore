@@ -54,4 +54,30 @@ void kvs_snapshot_writer_abort(kvs_snapshot_writer_t *writer,const char *temp_pa
 int kvs_snapshot_save(const char *path,kvs_snapshot_metadata_t *metadata);
 long long kvs_aof_get_offset(void);
 long long kvs_snapshot_load(const char* path,snapshot_replay_handler handler);
+
+/*
+ * 独立二进制 Snapshot，不依赖 AOF。
+ *
+ * save：保存四种引擎的当前数据。
+ * 返回 0 表示成功，-1 表示失败。
+ *
+ * load：加载到已初始化的空引擎中。
+ * 返回 0 表示成功，1 表示文件不存在，-1 表示损坏或其他错误。
+ * 加载失败后，调用方不得对外提供可能已部分加载的数据。
+ */
+
+/*
+ * Snapshot 文件中的存储类型编号。
+ * 编号属于文件格式，不能随意修改或重新排列。
+ */
+typedef enum {
+    KVS_SNAPSHOT_ENGINE_ARRAY = 1,
+    KVS_SNAPSHOT_ENGINE_RBTREE = 2,
+    KVS_SNAPSHOT_ENGINE_HASH = 3,
+    KVS_SNAPSHOT_ENGINE_SKIPLIST = 4
+} kvs_snapshot_engine_t;
+
+int kvs_snapshot_store_save(const char *path);
+int kvs_snapshot_store_load(const char *path);
+
 #endif

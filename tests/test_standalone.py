@@ -142,6 +142,174 @@ def test_pipelining(port):
             f"pipelining test exited with status {completed.returncode}"
         )
 
+def test_mixed_pipeline(port):
+    """一次发送16条命令，逐字节检查全部回复的内容和顺序。"""
+
+    def encode(*fields):
+        # 每个字段都使用 RESP 长度编码。
+        request = b"*" + str(len(fields)).encode("ascii") + b"\r\n"
+        for field in fields:
+            request += (
+                b"$" + str(len(field)).encode("ascii") + b"\r\n"
+                + field + b"\r\n"
+            )
+        return request
+
+    request = b""
+    expected = b""
+    key_prefix = uuid.uuid4().hex.encode("ascii")
+
+    # 每组4条命令，4组共16条。
+    for index in range(4):
+        key = key_prefix + b"_" + str(index).encode("ascii")
+        value = b"value " + str(index).encode("ascii")
+
+        # 1. 写入成功。
+        request += encode(b"HSET", key, value)
+        expected += b"+OK\r\n"
+
+        # 2. 读取刚写入的值。
+        request += encode(b"HGET", key)
+        expected += (
+            b"$" + str(len(value)).encode("ascii") + b"\r\n"
+            + value + b"\r\n"
+        )
+
+        # 3. GET缺少key，应返回参数错误。
+        request += encode(b"GET")
+        expected += b"-ERR wrong number of arguments for GET\r\n"
+
+        # 4. 错误之后仍然能够继续执行PING。
+        request += encode(b"PING")
+        expected += b"+PONG\r\n"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+
+        # 一次提交全部命令；不在命令之间等待回复。
+        connection.sendall(request)
+
+        # TCP可能分多次交付回复，因此持续接收，直到达到预期长度。
+        received = bytearray()
+        while len(received) < len(expected):
+            chunk = connection.recv(65536)
+            if not chunk:
+                raise TestFailure("mixed pipeline connection closed early")
+            received.extend(chunk)
+
+        if bytes(received) != expected:
+            raise TestFailure(
+                f"mixed pipeline replies mismatch: "
+                f"received={bytes(received)!r}, expected={expected!r}"
+            )
+
+    print("[PASS] mixed pipeline: 16 commands, exact replies in order")
+
+def test_pipeline_partial_tail(port):
+    """完整PING后跟半条PING，前一条回复不能等待后半包。"""
+    ping = b"*1\r\n$4\r\nPING\r\n"
+    expected = b"+PONG\r\n"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+
+        with connection.makefile("rb") as replies:
+            # 第一条完整；第二条暂时不发最后两个字节。
+            connection.sendall(ping + ping[:-2])
+
+            # 不补齐第二条，先等待第一条回复。
+            # 如果服务端没有发送积累的回复，这里会超时失败。
+            first = replies.read(len(expected))
+            if first != expected:
+                raise TestFailure(
+                    f"partial-tail first reply mismatch: {first!r}"
+                )
+
+            # 收到第一条回复后，才补齐第二条请求。
+            connection.sendall(ping[-2:])
+
+            second = replies.read(len(expected))
+            if second != expected:
+                raise TestFailure(
+                    f"partial-tail second reply mismatch: {second!r}"
+                )
+
+    print("[PASS] pipeline flushes replies before waiting for partial request")
+
+def test_pipeline_large_batch(port):
+    """总回复超过64 KiB，检查发送后继续积累是否正确。"""
+    def encode(*fields):
+        request = b"*" + str(len(fields)).encode("ascii") + b"\r\n"
+        for field in fields:
+            request += (
+                b"$" + str(len(field)).encode("ascii") + b"\r\n"
+                + field + b"\r\n"
+            )
+        return request
+
+    key = b"batch_" + uuid.uuid4().hex.encode("ascii")
+    value = b"v" * 4096
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(5)
+
+        with connection.makefile("rb") as replies:
+            # 先准备数据，并确认写入成功。
+            connection.sendall(encode(b"HSET", key, value))
+            if replies.readline() != b"+OK\r\n":
+                raise TestFailure("large batch setup failed")
+
+            # 一次提交40条GET，最后用PING检查后续回复顺序。
+            request = encode(b"HGET", key) * 40 + encode(b"PING")
+            connection.sendall(request)
+
+            # 每条GET都应返回同样的完整Bulk回复。
+            bulk_reply = (
+                b"$4096\r\n" + value + b"\r\n"
+            )
+            expected = bulk_reply * 40 + b"+PONG\r\n"
+
+            received = replies.read(len(expected))
+            if received != expected:
+                raise TestFailure(
+                    f"large batch replies mismatch: "
+                    f"received={len(received)} bytes, "
+                    f"expected={len(expected)} bytes"
+                )
+
+            # 准备一个超过64 KiB的值。
+            large_value = b"L" * (70 * 1024)
+            connection.sendall(encode(b"HSET", key, large_value))
+            if replies.readline() != b"+OK\r\n":
+                raise TestFailure("large reply setup failed")
+
+            # 第一个PING先积累回复；大GET随后可能触发缓冲区扩容。
+            # 最后一个PING检查大回复之后仍能正常处理命令。
+            connection.sendall(
+                encode(b"PING")
+                + encode(b"HGET", key)
+                + encode(b"PING")
+            )
+
+            expected = (
+                b"+PONG\r\n"
+                + b"$" + str(len(large_value)).encode("ascii") + b"\r\n"
+                + large_value + b"\r\n"
+                + b"+PONG\r\n"
+            )
+
+            received = replies.read(len(expected))
+            if received != expected:
+                raise TestFailure(
+                    f"large GET pipeline mismatch: "
+                    f"received={len(received)} bytes, "
+                    f"expected={len(expected)} bytes"
+                )
+
+    print("[PASS] large pipeline batches and single large GET replies")
+
+
+
 def test_other_log_level(test_dir, level):
     """用独立服务验证 ERROR 或 DEBUG 的实际运行效果。"""
     run_dir = test_dir / f"log-{level}"
@@ -347,13 +515,14 @@ def test_resp2_write_commands(port):
             value_header = replies.readline()
             value_body = replies.readline()
 
-    if duplicate_reply != b"-ERR key already exists\r\n":
+    if duplicate_reply != b"+OK\r\n":
         raise TestFailure(f"duplicate SET returned {duplicate_reply!r}")
-    if (value_header, value_body) != (b"$1\r\n", b"v\r\n"):
+    if (value_header, value_body) != (b"$1\r\n", b"x\r\n"):
         raise TestFailure(
-            f"duplicate SET changed existing value: {value_header!r} {value_body!r}"
+            f"duplicate SET did not overwrite value: "
+            f"{value_header!r} {value_body!r}"
         )
-    print("[PASS] duplicate RESP2 SET returns Error and preserves value")
+    print("[PASS] duplicate RESP2 SET returns OK and overwrites value")
     mod_request = b"*3\r\n$3\r\nMOD\r\n" + key_field + b"$1\r\nx\r\n"
     missing_key = key + b"_missing"
     missing_field = (
@@ -651,6 +820,9 @@ def main():
         test_basic_commands(port)
         test_bind_ip(port)
         test_pipelining(port)
+        test_mixed_pipeline(port)
+        test_pipeline_partial_tail(port)
+        test_pipeline_large_batch(port)
         test_other_log_level(test_dir, "error")
         test_other_log_level(test_dir, "debug")
         test_invalid_config_startup(test_dir)

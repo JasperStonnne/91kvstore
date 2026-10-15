@@ -519,8 +519,18 @@ void kvs_rbtree_destory(kvs_rbtree_t *inst){
 
 int kvs_rbtree_set(kvs_rbtree_t *inst, char *key,char *value){
     if(!inst||!key||!value) return -1;
-	if (rbtree_search(inst, key) != inst->nil) {
-		return 1;  // 已存在
+    rbtree_node *existing = rbtree_search(inst, key);
+
+    if (existing != inst->nil) {
+        char *new_value = kvs_malloc(strlen(value) + 1);
+        if (new_value == NULL) {
+            return -2;
+        }
+
+        strcpy(new_value, value);
+        kvs_free(existing->value);
+        existing->value = new_value;
+        return 0;
     }
 	rbtree_node *node = rbtree_node_alloc(inst);
 	if(node==NULL)return -2;

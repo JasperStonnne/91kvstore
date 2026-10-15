@@ -52,6 +52,18 @@ kvs_skiplist_node_t *first_node =
     assert(first_node != NULL);
     assert(strcmp(first_node->key, "name") == 0);
 
+    // 重复 SET 覆盖 value，节点和跳表层数保持不变。
+    int original_level = list.level;
+
+    assert(kvs_skiplist_set(&list, "name", "Another") == 0);
+    assert(list.header->forward[0] == first_node);
+    assert(list.level == original_level);
+    assert(first_node->forward[0] == NULL);
+
+    value = kvs_skiplist_get(&list, "name");
+    assert(value != NULL);
+    assert(strcmp(value, "Another") == 0);
+
 #if KVS_SKIPLIST_USE_MEMORY_POOL
 // 第一个普通节点触发 node_pool 创建 Chunk
     assert(list.node_pool.chunk_list != NULL);
