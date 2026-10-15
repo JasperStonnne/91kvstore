@@ -52,12 +52,15 @@ int kvs_array_set(kvs_array_t *inst, char *key, char *value) {
         return -1;
     }
 
-    if (inst->total >= KVS_ARRAY_SIZE) {
-        return -1;
+    /* 已存在就修改；成功或出错时直接返回。 */
+    int update_result = kvs_array_mod(inst, key, value);
+    if (update_result <= 0) {
+        return update_result;
     }
 
-    if (kvs_array_get(inst, key) != NULL) {
-        return 1;
+    /* MOD 返回 1 表示不存在，接下来按新 key 插入。 */
+    if (inst->total >= KVS_ARRAY_SIZE) {
+        return -1;
     }
 
     size_t key_size = strlen(key) + 1;

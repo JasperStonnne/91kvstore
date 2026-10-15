@@ -191,6 +191,32 @@ static void test_invalid_configs(void)
             "replication_port is only valid"
         },
         {
+            "primary rejects snapshot mode",
+            "role=primary\nservice_port=29000\n"
+            "replication_port=29100\npersistence_mode=snapshot\n",
+            "primary/replica currently support only"
+        },
+        {
+            "primary rejects aof mode",
+            "role=primary\nservice_port=29000\n"
+            "replication_port=29100\npersistence_mode=aof\n",
+            "primary/replica currently support only"
+        },
+        {
+            "replica rejects snapshot mode",
+            "role=replica\nservice_port=29001\n"
+            "primary_host=127.0.0.1\nprimary_port=29100\n"
+            "persistence_mode=snapshot\n",
+            "primary/replica currently support only"
+        },
+        {
+            "replica rejects aof mode with mode field first",
+            "persistence_mode=aof\nrole=replica\n"
+            "service_port=29001\nprimary_host=127.0.0.1\n"
+            "primary_port=29100\n",
+            "primary/replica currently support only"
+        },
+        {
             "malformed line",
             "role=standalone\nservice_port 29000\n",
             "expected 'key = value'"
@@ -232,6 +258,30 @@ static kvs_config_t load_valid(const char *contents)
     assert(unlink(path) == 0);
 
     return config;
+}
+
+static void test_valid_snapshot_mode(void)
+{
+    kvs_config_t config = load_valid(
+        "role=standalone\n"
+        "service_port=29000\n"
+        "persistence_mode=snapshot\n"
+    );
+
+    assert(config.persistence_mode == KVS_PERSISTENCE_SNAPSHOT);
+    puts("snapshot mode config test passed");
+}
+
+static void test_valid_aof_mode(void)
+{
+    kvs_config_t config = load_valid(
+        "role=standalone\n"
+        "service_port=29000\n"
+        "persistence_mode=aof\n"
+    );
+
+    assert(config.persistence_mode == KVS_PERSISTENCE_AOF);
+    puts("aof mode config test passed");
 }
 
 static void test_valid_primary_and_replica(void)
@@ -333,6 +383,8 @@ int main(void)
     test_invalid_configs();
     test_missing_file();
     test_example_config_files();
+    test_valid_snapshot_mode();
+    test_valid_aof_mode();
     puts("config parser tests passed");
     return 0;
 }

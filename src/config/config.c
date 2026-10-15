@@ -205,15 +205,20 @@ static int parse_field(
         return 0;
 
     case FIELD_PERSISTENCE_MODE:
-        if (strcmp(value, "legacy_hybrid") != 0) {
+        if (strcmp(value, "legacy_hybrid") == 0) {
+            parsed->persistence_mode = KVS_PERSISTENCE_LEGACY_HYBRID;
+        } else if (strcmp(value, "snapshot") == 0) {
+            parsed->persistence_mode = KVS_PERSISTENCE_SNAPSHOT;
+        } else if (strcmp(value, "aof") == 0) {
+            parsed->persistence_mode = KVS_PERSISTENCE_AOF;
+        } else {
             return config_error(
                 error, error_capacity, path, line_number,
                 "unsupported persistence_mode '%s'; "
-                "only legacy_hybrid is implemented",
+                "expected legacy_hybrid, snapshot or aof",
                 value
             );
         }
-        parsed->persistence_mode = KVS_PERSISTENCE_LEGACY_HYBRID;
         return 0;
 
     case FIELD_REPLICATION_PORT:
@@ -372,6 +377,19 @@ static int validate_config(
             "internal error: invalid role"
         );
     }
+    bool is_replication_role =
+        parsed->role == KVS_ROLE_PRIMARY ||
+        parsed->role == KVS_ROLE_REPLICA;
+
+    if (is_replication_role &&
+        parsed->persistence_mode != KVS_PERSISTENCE_LEGACY_HYBRID) {
+        return config_error(
+            error, error_capacity, path,
+            field_lines[FIELD_PERSISTENCE_MODE],
+            "primary/replica currently support only "
+            "persistence_mode=legacy_hybrid"
+        );
+    }
 
     return 0;
 }
@@ -499,7 +517,6 @@ int kvs_config_load(
         ) < 0) {
         goto done;
     }
-
     result = 0;
 
 done:

@@ -83,6 +83,15 @@ int main(void) {
     hashnode_t *first_node = find_node(&hash, "name");
     assert(first_node != NULL);
 
+    /* 覆盖 value，保持节点和记录数量不变。 */
+    assert(kvs_hash_set(&hash, "name", "Another") == 0);
+    assert(hash.count == 1);
+    assert(find_node(&hash, "name") == first_node);
+
+    value = kvs_hash_get(&hash, "name");
+    assert(value != NULL);
+    assert(strcmp(value, "Another") == 0);
+
     /*
      * 第三部分：删除节点。
      * key/value 被释放，节点 Block 被归还 node_pool。

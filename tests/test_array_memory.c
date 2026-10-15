@@ -49,16 +49,13 @@ int main(void) {
     assert(value != NULL);
     assert(strcmp(value, "Shanghai") == 0);
 
-    /*
-     * 4. 重复插入相同 key 应当失败
-     * 返回 1 表示 key 已经存在，元素数量不能变化。
-     */
-    assert(kvs_array_set(&array, "name", "Another") == 1);
+    /* 重复 SET 覆盖 value，但不增加记录数量。 */
+    assert(kvs_array_set(&array, "name", "Another") == 0);
     assert(array.total == 2);
 
     value = kvs_array_get(&array, "name");
     assert(value != NULL);
-    assert(strcmp(value, "Jasper") == 0);
+    assert(strcmp(value, "Another") == 0);
 
     /*
      * 5. 修改 value
@@ -95,6 +92,23 @@ int main(void) {
      */
     assert(kvs_array_del(&array, "missing") == 1);
     assert(array.total == 1);
+
+    /* 填满后，覆盖已有 key 仍应成功，新建则失败。 */
+    for (int i = array.total; i < KVS_ARRAY_SIZE; ++i) {
+        char key[32];
+        snprintf(key, sizeof(key), "capacity_%d", i);
+        assert(kvs_array_set(&array, key, "value") == 0);
+    }
+
+    assert(array.total == KVS_ARRAY_SIZE);
+
+    assert(kvs_array_set(&array, "city", "Beijing") == 0);
+    value = kvs_array_get(&array, "city");
+    assert(value != NULL && strcmp(value, "Beijing") == 0);
+    assert(array.total == KVS_ARRAY_SIZE);
+
+    assert(kvs_array_set(&array, "overflow", "value") < 0);
+    assert(array.total == KVS_ARRAY_SIZE);
 
     /*
      * 8. 销毁 Array

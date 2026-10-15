@@ -159,9 +159,17 @@ int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
 	hashnode_t *node = hash->nodes[idx];
 #if 1
 	while (node != NULL) {
-		if (strcmp(node->key, key) == 0) { // exist
-			return 1;
-		}
+        if (strcmp(node->key, key) == 0) {
+            char *new_value = kvs_malloc(strlen(value) + 1);
+            if (new_value == NULL) {
+                return -2;
+            }
+
+            strcpy(new_value, value);
+            kvs_free(node->value);
+            node->value = new_value;
+            return 0;
+        }
 		node = node->next;
 	}
 #endif

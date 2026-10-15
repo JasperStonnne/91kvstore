@@ -93,6 +93,29 @@ const char *response[]={
 };
 
 static kvs_role_t kvs_server_role = KVS_ROLE_STANDALONE;
+static kvs_persistence_mode_t kvs_persistence_mode =
+    KVS_PERSISTENCE_LEGACY_HYBRID;
+
+static void kvs_close_current_persistence(void)
+{
+    if (kvs_persistence_mode != KVS_PERSISTENCE_SNAPSHOT) {
+        kvs_aof_close();
+    }
+}
+
+static int kvs_save_current_snapshot(void)
+{
+    if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
+        return kvs_snapshot_store_save("snapshot.bin");
+    }
+
+    if (kvs_persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID) {
+        return kvs_snapshot_save("snapshot.db", NULL);
+    }
+
+    errno = ENOTSUP;
+    return -1;
+}
 
 static int kvs_is_write_command(int cmd){
     if(cmd<KVS_CMD_START||cmd>=KVS_CMD_COUNT){
@@ -457,7 +480,10 @@ int kvs_filter_protocol(
         }
     }
 
-    if(ret==0&&kvs_is_write_command(cmd)&&source!=KVS_COMMAND_SOURCE_RECOVERY){
+        if (ret == 0 &&
+        kvs_is_write_command(cmd) &&
+        source != KVS_COMMAND_SOURCE_RECOVERY &&
+        kvs_persistence_mode != KVS_PERSISTENCE_SNAPSHOT) {
         int aof_ret=kvs_aof_append(tokens,count);
         if(aof_ret<0){
             fprintf(stderr,"failed to append AOF\n");
@@ -506,33 +532,84 @@ static int kvs_encode_value_to_output(
     kvs_output_buffer_t *output,
     const char *value)
 {
-    if (output == NULL || value == NULL) return -1;
+    /*
+     * output 指向输出缓冲区，value 指向待编码的字符串。
+     * 任意一个为空，都无法继续处理。
+     *
+     * || 从左向右判断；发现条件成立后就停止。
+     * 因此 output 为空时，不会执行后面的 output->length。
+     */
+    if (output == NULL || value == NULL ||
+        /* 已有数据的字节数不能是负数。 */
+        output->length < 0 ||
+        /* 已有数据不能超过缓冲区分配的容量。 */
+        output->length > output->capacity) {
+        return -1;
+    }
 
     kvs_slice_t value_slice = {
         .data = value,
         .length = strlen(value)
     };
 
+    /* 保存完整 RESP 回复需要的字节数，此时还没有写入回复。 */
     size_t required = 0;
-    if (kvs_encoded_value_response_size(&value_slice, &required) != 0 ||
-        required > INT_MAX) {
+
+    /*
+     * 根据 value 的长度，计算完整回复大小。
+     * &required 表示把变量地址传进去，让函数填写计算结果。
+     * 返回非 0 表示计算失败。
+     */
+    if (kvs_encoded_value_response_size(&value_slice, &required) != 0) {
         return -1;
     }
 
+    /*
+     * length 使用 int 保存，最大不能超过 INT_MAX。
+     * 已有 length 字节，再加入 required 字节，不能超过这个上限。
+     * 使用减法检查，避免先相加时发生溢出。
+     */
+    if (required > (size_t)(INT_MAX - output->length)) {
+        return -1;
+    }
+
+    /*
+     * 确保已有数据的末尾，至少还能放下 required 字节。
+     * 空间足够：直接使用。
+     * 空间不足：尝试扩容，并更新 output 的 data 和 capacity。
+     * 扩容失败：返回 -1，不继续编码。
+     */
     if (kvs_output_buffer_ensure_space(output, (int)required) < 0) {
         return -1;
     }
 
+    /* 接收编码函数填写的结果：本次实际写了多少字节。 */
     size_t encoded_bytes = 0;
+
+    /*
+     * &value_slice：要编码的数据描述。
+     * data + length：跳过已有回复，从末尾开始写。
+     * capacity - length：从写入位置开始，还有多少可用空间。
+     * &encoded_bytes：让编码函数填写实际写入的字节数。
+     */
     if (kvs_encode_value_response(
             &value_slice,
-            output->data,
-            (size_t)output->capacity,
-            &encoded_bytes) != 0 ||
-        encoded_bytes > INT_MAX) {
+            output->data + output->length,
+            (size_t)(output->capacity - output->length),
+            &encoded_bytes) != 0) {
+        /* 编码失败，不把本次数据计入有效回复。 */
         return -1;
     }
 
+    /* 返回类型是 int，转换前检查长度是否能表示。 */
+    if (encoded_bytes > INT_MAX) {
+        return -1;
+    }
+
+    /*
+     * 返回本次新增长度。
+     * 本函数不更新 output->length，由网络层负责累加。
+     */
     return (int)encoded_bytes;
 }
 
@@ -562,12 +639,20 @@ static int kvs_execute_fields(
         if (response == NULL ||
         response->data == NULL ||
         response->capacity <= 0 ||
+        response->length < 0 ||
+        response->length > response->capacity ||
         fields == NULL ||
         field_count == 0 ||
         field_count > KVS_MAX_TOKENS ||
         field_count > INT_MAX) {
         return -1;
     }
+
+    /* 下一条回复的写入起点：跳过已有的 length 字节。 */
+    char *reply_data = response->data + response->length;
+
+    /* 从写入起点开始，还能使用的字节数。 */
+    int reply_capacity = response->capacity - response->length;
 
     for (size_t i = 0; i < field_count; i++) {
         if (fields[i].data == NULL || fields[i].length == SIZE_MAX) {
@@ -579,12 +664,14 @@ static int kvs_execute_fields(
                 "-ERR NUL bytes are not supported\r\n";
             const size_t reply_length = sizeof(reply) - 1;
 
+            /* 本条错误回复必须能放进剩余空间。 */
             if (source != KVS_COMMAND_SOURCE_CLIENT ||
-                reply_length > (size_t)response->capacity) {
+                reply_length > (size_t)reply_capacity) {
                 return -1;
             }
 
-            memcpy(response->data, reply, reply_length);
+            /* 从已有回复末尾开始写，不覆盖前面的数据。 */
+            memcpy(reply_data, reply, reply_length);
             return (int)reply_length;
         }
     }
@@ -604,8 +691,9 @@ static int kvs_execute_fields(
             ? sizeof(pong) - 1 : sizeof(wrong_arity) - 1;
         int result = -1;
 
-        if (reply_length <= (size_t)response->capacity) {
-            memcpy(response->data, reply, reply_length);
+        /* 剩余空间足够时，把 PING 回复写在已有回复末尾。 */
+        if (reply_length <= (size_t)reply_capacity) {
+            memcpy(reply_data, reply, reply_length);
             result = (int)reply_length;
         }
 
@@ -629,7 +717,7 @@ static int kvs_execute_fields(
         if (field_count != 1) {
             reply = wrong_arity;
             reply_length = sizeof(wrong_arity) - 1;
-        } else if (kvs_snapshot_save("snapshot.db", NULL) < 0) {
+        } else if (kvs_save_current_snapshot() < 0) {
             reply = failed;
             reply_length = sizeof(failed) - 1;
         } else {
@@ -637,8 +725,9 @@ static int kvs_execute_fields(
             reply_length = sizeof(ok) - 1;
         }
 
-        if (reply_length <= (size_t)response->capacity) {
-            memcpy(response->data, reply, reply_length);
+        /* 把 SAVE 的成功或错误回复写在已有回复末尾。 */
+        if (reply_length <= (size_t)reply_capacity) {
+            memcpy(reply_data, reply, reply_length);
             result = (int)reply_length;
         }
 
@@ -662,13 +751,19 @@ static int kvs_execute_fields(
         if (field_count != expected) {
             int written = -1;
             if (source == KVS_COMMAND_SOURCE_CLIENT) {
+                /* 从已有回复末尾写入，并限制在剩余空间内。 */
                 written = snprintf(
-                    response->data,
-                    (size_t)response->capacity,
+                    reply_data,
+                    (size_t)reply_capacity,
                     "-ERR wrong number of arguments for %s\r\n",
                     tokens[0]
                 );
-                if (written < 0 || written >= response->capacity) {
+
+                /*
+                 * snprintf 返回本来需要写入的字符数，不包含结尾 '\0'。
+                 * 大于等于剩余容量，说明回复被截断。
+                 */
+                if (written < 0 || written >= reply_capacity) {
                     written = -1;
                 }
             }
@@ -686,8 +781,9 @@ static int kvs_execute_fields(
         const size_t reply_length = sizeof(reply) - 1;
         int result = -1;
 
-        if (reply_length <= (size_t)response->capacity) {
-            memcpy(response->data, reply, reply_length);
+        /* 未知命令的错误回复也追加在已有回复末尾。 */
+        if (reply_length <= (size_t)reply_capacity) {
+            memcpy(reply_data, reply, reply_length);
             result = (int)reply_length;
         }
 
@@ -713,10 +809,11 @@ static int kvs_execute_fields(
             static const char nil_reply[] = "$-1\r\n";
             const size_t nil_length = sizeof(nil_reply) - 1;
 
-            if (nil_length > (size_t)response->capacity) {
+            /* key 不存在时，把 RESP 空值回复写到已有回复末尾。 */
+            if (nil_length > (size_t)reply_capacity) {
                 result = -1;
             } else {
-                memcpy(response->data, nil_reply, nil_length);
+                memcpy(reply_data, nil_reply, nil_length);
                 result = (int)nil_length;
             }
         } else {
@@ -735,8 +832,8 @@ static int kvs_execute_fields(
     int result = kvs_execute_tokens(
         tokens,
         (int)field_count,
-        response->data,
-        response->capacity,
+        reply_data,      /* 本条回复从已有数据末尾写入。 */
+        reply_capacity,  /* 只能使用剩余空间。 */
         source,
         &exec_status
     );
@@ -764,12 +861,13 @@ static int kvs_execute_fields(
         reply_length = sizeof(exists) - 1;
     }
 
-    if (reply_length > (size_t)response->capacity) {
-        result = -1;
-    } else {
-        memcpy(response->data, reply, reply_length);
-        result = (int)reply_length;
-    }
+/* 把 SET 的执行结果写到已有回复末尾。 */
+        if (reply_length > (size_t)reply_capacity) {
+            result = -1;
+        } else {
+            memcpy(reply_data, reply, reply_length);
+            result = (int)reply_length;
+        }
 
     }
 
@@ -793,10 +891,11 @@ static int kvs_execute_fields(
             reply_length = sizeof(missing) - 1;
         }
 
-        if (reply_length > (size_t)response->capacity) {
+        /* DEL 回复追加到末尾，保留之前积累的回复。 */
+        if (reply_length > (size_t)reply_capacity) {
             result = -1;
         } else {
-            memcpy(response->data, reply, reply_length);
+            memcpy(reply_data, reply, reply_length);
             result = (int)reply_length;
         }
     }
@@ -821,10 +920,11 @@ static int kvs_execute_fields(
             reply_length = sizeof(missing) - 1;
         }
 
-        if (reply_length > (size_t)response->capacity) {
+        /* 把 MOD 的成功或错误回复写到已有回复末尾。 */
+        if (reply_length > (size_t)reply_capacity) {
             result = -1;
         } else {
-            memcpy(response->data, reply, reply_length);
+            memcpy(reply_data, reply, reply_length);
             result = (int)reply_length;
         }
     }
@@ -848,10 +948,11 @@ static int kvs_execute_fields(
             reply_length = sizeof(missing) - 1;
         }
 
-        if (reply_length > (size_t)response->capacity) {
+        /* 把 key 是否存在的查询结果写到已有回复末尾。 */
+        if (reply_length > (size_t)reply_capacity) {
             result = -1;
         } else {
-            memcpy(response->data, reply, reply_length);
+            memcpy(reply_data, reply, reply_length);
             result = (int)reply_length;
         }
     }
@@ -940,7 +1041,10 @@ static int kvs_network_protocol(
     response->data == NULL ||
     consumed_length == NULL ||
     length < 0 ||
-    response->capacity <= 0) {
+    response->capacity <= 0 ||
+    /* 已有回复长度必须在容量范围内。 */
+    response->length < 0 ||
+    response->length > response->capacity) {
     return -1;
 }
 
@@ -965,8 +1069,16 @@ static int kvs_network_protocol(
         "-ERR invalid or oversized request\r\n";
         const size_t error_length = sizeof(error_reply) - 1;
 
-        if (error_length > (size_t)response->capacity) return -1;
-        memcpy(response->data, error_reply, error_length);
+        /* 已有回复占用 length 字节，后面才是可用空间。 */
+        int remaining = response->capacity - response->length;
+        if (error_length > (size_t)remaining) return -1;
+
+        /* 把非法请求的错误回复写在已有回复末尾。 */
+        memcpy(
+            response->data + response->length,
+            error_reply,
+            error_length
+        );
         *consumed_length = length;
         return (int)error_length;
     }
@@ -980,7 +1092,12 @@ static int kvs_network_protocol(
         KVS_COMMAND_SOURCE_CLIENT,
         NULL
 );
-        if (response_length < 0 || response_length > response->capacity) {
+        /*
+         * response_length 是本次新生成的回复长度，
+         * 不能超过已有回复后面的剩余空间。
+         */
+        if (response_length < 0 ||
+            response_length > response->capacity - response->length) {
             return -1;
         }
 
@@ -1109,43 +1226,82 @@ int main(int argc, char *argv[])
         /* 配置解析成功后，运行日志采用配置文件指定的级别。 */
     kvs_log_set_level(config.log_level);
 
-        /* 保持原有的 Snapshot + AOF 混合恢复流程。 */
+
+       /* 初始化引擎，并按配置选择持久化恢复路径。 */
     kvs_server_role = config.role;
+    kvs_persistence_mode = config.persistence_mode;
     init_kvengine();
 
-    long long offset = kvs_snapshot_load(
-        "snapshot.db", kvs_recovery_fields_protocol
-    );
-    if (offset < 0) {
-        fprintf(stderr, "failed to load snapshot\n");
-        return -1;
-    }
+    if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
+        int load_result = kvs_snapshot_store_load("snapshot.bin");
 
-    if (kvs_aof_replay(
-            "appendonly.aof", offset, kvs_recovery_fields_protocol
-        ) < 0) {
-        fprintf(stderr, "failed to replay AOF\n");
-        return -1;
-    }
+        if (load_result < 0) {
+            fprintf(stderr, "failed to load binary snapshot\n");
+            dest_kvengine();
+            return 1;
+        }
 
-    if (kvs_aof_open("appendonly.aof") < 0) {
-        fprintf(stderr, "failed to open AOF\n");
-        return -1;
+        /* 返回 1 表示文件不存在，保留空引擎继续启动。 */
+    } else if (kvs_persistence_mode == KVS_PERSISTENCE_AOF) {
+        if (kvs_aof_replay(
+                "commands.aof",
+                0,
+                kvs_recovery_fields_protocol
+            ) < 0) {
+            fprintf(stderr, "failed to replay standalone AOF\n");
+            dest_kvengine();
+            return 1;
+        }
+
+        if (kvs_aof_open("commands.aof") < 0) {
+            fprintf(stderr, "failed to open standalone AOF\n");
+            dest_kvengine();
+            return 1;
+        }
+    } else {
+        long long offset = kvs_snapshot_load(
+            "snapshot.db", kvs_recovery_fields_protocol
+        );
+
+        if (offset < 0) {
+            fprintf(stderr, "failed to load snapshot\n");
+            dest_kvengine();
+            return 1;
+        }
+
+        if (kvs_aof_replay(
+                "appendonly.aof",
+                offset,
+                kvs_recovery_fields_protocol
+            ) < 0) {
+            fprintf(stderr, "failed to replay AOF\n");
+            dest_kvengine();
+            return 1;
+        }
+
+        if (kvs_aof_open("appendonly.aof") < 0) {
+            fprintf(stderr, "failed to open AOF\n");
+            dest_kvengine();
+            return 1;
+        }
     }
     /* 以下恢复、复制和网络启动代码继续共用这份配置。 */
 
-if (kvs_replication_init(
-        config.role,
-        config.primary_host,
-        config.primary_port,
-        kvs_install_replication_snapshot,
-        kvs_replication_command_protocol
-    ) < 0) {
+    if (config.role == KVS_ROLE_PRIMARY ||
+        config.role == KVS_ROLE_REPLICA) {
+        if (kvs_replication_init(
+                config.role,
+                config.primary_host,
+                config.primary_port,
+                kvs_install_replication_snapshot,
+                kvs_replication_command_protocol
+            ) < 0) {
             fprintf(stderr, "failed to initialize replication\n");
-            kvs_aof_close();
+kvs_close_current_persistence();
             dest_kvengine();
             return -1;
         }
+    }
     int network_ret=-1;
 
     if (config.role == KVS_ROLE_PRIMARY) {
@@ -1202,12 +1358,12 @@ if (kvs_replication_init(
     if(network_ret<0){
         fprintf(stderr,"failed to start network service\n");
         kvs_replication_destroy();
-        kvs_aof_close();
+    kvs_close_current_persistence();
         dest_kvengine();
         return -1;
     }
     kvs_replication_destroy();
-    kvs_aof_close();
+    kvs_close_current_persistence();
     dest_kvengine();
 
 

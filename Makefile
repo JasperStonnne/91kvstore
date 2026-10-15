@@ -55,6 +55,7 @@ OBJS := \
 	$(BUILD_DIR)/kvs_skiplist.o \
 	$(BUILD_DIR)/aof.o \
 	$(BUILD_DIR)/snapshot.o \
+	$(BUILD_DIR)/snapshot_store.o \
 	$(BUILD_DIR)/replication.o \
 	$(BUILD_DIR)/memory_pool.o \
 	$(BUILD_DIR)/buffer.o
@@ -153,6 +154,14 @@ $(BUILD_DIR)/snapshot.o: \
 	$(PERSISTENCE_DIR)/snapshot.c \
 	$(INCLUDE_DIR)/persistence.h \
 	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/snapshot_store.o: \
+	$(PERSISTENCE_DIR)/snapshot_store.c \
+	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/protocol.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/replication.o: \
@@ -378,6 +387,7 @@ clean:
 UNIT_TEST_TARGETS := \
 	test-protocol \
 	test-config \
+	test-snapshot \
 	test-memory-pool \
 	test-hash-memory-pool \
 	test-rbtree-memory-pool \
@@ -415,7 +425,7 @@ test-integration: $(BIN_DIR)/kvstore
 		printf '[FAIL] replication integration (exit %s)\n%s\n' "$$status" "$$output" >&2; \
 		exit "$$status"; \
 	fi
-	@printf 'Integration tests: 2 passed\n'
+	@printf 'Integration tests: 4 passed\n'
 
 test:
 	@$(MAKE) --no-print-directory test-unit
@@ -434,3 +444,44 @@ $(BIN_DIR)/test_config: \
                 $(TEST_DIR)/test_config.c \
                 $(SRC_DIR)/config/config.c \
                 -o $@
+
+.PHONY: test-snapshot
+
+test-snapshot: $(BIN_DIR)/test_snapshot_store
+	./$(BIN_DIR)/test_snapshot_store
+
+$(BIN_DIR)/test_snapshot_store: \
+	$(TEST_DIR)/test_snapshot_store.c \
+	$(PERSISTENCE_DIR)/snapshot_store.c \
+	$(ENGINE_DIR)/kvs_array.c \
+	$(ENGINE_DIR)/kvs_rbtree.c \
+	$(ENGINE_DIR)/kvs_hash.c \
+	$(ENGINE_DIR)/kvs_skiplist.c \
+	$(MEMORY_DIR)/memory_pool.c \
+	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/protocol.h \
+	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		$(TEST_DIR)/test_snapshot_store.c \
+		$(PERSISTENCE_DIR)/snapshot_store.c \
+		$(ENGINE_DIR)/kvs_array.c \
+		$(ENGINE_DIR)/kvs_rbtree.c \
+		$(ENGINE_DIR)/kvs_hash.c \
+		$(ENGINE_DIR)/kvs_skiplist.c \
+		$(MEMORY_DIR)/memory_pool.c \
+		-o $@
+
+.PHONY: test-snapshot-restart
+
+test-snapshot-restart: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_snapshot_restart.py
+
+test-integration: test-snapshot-restart
+
+.PHONY: test-aof-restart
+
+test-aof-restart: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_aof_restart.py
+
+test-integration: test-aof-restart

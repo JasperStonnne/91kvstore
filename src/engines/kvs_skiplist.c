@@ -170,7 +170,16 @@ int kvs_skiplist_set(kvs_skiplist_t* skipList,char *key,char* value) {
       }
       return 0 ;
    } else {
-       return 1;
+       /* 先准备新 value，成功后再释放旧 value。 */
+       char *new_value = kvs_malloc(strlen(value) + 1);
+       if (new_value == NULL) {
+           return -2;
+       }
+
+       strcpy(new_value, value);
+       kvs_free(current->value);
+       current->value = new_value;
+       return 0;
    }
 }
 

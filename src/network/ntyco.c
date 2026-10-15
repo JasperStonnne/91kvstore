@@ -14,6 +14,9 @@
 #define NTYCO_MAX_LISTENER_COUNT 2
 #define NTYCO_MAX_CONNECTOR_COUNT 1 // 当前一台 Replica 只连接一个 Primary
 #define NTYCO_STREAM_RETRY_INTERVAL_MS 50
+/* 待发送回复达到 64 KiB 时，先发送这一批。 */
+#define NTYCO_REPLY_BATCH_THRESHOLD (64 * 1024)
+
 typedef struct {
 	unsigned short port;
 	const char *bind_ip;/* 指向启动配置中的 IP；NULL 沿用 0.0.0.0。 */
@@ -173,6 +176,29 @@ static int ntyco_send_all(int fd,const char *data,int length)
 
     return 0;
 }
+
+/* 完整发送当前积累的回复，成功后重置有效长度。 */
+static int ntyco_flush_output(int fd, kvs_output_buffer_t *output)
+{
+    /* 没有积累回复，不需要发送。 */
+    if (output->length == 0) {
+        return 0;
+    }
+
+    /* send_all 会循环发送，直到全部发完或发生错误。 */
+    if (ntyco_send_all(fd, output->data, output->length) < 0) {
+        return -1;
+    }
+
+    /*
+     * 已全部发送，重置长度。
+     * 保留分配的内存，供下一批回复复用。
+     */
+    output->length = 0;
+    output->offset = 0;
+    return 0;
+}
+
 void server_reader(void *arg) {
 	ntyco_connection_context_t *context = (ntyco_connection_context_t *)arg;
 	int fd=context->fd;
@@ -203,22 +229,44 @@ void server_reader(void *arg) {
 				goto connection_closed;
 			}
 
-			output.length=handler(fd,input.data,input.length,&output,&consumed_length);
-			if (output.length < 0 ||
-				output.length > output.capacity) {
-				goto connection_closed;
+			/* handler 返回本条命令新生成的回复长度。 */
+			int response_length = handler(
+					fd,
+					input.data,
+					input.length,
+					&output,
+					&consumed_length
+			);
+
+			/* 新回复不能超过剩余空间。 */
+			if (response_length < 0 ||
+				response_length > output.capacity - output.length) {
+					goto connection_closed;
 			}
+
+			/* 保留之前的长度，再加上本条回复长度。 */
+			output.length += response_length;
 			if(kvs_input_buffer_consume(&input,consumed_length)<0){
 				goto connection_closed;
 			}
-			if(output.length==0){
-				continue;
+			if (output.length == 0) {
+					continue;
 			}
-			if(ntyco_send_all(fd,output.data,output.length) < 0){
-			goto connection_closed;
+
+			/*
+				* 普通客户端未达到阈值时，继续积累回复。
+				* 这里的 continue 属于内部的 do...while 循环。
+				*/
+			if (stream_handler == NULL &&
+				close_handler == NULL &&
+				output.length < NTYCO_REPLY_BATCH_THRESHOLD) {
+					continue;
 			}
-				output.length=0;
-				output.offset=0;
+
+			/* 达到阈值或属于复制连接时，立即发送。 */
+			if (ntyco_flush_output(fd, &output) < 0) {
+					goto connection_closed;
+			}
 
 			if(stream_handler!=NULL){
 				while(1){
@@ -257,7 +305,15 @@ void server_reader(void *arg) {
 					}
 				}
 			}
-		}while(input.length>0&&consumed_length>0);
+	} while (input.length > 0 && consumed_length > 0);
+
+			/*
+				* 内部循环结束后，必须发送剩余回复，
+				* 然后才能等待下一次接收。
+				*/
+			if (ntyco_flush_output(fd, &output) < 0) {
+					goto connection_closed;
+			}
 			} else if (ret == 0) {
 					break;                              // 对端正常断开
 			} else if (errno == EINTR) {

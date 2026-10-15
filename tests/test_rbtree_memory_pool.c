@@ -53,20 +53,19 @@ int main(void) {
     assert(value != NULL);
     assert(strcmp(value, "Jasper") == 0);
 
-    // 当前树只有一个普通节点，所以 root 就是刚申请的节点
+    // 当前树只有一个普通节点，记录它的地址。
     rbtree_node *first_node = tree.root;
     assert(first_node != NULL);
-      // 删除唯一的普通节点
-    // 重复插入相同 key，应当被拒绝
-    assert(kvs_rbtree_set(&tree, "name", "Another") == 1);
 
-    // 根节点没有被替换，也没有创建第二个节点
+    // 重复 SET 覆盖 value，复用原来的节点。
+    assert(kvs_rbtree_set(&tree, "name", "Another") == 0);
     assert(tree.root == first_node);
 
-    // 原来的 value 不能被修改
     value = kvs_rbtree_get(&tree, "name");
     assert(value != NULL);
-    assert(strcmp(value, "Jasper") == 0);
+    assert(strcmp(value, "Another") == 0);
+
+    // 删除唯一的普通节点。
     assert(kvs_rbtree_del(&tree, "name") == 0);
 
     // 节点删除后，树重新变成空树
