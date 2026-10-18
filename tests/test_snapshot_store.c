@@ -1,12 +1,15 @@
 #include "kvstore.h"
 #include "persistence.h"
-
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 extern kvs_array_t global_array;
 extern kvs_rbtree_t global_rbtree;
 extern kvs_hash_t global_hash;
@@ -101,6 +104,75 @@ static void test_rejects_corruption(const char *path)
     puts("snapshot corruption tests passed");
 }
 
+static void test_save_failure_preserves_old_snapshot(const char *path)
+{
+    /* 1. 备份旧快照的字节内容。 */
+    int fd = open(path, O_RDONLY);
+    assert(fd >= 0);
+
+    struct stat before;
+    assert(fstat(fd, &before) == 0);
+    assert(before.st_size > 0);
+
+    size_t length = (size_t)before.st_size;
+    unsigned char *original = malloc(length);
+    unsigned char *actual = malloc(length);
+    assert(original != NULL && actual != NULL);
+    assert(pread(fd, original, length, 0) == (ssize_t)length);
+
+    /* 2. 修改内存数据，让它与旧快照不同。 */
+    assert(kvs_hash_mod(
+        &global_hash, "name", "must not replace old snapshot") == 0);
+
+    /* 3. 保存测试进程原来的限制和信号处理方式。 */
+    struct rlimit original_limit;
+    assert(getrlimit(RLIMIT_FSIZE, &original_limit) == 0);
+
+    struct sigaction original_action;
+    struct sigaction ignored_action = {0};
+    ignored_action.sa_handler = SIG_IGN;
+    assert(sigemptyset(&ignored_action.sa_mask) == 0);
+    assert(sigaction(
+        SIGXFSZ, &ignored_action, &original_action) == 0);
+
+    /* 4. 临时限制文件大小，让本次 SAVE 的写入失败。 */
+    struct rlimit limited = original_limit;
+    limited.rlim_cur = 0;
+    assert(setrlimit(RLIMIT_FSIZE, &limited) == 0);
+
+    int save_result = kvs_snapshot_store_save(path);
+    int save_errno = errno;
+
+    /* 5. 立即恢复原来的测试环境。 */
+    assert(setrlimit(RLIMIT_FSIZE, &original_limit) == 0);
+    assert(sigaction(SIGXFSZ, &original_action, NULL) == 0);
+
+    assert(save_result == -1);
+    assert(save_errno == EFBIG);
+
+    /* 6. 正式文件没有被替换，长度和内容也没有变化。 */
+    struct stat after;
+    assert(stat(path, &after) == 0);
+    assert(after.st_dev == before.st_dev);
+    assert(after.st_ino == before.st_ino);
+    assert(after.st_size == before.st_size);
+
+    assert(pread(fd, actual, length, 0) == (ssize_t)length);
+    assert(memcmp(actual, original, length) == 0);
+
+    assert(close(fd) == 0);
+    free(actual);
+    free(original);
+
+    /* 7. 清空内存，确认旧快照仍能恢复旧值。 */
+    destroy_engines();
+    create_engines();
+    assert(kvs_snapshot_store_load(path) == 0);
+    expect_value(kvs_hash_get(&global_hash, "name"), "Hash");
+
+    puts("snapshot write failure preserves old snapshot");
+}
+
 int main(void)
 {
     char directory[] = "/tmp/91kv-snapshot-test-XXXXXX";
@@ -140,6 +212,8 @@ int main(void)
     assert(kvs_skiplist_set(&global_skiplist, "name", "Skiplist") == 0);
 
     assert(kvs_snapshot_store_save(path) == 0);
+
+    test_save_failure_preserves_old_snapshot(path);
 
     /* 更新、删除后再次保存，替换上一份快照。 */
     assert(kvs_hash_mod(

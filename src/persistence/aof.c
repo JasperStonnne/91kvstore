@@ -7,10 +7,35 @@
 #include <fcntl.h>       // open、O_RDONLY
 #include <sys/stat.h>    // fstat、struct stat、S_ISREG
 #include <sys/syscall.h> // SYS_close，绕过 NtyCo 的 close hook
+#include <stdint.h>
+#include "mapped_file.h"
+#include "uring_io.h"
 #include"persistence.h"
 #include "protocol.h"
 
-static FILE *aof_fp=NULL;
+/*
+ * AOF 写入侧的状态。
+ * 打开时创建资源，追加时复用，关闭时释放。
+ */
+typedef struct {
+    /* AOF 文件描述符，由打开函数取得、关闭函数释放。 */
+    int fd;
+
+    /*
+     * 下一条命令写入文件的起始字节位置。
+     * 打开已有文件时，从文件末尾继续。
+     */
+    off_t offset;
+
+    /* 保存期间复用的 io_uring 队列。 */
+    kvs_uring_io_t io;
+} aof_writer_t;
+
+/* fd=-1 表示当前没有打开 AOF。 */
+static aof_writer_t aof_writer = {
+    .fd = -1
+};
+
 /*
  * 直接调用 Linux 内核关闭普通文件，
  * 避免进入 NtyCo 为网络 socket 重写的 close()。
@@ -26,85 +51,129 @@ static int kvs_aof_file_close(int fd)
 /*
 return: 0-success,-1-error
 */
-int kvs_aof_open(const char* path){
-    if(path==NULL){
-        return -1;
-    }
-    if(aof_fp!=NULL){
-        return -1;
-    }
-    aof_fp=fopen(path,"a");
-    if(aof_fp==NULL){
+int kvs_aof_open(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        errno = EINVAL;
         return -1;
     }
 
-    if(fseeko(aof_fp,0,SEEK_END)!=0){
-        fclose(aof_fp);
-        aof_fp=NULL;
+    /* 不能重复打开，否则会丢失已有文件和队列的资源。 */
+    if (aof_writer.fd >= 0 || aof_writer.io.initialized) {
+        errno = EALREADY;
         return -1;
-
     }
 
+    /*
+     * 文件不存在时创建；存在时保留原内容。
+     * 不使用 O_TRUNC，也不使用 O_APPEND。
+     */
+    int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
+    if (fd < 0) {
+        return -1;
+    }
+
+    /* 取得已有文件的长度，作为下一次写入的位置。 */
+    struct stat file_info;
+    if (fstat(fd, &file_info) < 0) {
+        int saved_errno = errno;
+        kvs_aof_file_close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    /* AOF 应当是普通文件。 */
+    if (!S_ISREG(file_info.st_mode) || file_info.st_size < 0) {
+        kvs_aof_file_close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* 为后续追加和同步创建队列，整个打开期间复用。 */
+    if (kvs_uring_io_init(&aof_writer.io) < 0) {
+        int saved_errno = errno;
+        kvs_aof_file_close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    /* 资源全部准备成功后，才将文件标记为已打开。 */
+    aof_writer.fd = fd;
+    aof_writer.offset = file_info.st_size;
     return 0;
 }
-int kvs_aof_close(void){
-    if(aof_fp==NULL){
+
+int kvs_aof_close(void)
+{
+    if (aof_writer.fd < 0) {
+        errno = EBADF;
         return -1;
     }
-    int ret=fclose(aof_fp);
-    aof_fp=NULL;
-    if(ret==0){
-        return 0;
-    }else{
-        return -1;
-    }
+
+    /*
+     * 追加函数返回前，必须已经处理完提交的请求。
+     * 因此这里可以释放队列，再关闭文件。
+     */
+    kvs_uring_io_close(&aof_writer.io);
+
+    int close_result = kvs_aof_file_close(aof_writer.fd);
+    int saved_errno = errno;
+
+    /*
+     * 即使 close 报错，也不再次关闭同一个 fd。
+     * 清除状态，避免后续误用。
+     */
+    aof_writer.fd = -1;
+    aof_writer.offset = 0;
+
+    errno = saved_errno;
+    return close_result;
 }
+
 /*
- * 让 Replica 本地 AOF 使用与 Primary 相同的 offset 坐标。
- *
- * 例如 Snapshot 对应 Primary offset=27：
- * - 本地 AOF 小于 27：扩展到 27 字节；
- * - 本地 AOF 大于 27：截断到 27 字节；
- * - 后续复制命令从第 27 字节之后追加。
+ * Replica 安装全量 Snapshot 后调用。
+ * 保留原语义：调整本地 AOF 长度，并对齐后续追加位置。
  */
 int kvs_aof_reset_to_offset(long long offset)
 {
-    if(aof_fp==NULL || offset<0){
+    if (aof_writer.fd < 0 ||
+        !aof_writer.io.initialized ||
+        offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* 确认传入的 offset 能用文件位置类型 off_t 表示。 */
+    off_t target_offset = (off_t)offset;
+    if (target_offset < 0 ||
+        (long long)target_offset != offset) {
+        errno = EOVERFLOW;
         return -1;
     }
 
     /*
-     * 先把 stdio 缓冲区已有内容交给内核，
-     * 避免随后调整文件长度时与缓冲内容冲突。
-     */
-    if(fflush(aof_fp)!=0){
-        return -1;
-    }
-
-    int fd=fileno(aof_fp);
-    if(fd<0){
-        return -1;
-    }
-
-    /*
-     * 将文件长度调整到 Snapshot 对应的 Primary AOF offset。
+     * 调用前，之前的追加请求必须已经结束。
      * 文件较短时扩展，较长时截断。
      */
-    if(ftruncate(fd,(off_t)offset)!=0){
+    int truncate_result;
+    do {
+        truncate_result = ftruncate(
+            aof_writer.fd, target_offset);
+    } while (truncate_result < 0 && errno == EINTR);
+
+    if (truncate_result < 0) {
         return -1;
     }
 
-    /* 后续 kvs_aof_append() 从调整后的文件末尾继续写。 */
-    if(fseeko(aof_fp,0,SEEK_END)!=0){
-        return -1;
-    }
+    /*
+     * 文件长度已经改变，追加位置也必须跟着改变。
+     * 即使后续同步失败，也不能保留旧位置。
+     */
+    aof_writer.offset = target_offset;
 
-    /* 确保文件长度变化持久化。 */
-    if(fsync(fd)!=0){
-        return -1;
-    }
-
-    return 0;
+    /* 同步文件长度变化；成功后才能返回 0。 */
+    return kvs_uring_io_sync(
+        &aof_writer.io, aof_writer.fd);
 }
 int kvs_aof_reader_open(
     kvs_aof_reader_t *reader,
@@ -129,7 +198,7 @@ int kvs_aof_reader_open(
     reader->offset=0;
     reader->remaining=0;
 
-    // 单独只读打开 AOF，不影响全局 aof_fp 的追加位置。
+/* 复制使用独立的只读 fd，不改变 AOF 写入侧维护的 offset。 */
     int fd=open(path,O_RDONLY);
     if(fd<0){
         return -1;
@@ -226,16 +295,22 @@ void kvs_aof_reader_close(kvs_aof_reader_t *reader)
 }
 int kvs_aof_append(char **tokens, int count)
 {
-    if (aof_fp == NULL ||
+    if (aof_writer.fd < 0 ||
+        !aof_writer.io.initialized ||
         tokens == NULL ||
         (count != 2 && count != 3)) {
+        errno = EINVAL;
         return -1;
     }
 
+    /* 1. 保留原来的编码过程：命令名、key、可选的 value。 */
     kvs_slice_t fields[3];
 
     for (int i = 0; i < count; i++) {
-        if (tokens[i] == NULL) return -1;
+        if (tokens[i] == NULL) {
+            errno = EINVAL;
+            return -1;
+        }
 
         fields[i].data = tokens[i];
         fields[i].length = strlen(tokens[i]);
@@ -248,7 +323,9 @@ int kvs_aof_append(char **tokens, int count)
     }
 
     char *encoded = malloc(required);
-    if (encoded == NULL) return -1;
+    if (encoded == NULL) {
+        return -1;
+    }
 
     size_t encoded_length = 0;
     if (kvs_encode_command(
@@ -261,15 +338,46 @@ int kvs_aof_append(char **tokens, int count)
         return -1;
     }
 
-    size_t written = fwrite(encoded, 1, encoded_length, aof_fp);
-    free(encoded);
-
-    if (written != encoded_length ||
-        fflush(aof_fp) != 0 ||
-        fsync(fileno(aof_fp)) != 0) {
+    /* 2. 提前检查写完后的 offset 是否溢出。 */
+    off_t next_offset;
+    if (__builtin_add_overflow(
+            aof_writer.offset, encoded_length, &next_offset)) {
+        free(encoded);
+        errno = EOVERFLOW;
         return -1;
     }
 
+    /* 3. 指定源数据的内存地址和目标文件位置。 */
+    kvs_uring_write_t request = {
+        .data = encoded,
+        .length = encoded_length,
+        .offset = aof_writer.offset
+    };
+
+    int write_result = kvs_uring_io_write_batch(
+        &aof_writer.io,
+        aof_writer.fd,
+        &request,
+        1
+    );
+
+    /* 写请求已经结束，才能释放它借用的内存。 */
+    int saved_errno = errno;
+    free(encoded);
+    errno = saved_errno;
+
+    if (write_result < 0) {
+        return -1;
+    }
+
+    /* 4. 保留每条命令同步成功后才返回成功的规则。 */
+    if (kvs_uring_io_sync(
+            &aof_writer.io, aof_writer.fd) < 0) {
+        return -1;
+    }
+
+    /* 5. 写入和同步都成功，更新下一条命令的写入位置。 */
+    aof_writer.offset = next_offset;
     return 0;
 }
 int kvs_aof_replay(
@@ -278,96 +386,73 @@ int kvs_aof_replay(
     aof_replay_handler handler)
 {
     if (path == NULL || handler == NULL || offset < 0) {
+        errno = EINVAL;
         return -1;
     }
 
-    /* 使用二进制模式读取，协议解析按字节工作，不依赖文本换行。 */
-    FILE *fp = fopen(path, "rb");
-    if (fp == NULL) {
+    /* 映射文件；文件不存在时，保持原有的空数据启动行为。 */
+    kvs_mapped_file_t file = {0};
+
+    if (kvs_mapped_file_open(path, &file) < 0) {
         return errno == ENOENT ? 0 : -1;
     }
 
-    /* 从 Snapshot 对应的 AOF 位置开始回放后续命令。 */
-    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
-        fclose(fp);
-        return -1;
+    int replay_result = 0;
+    int saved_errno;
+
+    /*
+     * position 表示下一条命令在文件中的起始位置。
+     * offset 在文件范围内时，可以安全地转换成 size_t。
+     * offset 到达或超过末尾时，不回放任何命令，保持原有行为。
+     */
+    size_t position = file.length;
+
+    if ((uintmax_t)offset < (uintmax_t)file.length) {
+        position = (size_t)offset;
     }
 
-    char *input = NULL;              /* 当前正在读取的命令字节 */
-    size_t input_length = 0;         /* 已读入的命令字节数 */
-    size_t input_capacity = 0;       /* input 当前分配的容量 */
-    int replay_result = 0;
-
-    while (1) {
-        int byte = fgetc(fp);        /* 每次从 AOF 读取一个字节 */
-
-        if (byte == EOF) {
-            /*
-             * EOF 时若还剩半条命令，说明 AOF 末尾不完整；
-             * ferror 则表示读取文件本身发生错误。
-             */
-            if (ferror(fp) || input_length != 0) {
-                replay_result = -1;
-            }
-            break;
-        }
-
-        /* 当前命令占满缓冲区时扩容，避免长字段被固定长度限制。 */
-        if (input_length == input_capacity) {
-            size_t new_capacity = input_capacity == 0
-                ? 1024
-                : input_capacity * 2;
-
-            /* 容量翻倍后变小，表示 size_t 溢出了。 */
-            if (new_capacity < input_capacity) {
-                replay_result = -1;
-                break;
-            }
-
-            char *new_input = realloc(input, new_capacity);
-            if (new_input == NULL) {
-                replay_result = -1;
-                break;
-            }
-
-            input = new_input;
-            input_capacity = new_capacity;
-        }
-
-        /* 把刚读到的字节追加到当前命令末尾。 */
-        input[input_length++] = (char)byte;
+    while (position < file.length) {
+        /* 从当前位置到文件末尾，还有多少字节。 */
+        size_t remaining = file.length - position;
 
         /*
-         * AOF 中保存的是写命令，目前每条最多包含：
-         * 命令名、key、value 三个字段。
+         * fields 借用映射中的字段内容，不复制命令字节。
+         * 当前 AOF 的每条写命令最多包含：命令名、key、value。
          */
         kvs_slice_t fields[3];
         size_t field_count = 0;
         size_t parsed_bytes = 0;
 
         int parse_result = kvs_parse_command(
-            input,
-            input_length,
+            (const char *)file.data + position,
+            remaining,
             fields,
             3,
             &field_count,
             &parsed_bytes
         );
 
-        if (parse_result == 0) {
-            continue; /* 命令尚未读完整，继续读取后续字节。 */
-        }
-
         /*
-         * -1 表示格式错误。
-         * parsed_bytes 必须等于当前缓冲区长度，因为我们逐字节读取，
-         * 解析成功时缓冲区里应该刚好只有这一条命令。
+         * 已经提供到文件末尾，仍不完整，说明尾部命令被截断。
+         * 格式错误也必须拒绝恢复。
          */
-        if (parse_result < 0 || parsed_bytes != input_length) {
+        if (parse_result <= 0) {
+            errno = parse_result == 0 ? EIO : EINVAL;
             replay_result = -1;
             break;
         }
 
+        /* 防止位置不前进，或者越过当前映射范围。 */
+        if (parsed_bytes == 0 || parsed_bytes > remaining) {
+            errno = EINVAL;
+            replay_result = -1;
+            break;
+        }
+
+        /*
+         * 继续使用原来的恢复回调。
+         * 回调返回前，映射一直有效，fields 指向的字节可以读取。
+         */
         char response[1024] = {0};
         int response_length = handler(
             fields,
@@ -376,38 +461,36 @@ int kvs_aof_replay(
             sizeof(response)
         );
 
-        /* 恢复命令必须成功，并返回约定的 OK 响应。 */
         if (response_length <= 0 ||
             response_length > (int)sizeof(response)) {
+            errno = EINVAL;
             replay_result = -1;
             break;
         }
 
-        /* 当前命令已解析并执行，清空逻辑长度后读取下一条。 */
-        input_length = 0;
+        /* 当前命令恢复成功，移动到下一条命令的开头。 */
+        position += parsed_bytes;
     }
 
-    /* 释放动态命令缓冲区，并检查文件是否成功关闭。 */
-    free(input);
+    /* 无论恢复成功还是失败，都要解除映射。 */
+    saved_errno = errno;
 
-    if (fclose(fp) != 0) {
+    if (kvs_mapped_file_close(&file) < 0 && replay_result == 0) {
         replay_result = -1;
+        saved_errno = errno;
     }
 
+    errno = saved_errno;
     return replay_result;
 }
 
-/* 返回当前 AOF 文件的写入位置，供 Snapshot 和复制记录 offset 使用。 */
+/* 返回 AOF 当前的字节 offset，供 Snapshot 和复制模块使用。 */
 long long kvs_aof_get_offset(void)
 {
-    if (aof_fp == NULL) {
+    if (aof_writer.fd < 0) {
+        errno = EBADF;
         return -1;
     }
 
-    off_t offset = ftello(aof_fp);
-    if (offset == (off_t)-1) {
-        return -1;
-    }
-
-    return (long long)offset;
+    return (long long)aof_writer.offset;
 }
