@@ -56,6 +56,8 @@ OBJS := \
 	$(BUILD_DIR)/aof.o \
 	$(BUILD_DIR)/snapshot.o \
 	$(BUILD_DIR)/snapshot_store.o \
+	$(BUILD_DIR)/mapped_file.o \
+	$(BUILD_DIR)/uring_io.o \
 	$(BUILD_DIR)/replication.o \
 	$(BUILD_DIR)/memory_pool.o \
 	$(BUILD_DIR)/buffer.o
@@ -90,7 +92,7 @@ $(NTYCO_DIR)/libntyco.a:
 	$(MAKE) -C $(NTYCO_DIR)
 
 $(BIN_DIR)/kvstore: $(OBJS) $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
-	$(CC) $(OBJS) $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(OBJS) $(LDFLAGS) $(LDLIBS) -luring -o $@
 
 $(BUILD_DIR)/kvstore.o: \
 	$(SRC_DIR)/kvstore.c \
@@ -146,8 +148,10 @@ $(BUILD_DIR)/kvs_skiplist.o: \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/aof.o: \
-	$(PERSISTENCE_DIR)/aof.c \
-	$(INCLUDE_DIR)/persistence.h | $(BUILD_DIR)
+    $(PERSISTENCE_DIR)/aof.c \
+    $(INCLUDE_DIR)/persistence.h \
+    $(INCLUDE_DIR)/mapped_file.h \
+    $(INCLUDE_DIR)/uring_io.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/snapshot.o: \
@@ -159,9 +163,21 @@ $(BUILD_DIR)/snapshot.o: \
 $(BUILD_DIR)/snapshot_store.o: \
 	$(PERSISTENCE_DIR)/snapshot_store.c \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/mapped_file.h \
+    $(INCLUDE_DIR)/uring_io.h \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/protocol.h \
 	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mapped_file.o: \
+	$(PERSISTENCE_DIR)/mapped_file.c \
+	$(INCLUDE_DIR)/mapped_file.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/uring_io.o: \
+    $(PERSISTENCE_DIR)/uring_io.c \
+    $(INCLUDE_DIR)/uring_io.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/replication.o: \
@@ -385,6 +401,7 @@ clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
 
 UNIT_TEST_TARGETS := \
+    test-uring-io \
 	test-protocol \
 	test-config \
 	test-snapshot \
@@ -392,6 +409,8 @@ UNIT_TEST_TARGETS := \
 	test-hash-memory-pool \
 	test-rbtree-memory-pool \
 	test-skiplist-memory-pool \
+	test-mapped-file \
+	test-aof-replay \
 	test-array-memory
 
 .PHONY: test-unit test-integration test
@@ -453,25 +472,30 @@ test-snapshot: $(BIN_DIR)/test_snapshot_store
 $(BIN_DIR)/test_snapshot_store: \
 	$(TEST_DIR)/test_snapshot_store.c \
 	$(PERSISTENCE_DIR)/snapshot_store.c \
+	$(PERSISTENCE_DIR)/mapped_file.c \
+	$(PERSISTENCE_DIR)/uring_io.c \
 	$(ENGINE_DIR)/kvs_array.c \
 	$(ENGINE_DIR)/kvs_rbtree.c \
 	$(ENGINE_DIR)/kvs_hash.c \
 	$(ENGINE_DIR)/kvs_skiplist.c \
 	$(MEMORY_DIR)/memory_pool.c \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/mapped_file.h \
+	$(INCLUDE_DIR)/uring_io.h \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/protocol.h \
 	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
 		$(TEST_DIR)/test_snapshot_store.c \
 		$(PERSISTENCE_DIR)/snapshot_store.c \
+		$(PERSISTENCE_DIR)/mapped_file.c \
+		$(PERSISTENCE_DIR)/uring_io.c \
 		$(ENGINE_DIR)/kvs_array.c \
 		$(ENGINE_DIR)/kvs_rbtree.c \
 		$(ENGINE_DIR)/kvs_hash.c \
 		$(ENGINE_DIR)/kvs_skiplist.c \
 		$(MEMORY_DIR)/memory_pool.c \
-		-o $@
-
+		-o $@ -luring
 .PHONY: test-snapshot-restart
 
 test-snapshot-restart: $(BIN_DIR)/kvstore
@@ -485,3 +509,54 @@ test-aof-restart: $(BIN_DIR)/kvstore
 	python3 -B $(TEST_DIR)/test_aof_restart.py
 
 test-integration: test-aof-restart
+
+.PHONY: test-mapped-file
+
+test-mapped-file: $(BIN_DIR)/test_mapped_file
+	./$(BIN_DIR)/test_mapped_file
+
+$(BIN_DIR)/test_mapped_file: \
+	$(TEST_DIR)/test_mapped_file.c \
+	$(PERSISTENCE_DIR)/mapped_file.c \
+	$(INCLUDE_DIR)/mapped_file.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		$(TEST_DIR)/test_mapped_file.c \
+		$(PERSISTENCE_DIR)/mapped_file.c \
+		-o $@
+
+.PHONY: test-aof-replay
+
+test-aof-replay: $(BIN_DIR)/test_aof_replay
+	./$(BIN_DIR)/test_aof_replay
+
+$(BIN_DIR)/test_aof_replay: \
+    $(TEST_DIR)/test_aof_replay.c \
+    $(PERSISTENCE_DIR)/aof.c \
+    $(PERSISTENCE_DIR)/mapped_file.c \
+    $(PERSISTENCE_DIR)/uring_io.c \
+    $(SRC_DIR)/protocol/codec.c \
+    $(INCLUDE_DIR)/persistence.h \
+    $(INCLUDE_DIR)/mapped_file.h \
+    $(INCLUDE_DIR)/uring_io.h \
+    $(INCLUDE_DIR)/protocol.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+	    $(TEST_DIR)/test_aof_replay.c \
+	    $(PERSISTENCE_DIR)/aof.c \
+	    $(PERSISTENCE_DIR)/mapped_file.c \
+	    $(PERSISTENCE_DIR)/uring_io.c \
+	    $(SRC_DIR)/protocol/codec.c \
+	    -o $@ -luring
+
+.PHONY: test-uring-io
+
+test-uring-io: $(BIN_DIR)/test_uring_io
+	./$(BIN_DIR)/test_uring_io
+
+$(BIN_DIR)/test_uring_io: \
+    $(TEST_DIR)/test_uring_io.c \
+    $(PERSISTENCE_DIR)/uring_io.c \
+    $(INCLUDE_DIR)/uring_io.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+	    $(TEST_DIR)/test_uring_io.c \
+	    $(PERSISTENCE_DIR)/uring_io.c \
+	    -o $@ -luring
