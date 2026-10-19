@@ -319,17 +319,11 @@ static int validate_config(
         break;
 
     case KVS_ROLE_PRIMARY:
-        if (!seen[FIELD_REPLICATION_PORT]) {
-            return config_error(
-                error, error_capacity, path, 0,
-                "role=primary requires replication_port"
-            );
-        }
-        if (parsed->service_port == parsed->replication_port) {
+        if (seen[FIELD_REPLICATION_PORT]) {
             return config_error(
                 error, error_capacity, path,
                 field_lines[FIELD_REPLICATION_PORT],
-                "service_port and replication_port must differ"
+                "replication_port has been removed; use service_port"
             );
         }
         if (seen[FIELD_PRIMARY_HOST]) {

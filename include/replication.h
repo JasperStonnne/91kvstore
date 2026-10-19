@@ -49,5 +49,6 @@ int kvs_replication_init(
     kvs_replication_command_handler command_handler
 );
 void kvs_replication_destroy(void);
+void kvs_replication_on_replica_disconnected(int connection_fd);
 
 #endif

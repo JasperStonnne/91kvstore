@@ -1305,26 +1305,18 @@ kvs_close_current_persistence();
     int network_ret=-1;
 
     if (config.role == KVS_ROLE_PRIMARY) {
-        kvs_listener_config_t listeners[] = {
-            {
-                .port = config.service_port,                 // 普通客户端端口
-                .bind_ip = config.bind_ip,
-                .handler = kvs_network_protocol,             // 客户端命令协议、
-                .stream_handler = NULL                       // 普通客户端不发送文件流
-            },
-            {
-                .port = config.replication_port,             // Replica 专用端口
-                .bind_ip = config.bind_ip,
-                .handler = kvs_replication_network_protocol, // 主从复制协议
-                .stream_handler = kvs_replication_stream // 分块提供 Snapshot
-            }
-        };
+kvs_listener_config_t listener = {
+    .port = config.service_port,
+    .bind_ip = config.bind_ip,
+    .handler = kvs_network_protocol,
+    .stream_handler = NULL,
+    .replication_handler = kvs_replication_network_protocol,
+    .replication_stream_handler = kvs_replication_stream,
+    .replication_close_handler =kvs_replication_on_replica_disconnected
+};
 
-         /* Primary 同时开启客户端端口和复制端口。 */
-        network_ret = ntyco_start_listeners(
-            listeners,
-            sizeof(listeners) / sizeof(listeners[0])
-        );
+/* Primary 只监听服务端口，接入后按连接协议分流。 */
+    network_ret = ntyco_start_listeners(&listener, 1);
     } else if (config.role == KVS_ROLE_REPLICA) {
         /* Replica 监听客户端端口，同时需要连接上游 Primary。 */
         kvs_listener_config_t listener = {

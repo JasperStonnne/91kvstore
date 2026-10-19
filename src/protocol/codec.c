@@ -273,3 +273,36 @@ int kvs_encode_value_response(
     *encoded_bytes = pos;
     return 0;
 }
+
+kvs_connection_kind_t kvs_identify_connection(
+    const char *input,
+    size_t length)
+{
+    static const char handshake[] = "PING\r\n";
+    const size_t handshake_length = sizeof(handshake) - 1;
+
+    if (length == 0) {
+        return KVS_CONNECTION_NEED_MORE;
+    }
+
+    if (input == NULL) {
+        return KVS_CONNECTION_INVALID;
+    }
+
+    if (input[0] == '*') {
+        return KVS_CONNECTION_CLIENT;
+    }
+
+    size_t compare_length =
+        length < handshake_length ? length : handshake_length;
+
+    if (memcmp(input, handshake, compare_length) != 0) {
+        return KVS_CONNECTION_INVALID;
+    }
+
+    if (length < handshake_length) {
+        return KVS_CONNECTION_NEED_MORE;
+    }
+
+    return KVS_CONNECTION_REPLICA;
+}

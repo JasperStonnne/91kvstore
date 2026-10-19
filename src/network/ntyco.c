@@ -6,9 +6,12 @@
 #include "server.h"
 #include "memory_pool.h"
 #include "log.h"
+#include "protocol.h"
 #include <arpa/inet.h>
 #include<errno.h>
 #include <string.h>
+#include <time.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #define NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK 64
 #define NTYCO_MAX_LISTENER_COUNT 2
@@ -24,6 +27,9 @@ typedef struct {
 	msg_handler handler;
 	kvs_connection_stream_handler stream_handler; // 当前监听器的可选流式输出函数
 	memory_pool_t connection_pool;  // 连接上下文专用池
+	msg_handler replication_handler;
+    kvs_connection_stream_handler replication_stream_handler;
+	kvs_connection_close_handler replication_close_handler;
 }ntyco_listener_context_t;
 
 typedef struct {
@@ -32,9 +38,13 @@ typedef struct {
 	kvs_connection_stream_handler stream_handler; // 该连接可选的流式输出函数
 	kvs_connection_close_handler close_handler; // 连接关闭时通知业务层，可以为 NULL
 	memory_pool_t *pool;
+	msg_handler replication_handler;
+    kvs_connection_stream_handler replication_stream_handler;
+	long long identification_deadline_ms;
+	kvs_connection_close_handler replication_close_handler;
 } ntyco_connection_context_t;
 
-typedef struct {
+typedef struct{
     const char *host;                              // 要连接的目标地址
     unsigned short port;                           // 要连接的目标端口
     int fd;                                        // NtyCo 创建的连接 socket
@@ -42,6 +52,72 @@ typedef struct {
     msg_handler message_handler;                   // 收到数据后的处理函数
     kvs_connection_close_handler close_handler;    // 连接断开回调
 } ntyco_connector_context_t;
+
+#define NTYCO_IDENTIFICATION_TIMEOUT_MS 5000
+#define NTYCO_IDENTIFICATION_RETRY_MS 10
+
+static long long ntyco_monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+        return -1;
+    }
+
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* 仅在连接协议尚未确定时使用。 */
+static ssize_t ntyco_recv_before_deadline(
+    int fd,
+    void *buffer,
+    size_t capacity,
+    long long deadline_ms)
+{
+    while (1) {
+        long long now = ntyco_monotonic_ms();
+        if (now < 0) {
+            return -1;
+        }
+
+        long long remaining = deadline_ms - now;
+        if (remaining <= 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+
+        /* 直接进行非阻塞接收，避免进入 recv 的无限等待 hook。 */
+        ssize_t received = syscall(
+            SYS_recvfrom,
+            fd, buffer, capacity, MSG_DONTWAIT,
+            NULL, NULL
+        );
+
+        if (received >= 0) {
+            return received;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return -1;
+        }
+
+        /* 暂无数据：登记短时休眠并让出协程，不占着 CPU 循环。 */
+        long long delay =
+            remaining < NTYCO_IDENTIFICATION_RETRY_MS
+                ? remaining
+                : NTYCO_IDENTIFICATION_RETRY_MS;
+
+        nty_coroutine *co =
+            nty_coroutine_get_sched()->curr_thread;
+
+        nty_schedule_sched_sleepdown(co, (uint64_t)delay);
+        nty_coroutine_yield(co);
+    }
+}
 
 static int ntyco_connector_context_init(
     ntyco_connector_context_t *context,
@@ -81,6 +157,9 @@ static int ntyco_listener_context_init(
 		context->listen_fd = -1;
         context->handler=config->handler;
 		context->stream_handler=config->stream_handler;
+		context->replication_handler = config->replication_handler;
+		context->replication_stream_handler =config->replication_stream_handler;
+		context->replication_close_handler =config->replication_close_handler;
         return memory_pool_init(
                 &context->connection_pool,
                 sizeof(ntyco_connection_context_t),
@@ -160,7 +239,8 @@ static int ntyco_send_all(int fd,const char *data,int length)
     int offset=0;
 
     while(offset<length){
-        int ret=nty_send(fd,data+offset,length-offset,0);
+        int ret = nty_send(fd, data + offset, length - offset, MSG_NOSIGNAL);
+
 
         if(ret>0){
             offset+=ret;
@@ -200,13 +280,30 @@ static int ntyco_flush_output(int fd, kvs_output_buffer_t *output)
 }
 
 void server_reader(void *arg) {
-	ntyco_connection_context_t *context = (ntyco_connection_context_t *)arg;
-	int fd=context->fd;
-	msg_handler handler = context->handler;
-	kvs_connection_stream_handler stream_handler =context->stream_handler;
-	kvs_connection_close_handler close_handler=context->close_handler;
-	memory_pool_t *pool = context->pool;
-	if(pool!=NULL)memory_pool_free(pool,context);
+    ntyco_connection_context_t *context =
+        (ntyco_connection_context_t *)arg;
+
+    int fd = context->fd;
+    msg_handler handler = context->handler;
+    kvs_connection_stream_handler stream_handler =
+        context->stream_handler;
+    kvs_connection_close_handler close_handler =
+        context->close_handler;
+
+    msg_handler replication_handler =
+        context->replication_handler;
+    kvs_connection_stream_handler replication_stream_handler =
+        context->replication_stream_handler;
+
+    /* 没有配置复制候选路径的监听器，继续沿用原处理方式。 */
+	kvs_connection_close_handler replication_close_handler =context->replication_close_handler;
+    int protocol_selected = (replication_handler == NULL);
+	long long identification_deadline_ms =context->identification_deadline_ms;
+
+    memory_pool_t *pool = context->pool;
+    if (pool != NULL) {
+        memory_pool_free(pool, context);
+    }
 	int ret = 0;//保存recv send的返回值
 	kvs_input_buffer_t input={0};//跨循环 保存请求数
 	kvs_output_buffer_t output={0};//保存当前链接尚未发送完的响应
@@ -217,12 +314,48 @@ void server_reader(void *arg) {
 		goto connection_closed;
 	}
 	int available = input.capacity - input.length;
-	ret = nty_recv(fd, input.data + input.length, available, 0);
+		if (!protocol_selected) {
+		ret = ntyco_recv_before_deadline(
+			fd,
+			input.data + input.length,
+			(size_t)available,
+			identification_deadline_ms
+		);
+        } else {
+            ret = nty_recv(
+                fd,
+                input.data + input.length,
+                available,
+                0
+            );
+        }
 		if (ret > 0) {
 			input.length+=ret;
 		do{
 			consumed_length=0;
 			output.offset=0;
+			    if (!protocol_selected) {
+                kvs_connection_kind_t kind =
+                    kvs_identify_connection(input.data, input.length);
+
+                if (kind == KVS_CONNECTION_NEED_MORE) {
+                    /* 半包不消费，退出内层循环，继续接收。 */
+                    break;
+                }
+
+                if (kind == KVS_CONNECTION_INVALID) {
+                    goto connection_closed;
+                }
+
+                if (kind == KVS_CONNECTION_REPLICA) {
+                    handler = replication_handler;
+                    stream_handler = replication_stream_handler;
+					close_handler = replication_close_handler;
+                }
+
+                /* 客户端沿用默认处理器；选定后不再切换身份。 */
+                protocol_selected = 1;
+            }
 
 			/* output.data 现在是指针，首次写响应前先分配初始空间。 */
 			if (kvs_output_buffer_ensure_space(&output, BUFFER_LENGTH) < 0) {
@@ -280,6 +413,25 @@ void server_reader(void *arg) {
 				* 当前协程休眠一小段时间，让出 CPU 后再检查。
 				*/
 				if(stream_length==KVS_STREAM_WAIT){
+					char probe;
+                    ssize_t pending = syscall(
+                        SYS_recvfrom,
+                        fd, &probe, 1,
+                        MSG_PEEK | MSG_DONTWAIT,
+                        NULL, NULL
+                    );
+
+                    if (pending == 0) {
+                        /* 对端已关闭连接。 */
+                        goto connection_closed;
+                    }
+
+                    if (pending < 0 &&
+                        errno != EAGAIN &&
+                        errno != EWOULDBLOCK &&
+                        errno != EINTR) {
+                        goto connection_closed;
+                    }
 					/*
 					* 某些 NtyCo 版本的非零 sleep 只登记定时器、不主动让出协程。
 					* 在适配层明确完成这两步，避免复制流空闲时阻塞其他连接。
@@ -441,6 +593,19 @@ void server(void *arg) {
 		if(cli_fd<0){
 			continue;
 		}
+		long long identification_deadline_ms = 0;
+
+        if (context->replication_handler != NULL) {
+            long long accepted_at = ntyco_monotonic_ms();
+
+            if (accepted_at < 0) {
+                nty_close(cli_fd);
+                continue;
+            }
+
+            identification_deadline_ms =
+                accepted_at + NTYCO_IDENTIFICATION_TIMEOUT_MS;
+        }
 		/* 只在 DEBUG 下记录连接建立；不打印每条请求或请求内容。 */
 		kvs_log_message(KVS_LOG_DEBUG, "client accepted fd=%d\n", cli_fd);
 		ntyco_connection_context_t *connection = memory_pool_alloc(&context->connection_pool);
@@ -449,8 +614,12 @@ void server(void *arg) {
 			continue;
 		}
 		connection->fd=cli_fd;
+		connection->identification_deadline_ms =identification_deadline_ms;
 		connection->handler=context->handler;
 		connection->stream_handler=context->stream_handler;
+		connection->replication_handler = context->replication_handler;
+		connection->replication_stream_handler =context->replication_stream_handler;
+		connection->replication_close_handler =context->replication_close_handler;
 		connection->close_handler=NULL; // 普通客户端连接不需要复制断开通知
 		connection->pool=&context->connection_pool;
 		nty_coroutine *read_co;

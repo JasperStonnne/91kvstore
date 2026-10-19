@@ -366,12 +366,15 @@ int kvs_uring_io_sync(kvs_uring_io_t *io, int fd)
             result = io_uring_wait_cqe(&io->ring, &cqe);
         } while (result == -EINTR);
 
-        if (result < 0) {
-            int saved_errno = -result;
-            kvs_uring_io_close(io);
-            errno = saved_errno;
-            return -1;
-        }
+            if (result < 0) {
+                /*
+                * 等待失败，但已提交的 fsync 可能仍在执行。
+                * 按写入路径相同的规则取消并收齐完成结果。
+                */
+                errno = -result;
+                uring_abort_requests(io, 1);
+                return -1;
+            }
 
         /*
          * 5. 先取出同步结果，再回收完成队列中的这个位置。

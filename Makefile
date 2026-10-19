@@ -411,6 +411,7 @@ UNIT_TEST_TARGETS := \
 	test-skiplist-memory-pool \
 	test-mapped-file \
 	test-aof-replay \
+	test-connection-protocol \
 	test-array-memory
 
 .PHONY: test-unit test-integration test
@@ -444,7 +445,7 @@ test-integration: $(BIN_DIR)/kvstore
 		printf '[FAIL] replication integration (exit %s)\n%s\n' "$$status" "$$output" >&2; \
 		exit "$$status"; \
 	fi
-	@printf 'Integration tests: 4 passed\n'
+	@printf 'Integration test groups: 5 passed\n'
 
 test:
 	@$(MAKE) --no-print-directory test-unit
@@ -560,3 +561,24 @@ $(BIN_DIR)/test_uring_io: \
 	    $(TEST_DIR)/test_uring_io.c \
 	    $(PERSISTENCE_DIR)/uring_io.c \
 	    -o $@ -luring
+
+.PHONY: test-connection-protocol
+
+test-connection-protocol: $(BIN_DIR)/test_connection_protocol
+	./$(BIN_DIR)/test_connection_protocol
+
+$(BIN_DIR)/test_connection_protocol: \
+	$(TEST_DIR)/test_connection_protocol.c \
+	$(SRC_DIR)/protocol/codec.c \
+	$(INCLUDE_DIR)/protocol.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		$(TEST_DIR)/test_connection_protocol.c \
+		$(SRC_DIR)/protocol/codec.c \
+		-o $@
+
+.PHONY: test-single-port
+
+test-single-port: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/verify_single_port.py .
+
+test-integration: test-single-port

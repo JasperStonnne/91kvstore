@@ -11,7 +11,6 @@ KVSTORE_BIN="$PROJECT_DIR/bin/kvstore"
 # 默认端口与原脚本相同；运行时可以用环境变量覆盖。
 PRIMARY_PORT=${PRIMARY_PORT:-29000}
 REPLICA_PORT=${REPLICA_PORT:-29001}
-REPLICATION_PORT=${REPLICATION_PORT:-29100}
 
 # 两个服务在不同目录运行，各自的持久化文件不会落在仓库里。
 TEST_DIR=$(mktemp -d /tmp/91kv-replication-test.XXXXXX)
@@ -52,10 +51,9 @@ if [ "$status" -eq 0 ] ||
         fi
     else
         # 失败时保留数据和日志，便于排查。
-        printf 'replication test artifacts kept at: %s\n' "$TEST_DIR" >&2
-        printf 'rerun: PRIMARY_PORT=%q REPLICA_PORT=%q REPLICATION_PORT=%q bash %q\n' \
-            "$PRIMARY_PORT" "$REPLICA_PORT" "$REPLICATION_PORT" \
-            "$PROJECT_DIR/tests/test_replication.sh" >&2
+        printf 'rerun: PRIMARY_PORT=%q REPLICA_PORT=%q bash %q\n' \
+    "$PRIMARY_PORT" "$REPLICA_PORT" \
+    "$PROJECT_DIR/tests/test_replication.sh" >&2
     fi
 }
 
@@ -179,16 +177,14 @@ for required_command in nc timeout stdbuf ss; do
     fi
 done
 
-# 三个端口必须不同。
-if [ "$PRIMARY_PORT" = "$REPLICA_PORT" ] ||
-   [ "$PRIMARY_PORT" = "$REPLICATION_PORT" ] ||
-   [ "$REPLICA_PORT" = "$REPLICATION_PORT" ]; then
+# 本测试中两个进程都监听本机，因此服务端口必须不同。
+if [ "$PRIMARY_PORT" = "$REPLICA_PORT" ]; then
     fail "test ports must be different"
 fi
 
 # 启动服务前检查端口格式、范围和现有监听者。
 # 检查与实际启动之间仍可能有极短的竞争；下面的启动检查也会捕获失败。
-for port in "$PRIMARY_PORT" "$REPLICA_PORT" "$REPLICATION_PORT"; do
+for port in "$PRIMARY_PORT" "$REPLICA_PORT"; do
     if [[ ! "$port" =~ ^[0-9]+$ ]] ||
        [ "$port" -lt 1 ] ||
        [ "$port" -gt 65535 ]; then
@@ -208,7 +204,6 @@ cat >"$PRIMARY_CONFIG" <<EOF
 role = primary
 bind_ip = 127.0.0.1
 service_port = $PRIMARY_PORT
-replication_port = $REPLICATION_PORT
 log_level = info
 persistence_mode = legacy_hybrid
 EOF
@@ -222,10 +217,119 @@ PRIMARY_PID=$!
 
 wait_for_log "$PRIMARY_LOG" "listen port : $PRIMARY_PORT" "$PRIMARY_PID" ||
     fail "Primary service port did not start"
-wait_for_log "$PRIMARY_LOG" "listen port : $REPLICATION_PORT" "$PRIMARY_PID" ||
-    fail "Primary replication port did not start"
-
 echo "[PASS] Primary started"
+
+python3 - "$PRIMARY_PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+
+def receive_exact(conn, length):
+    result = b""
+    while len(result) < length:
+        chunk = conn.recv(length - len(result))
+        if not chunk:
+            raise RuntimeError("connection closed before complete reply")
+        result += chunk
+    return result
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as replica:
+    replica.sendall(b"PI")
+
+    # 复制握手未完成时，普通客户端仍应正常工作。
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+        client.sendall(
+            b"*3\r\n$4\r\nHSET\r\n"
+            b"$11\r\nroute_probe\r\n$2\r\nok\r\n"
+        )
+        assert receive_exact(client, 5) == b"+OK\r\n"
+
+    # 补齐同一条连接上的握手。
+    replica.sendall(b"NG\r\n")
+    assert receive_exact(replica, 6) == b"PONG\r\n"
+
+print("[PASS] fragmented replication handshake and concurrent client")
+for invalid in (b"PINK\r\n", b"PINGX\r\n", b"HELLO\r\n"):
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as conn:
+        conn.sendall(invalid)
+        try:
+            reply = conn.recv(1)
+        except ConnectionResetError:
+            reply = b""
+
+        assert reply == b"", (
+            f"invalid prefix received an unexpected reply: {invalid!r}, {reply!r}"
+        )
+
+print("[PASS] invalid connection prefixes rejected")
+import time
+
+with socket.create_connection(("127.0.0.1", port), timeout=7) as conn:
+    started = time.monotonic()
+
+    # 不发送任何字节，等待 Primary 主动关闭。
+    try:
+        reply = conn.recv(1)
+    except ConnectionResetError:
+        reply = b""
+    except socket.timeout:
+        raise AssertionError("unidentified connection was not closed") from None
+
+    elapsed = time.monotonic() - started
+    assert reply == b"", "silent connection received unexpected data"
+    assert 4.5 <= elapsed < 7, (
+        f"unexpected identification timeout: {elapsed:.3f}s"
+    )
+
+print("[PASS] silent connection identification timeout")
+with socket.create_connection(("127.0.0.1", port), timeout=7) as conn:
+    started = time.monotonic()
+    conn.sendall(b"P")
+
+    time.sleep(3)
+    conn.sendall(b"I")
+
+    # 总计最多等到第 7 秒，不能因为收到 I 续期到第 8 秒。
+    conn.settimeout(4)
+
+    try:
+        reply = conn.recv(1)
+    except ConnectionResetError:
+        reply = b""
+    except socket.timeout:
+        raise AssertionError("partial handshake renewed the deadline") from None
+
+    elapsed = time.monotonic() - started
+    assert reply == b"", "partial handshake received unexpected data"
+    assert 4.5 <= elapsed < 7, (
+        f"unexpected partial handshake timeout: {elapsed:.3f}s"
+    )
+
+print("[PASS] partial handshake does not renew identification deadline")
+with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+    # 首字节已确定客户端路径，但 RESP 命令尚不完整。
+    client.sendall(b"*")
+    time.sleep(6)
+
+    client.sendall(
+        b"3\r\n$4\r\nHSET\r\n"
+        b"$11\r\nlate_client\r\n$2\r\nok\r\n"
+    )
+    assert receive_exact(client, 5) == b"+OK\r\n"
+
+print("[PASS] identified client preserves existing partial-request behavior")
+PY
+
+primary_listener_count=$(
+    ss -Hltpn |
+        awk -v marker="pid=$PRIMARY_PID," \
+            'index($0, marker) { count++ } END { print count + 0 }'
+)
+
+if [ "$primary_listener_count" -ne 1 ]; then
+    fail "Primary must have exactly one listening socket; found $primary_listener_count"
+fi
 
 # Replica 启动前，写入带空格的数据；它应通过 Snapshot 全量同步。
 primary_response=$(
@@ -256,7 +360,7 @@ role = replica
 bind_ip = 127.0.0.1
 service_port = $REPLICA_PORT
 primary_host = 127.0.0.1
-primary_port = $REPLICATION_PORT
+primary_port = $PRIMARY_PORT
 log_level = info
 persistence_mode = legacy_hybrid
 EOF
@@ -306,4 +410,42 @@ echo "[PASS] ONLINE incremental synchronization with spaces"
 
 
 echo
+# Replica 已完成同步，现在停止它，检查 Primary 的空闲连接清理。
+kill "$REPLICA_PID"
+wait "$REPLICA_PID" || true
+REPLICA_PID=""
+
+python3 - "$PRIMARY_PID" <<'PY'
+import os
+import sys
+import time
+
+fd_dir = f"/proc/{int(sys.argv[1])}/fd"
+deadline = time.monotonic() + 3
+
+while True:
+    sockets = []
+
+    for name in os.listdir(fd_dir):
+        try:
+            target = os.readlink(f"{fd_dir}/{name}")
+        except FileNotFoundError:
+            continue
+
+        if target.startswith("socket:["):
+            sockets.append(name)
+
+    # 当前测试没有其他活动连接，只应剩下服务监听 socket。
+    if len(sockets) == 1:
+        break
+
+    if time.monotonic() >= deadline:
+        raise AssertionError(
+            f"Primary retained sockets after Replica disconnected: {sockets}"
+        )
+
+    time.sleep(0.05)
+
+print("[PASS] Primary releases idle disconnected Replica socket")
+PY
 echo "replication integration test passed"

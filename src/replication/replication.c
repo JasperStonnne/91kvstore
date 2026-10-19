@@ -533,7 +533,6 @@ int kvs_replication_stream(
         kvs_snapshot_reader_close(
             &replication_manager.snapshot_reader
         );
-        replication_manager.snapshot_connection_fd=-1;
         return -1;
     }
 
@@ -551,7 +550,6 @@ int kvs_replication_stream(
         long long catch_up_end=kvs_aof_get_offset();
         if(catch_up_end<
            replication_manager.replication_offset){
-            replication_manager.snapshot_connection_fd=-1;
             return -1;
         }
 
@@ -565,8 +563,6 @@ int kvs_replication_stream(
                 KVS_REPLICATION_PRIMARY_AOF_PATH,
                 replication_manager.replication_offset,
                 catch_up_end) < 0){
-
-            replication_manager.snapshot_connection_fd=-1;
             return -1;
         }
 
@@ -595,7 +591,6 @@ int kvs_replication_stream(
             kvs_aof_reader_close(
                 &replication_manager.aof_reader
             );
-            replication_manager.snapshot_connection_fd=-1;
             return -1;
         }
 
@@ -616,9 +611,8 @@ int kvs_replication_stream(
         // 再次取得 Primary 此刻最新的 AOF 末尾。
         long long latest_offset=kvs_aof_get_offset();
 
-        if(latest_offset<sent_offset){
-            replication_manager.snapshot_connection_fd=-1;
-            return -1; // AOF 被异常截断，无法继续按原 offset 追赶
+        if (latest_offset < sent_offset) {
+            return -1;
         }
         if(latest_offset>sent_offset){
         /*
@@ -631,7 +625,6 @@ int kvs_replication_stream(
                 sent_offset,
                 latest_offset) < 0){
 
-            replication_manager.snapshot_connection_fd=-1;
             return -1;
         }
 
@@ -663,7 +656,6 @@ int kvs_replication_stream(
 
         if(online_length<0 ||
            online_length>=output_capacity){
-            replication_manager.snapshot_connection_fd=-1;
             return -1;
         }
 
@@ -693,7 +685,6 @@ if(replication_manager.state==KVS_REPLICATION_STATE_ONLINE){
 
     if(latest_offset<
        replication_manager.replication_offset){
-        replication_manager.snapshot_connection_fd=-1;
         return -1; // AOF 被截断，原来的复制 offset 已经失效
     }
 
@@ -712,7 +703,6 @@ if(replication_manager.state==KVS_REPLICATION_STATE_ONLINE){
             replication_manager.replication_offset,
             latest_offset) < 0){
 
-        replication_manager.snapshot_connection_fd=-1;
         return -1;
     }
 
@@ -730,7 +720,6 @@ if(replication_manager.state==KVS_REPLICATION_STATE_ONLINE){
         kvs_aof_reader_close(
             &replication_manager.aof_reader
         );
-        replication_manager.snapshot_connection_fd=-1;
         return -1;
     }
 
@@ -980,6 +969,24 @@ int kvs_replication_init(
 
     return 0;
 }
+
+void kvs_replication_on_replica_disconnected(int connection_fd)
+{
+    if (!replication_manager.initialized ||
+        replication_manager.role != KVS_ROLE_PRIMARY ||
+        connection_fd < 0 ||
+        replication_manager.snapshot_connection_fd != connection_fd) {
+        return;
+    }
+
+    kvs_snapshot_reader_close(&replication_manager.snapshot_reader);
+    kvs_aof_reader_close(&replication_manager.aof_reader);
+
+    replication_manager.snapshot_connection_fd = -1;
+    replication_manager.snapshot_file_size = -1;
+    replication_manager.state = KVS_REPLICATION_STATE_DISCONNECTED;
+}
+
 void kvs_replication_destroy(void)
 {
     if (!replication_manager.initialized) {                   // 未初始化就不需要销毁

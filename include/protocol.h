@@ -70,4 +70,21 @@ int kvs_encode_value_response(
     size_t *encoded_bytes
 );
 
+typedef enum {
+    KVS_CONNECTION_NEED_MORE = 0,
+    KVS_CONNECTION_CLIENT,
+    KVS_CONNECTION_REPLICA,
+    KVS_CONNECTION_INVALID
+} kvs_connection_kind_t;
+
+/*
+ * 只检查连接起始字节，不修改或消费输入。
+ * length 为 0 时返回 NEED_MORE。
+ * input 在 length 大于 0 时必须有效。
+ */
+kvs_connection_kind_t kvs_identify_connection(
+    const char *input,
+    size_t length
+);
+
 #endif

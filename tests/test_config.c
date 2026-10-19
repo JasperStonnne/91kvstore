@@ -163,15 +163,16 @@ static void test_invalid_configs(void)
             "invalid bind_ip"
         },
         {
-            "primary missing replication port",
-            "role=primary\nservice_port=29000\n",
-            "requires replication_port"
-        },
-        {
-            "primary conflicting ports",
+            "primary rejects old equal replication port",
             "role=primary\nservice_port=29000\n"
             "replication_port=29000\n",
-            "service_port and replication_port must differ"
+            "replication_port has been removed; use service_port"
+        },
+        {
+            "primary rejects old different replication port",
+            "role=primary\nservice_port=29000\n"
+            "replication_port=29100\n",
+            "replication_port has been removed; use service_port"
         },
         {
             "replica missing primary host",
@@ -193,13 +194,13 @@ static void test_invalid_configs(void)
         {
             "primary rejects snapshot mode",
             "role=primary\nservice_port=29000\n"
-            "replication_port=29100\npersistence_mode=snapshot\n",
+            "persistence_mode=snapshot\n",
             "primary/replica currently support only"
         },
         {
             "primary rejects aof mode",
             "role=primary\nservice_port=29000\n"
-            "replication_port=29100\npersistence_mode=aof\n",
+            "persistence_mode=aof\n",
             "primary/replica currently support only"
         },
         {
@@ -290,17 +291,14 @@ static void test_valid_primary_and_replica(void)
         "role = primary\n"
         "bind_ip = 127.0.0.1\n"
         "service_port = 29000\n"
-        "replication_port = 29100\n"
         "log_level = error\n"
     );
 
     assert(primary.role == KVS_ROLE_PRIMARY);
     assert(strcmp(primary.bind_ip, "127.0.0.1") == 0);
     assert(primary.service_port == 29000);
-    assert(primary.replication_port == 29100);
     assert(primary.log_level == KVS_LOG_ERROR);
     assert(primary.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
-
     kvs_config_t replica = load_valid(
         "role = replica\n"
         "service_port = 29001\n"
@@ -361,7 +359,6 @@ static void test_example_config_files(void)
     assert(primary.role == KVS_ROLE_PRIMARY);
     assert(strcmp(primary.bind_ip, "127.0.0.1") == 0);
     assert(primary.service_port == 29000);
-    assert(primary.replication_port == 29100);
     assert(primary.log_level == KVS_LOG_INFO);
     assert(primary.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
 
@@ -370,7 +367,7 @@ static void test_example_config_files(void)
     assert(strcmp(replica.bind_ip, "127.0.0.1") == 0);
     assert(replica.service_port == 29001);
     assert(strcmp(replica.primary_host, "127.0.0.1") == 0);
-    assert(replica.primary_port == 29100);
+    assert(replica.primary_port == 29000);
     assert(replica.log_level == KVS_LOG_INFO);
     assert(replica.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
 
