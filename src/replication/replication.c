@@ -330,6 +330,38 @@ static int kvs_replication_catch_up_command_protocol(
     return 0;
 }
 
+/*
+ * 每次只处理一条复制控制行。
+ * 控制行可能改变复制阶段，剩余数据必须交回外层重新分流。
+ */
+static int kvs_replication_control_line_protocol(
+    int connection_fd,
+    char *msg,
+    int length,
+    char *response,
+    int response_capacity,
+    int *consumed_length,
+    kvs_frame_handler frame_handler)
+{
+    *consumed_length = 0;
+
+    for (int i = 0; i < length; i++) {
+        if (msg[i] == '\n') {
+            return kvs_line_batch_protocol(
+                connection_fd,
+                msg,
+                i + 1,
+                response,
+                response_capacity,
+                consumed_length,
+                frame_handler
+            );
+        }
+    }
+
+    return 0; /* 控制行尚未收完整，保留全部输入。 */
+}
+
 static int kvs_replication_upstream_network_protocol(
     int connection_fd,
     char *msg,
@@ -350,7 +382,7 @@ static int kvs_replication_upstream_network_protocol(
     return -1;
     }
     if(replication_manager.state==KVS_REPLICATION_STATE_HANDSHAKE){
-    return kvs_line_batch_protocol(
+    return kvs_replication_control_line_protocol(
         connection_fd,
         msg,
         length,
@@ -461,8 +493,8 @@ if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
         return 0; /* 复制命令不需要向 Primary 返回普通响应。 */
     }
 
-    /* 非 * 开头的数据仍按行处理，用于 ONLINE 状态控制消息。 */
-    return kvs_line_batch_protocol(
+   /* 只消费一条控制行，剩余数据交回外层重新判断。 */
+    return kvs_replication_control_line_protocol(
         connection_fd,
         msg,
         length,

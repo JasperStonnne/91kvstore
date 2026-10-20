@@ -412,6 +412,7 @@ UNIT_TEST_TARGETS := \
 	test-mapped-file \
 	test-aof-replay \
 	test-connection-protocol \
+	test-replication-boundary \
 	test-array-memory
 
 .PHONY: test-unit test-integration test
@@ -582,3 +583,18 @@ test-single-port: $(BIN_DIR)/kvstore
 	python3 -B $(TEST_DIR)/verify_single_port.py .
 
 test-integration: test-single-port
+
+.PHONY: test-replication-boundary
+
+test-replication-boundary: $(BIN_DIR)/test_replication_boundary
+	./$(BIN_DIR)/test_replication_boundary
+
+$(BIN_DIR)/test_replication_boundary: \
+	$(TEST_DIR)/test_replication_boundary.c \
+	$(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/ntyco.o,$(OBJS)) \
+	$(wildcard $(INCLUDE_DIR)/*.h) | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		$(TEST_DIR)/test_replication_boundary.c \
+		$(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/ntyco.o,$(OBJS)) \
+		-luring -lpthread -ldl -o $@
+include tests/demo.mk
