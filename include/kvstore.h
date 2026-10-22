@@ -10,8 +10,7 @@
 #include<stdlib.h>
 #include<stddef.h>
 #include <assert.h>
-#include<memory_pool.h>
-
+#include "kvs_allocator.h"
 #define KVS_MAX_TOKENS 128
 #define ENABLE_ARRAY 1
 #define ENABLE_RBTREE 1
@@ -86,7 +85,6 @@ typedef struct _rbtree_node {
 typedef struct _rbtree {
 	rbtree_node *root;
 	rbtree_node *nil;
-    memory_pool_t node_pool;
 } rbtree;
 
 
@@ -104,10 +102,6 @@ int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key);
 int kvs_rbtree_foreach(kvs_rbtree_t *inst,kvs_visit_handler visitor,void *context);
 
 #endif
-
-void *kvs_malloc(size_t size);
-void kvs_free(void *ptr);
-
 
 #if ENABLE_HASH
 
@@ -137,8 +131,6 @@ typedef struct hashtable_s {
 	int max_slots;
 	int count;
 
-    memory_pool_t node_pool;
-
 } hashtable_t;
 
 typedef struct hashtable_s kvs_hash_t;
@@ -167,7 +159,6 @@ typedef struct kvs_skiplist_node {
 typedef struct kvs_skiplist {
     int level;
     kvs_skiplist_node_t* header;
-    memory_pool_t node_pool;
 } kvs_skiplist_t;
 
 int  kvs_skiplist_create(kvs_skiplist_t *inst);

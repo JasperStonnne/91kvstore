@@ -3,8 +3,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
+#include "kvs_allocator.h"
 #include "persistence.h"
+
+/* 仅用于模拟 AOF 编码缓冲申请失败。 */
+static int fail_alloc = 0;
+
+void *kvs_malloc(size_t size)
+{
+    if (fail_alloc) {
+        return NULL;
+    }
+
+    return kvs_allocator_alloc(size);
+}
+
+void kvs_free(void *ptr)
+{
+    kvs_allocator_free(ptr);
+}
 
 /* 两条完整的 AOF 命令：HSET k 1、HSET k 2。 */
 #define FIRST_COMMAND  "*3\r\n$4\r\nHSET\r\n$1\r\nk\r\n$1\r\n1\r\n"
@@ -75,8 +92,57 @@ static void expect_replay(
     assert(memcmp(seen_values, expected_values, expected_count) == 0);
 }
 
+static void test_append(void)
+{
+    /* 独立临时文件，不使用服务已有的 AOF。 */
+    char path[] = "/tmp/91kv-aof-append-XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    assert(close(fd) == 0);
+
+    assert(kvs_aof_open(path) == 0);
+
+    char *first[] = {"HSET", "k", "1"};
+    char *failed[] = {"HSET", "k", "9"};
+    char *second[] = {"HSET", "k", "2"};
+
+    kvs_pool_stats_t stats;
+
+    /* 写请求结束后，encoded 应当已经释放。 */
+    assert(kvs_aof_append(first, 3) == 0);
+    assert(kvs_allocator_pool_stats(&stats) == 0);
+    assert(stats.live_objects == 0);
+
+    /* 申请失败不应追加命令，也不应推进写入位置。 */
+    fail_alloc = 1;
+    int result = kvs_aof_append(failed, 3);
+    fail_alloc = 0;
+
+    assert(result < 0);
+    assert(kvs_allocator_pool_stats(&stats) == 0);
+    assert(stats.live_objects == 0);
+
+    /* 失败之后仍能正常追加下一条命令。 */
+    assert(kvs_aof_append(second, 3) == 0);
+    assert(kvs_allocator_pool_stats(&stats) == 0);
+    assert(stats.live_objects == 0);
+
+    assert(kvs_aof_close() == 0);
+
+    /* 确认实际文件只有两条成功命令，没有失败的 value=9。 */
+    expect_replay(path, 0, 0, "12");
+
+    assert(unlink(path) == 0);
+    puts("[PASS] AOF append allocation failure and cleanup");
+}
+
 int main(void)
 {
+    assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
+
+    test_append();
+
+    /* 后面原有的回放测试保持原样。 */
     char path[] = "/tmp/91kv-aof-replay-XXXXXX";
     int fd = mkstemp(path);
     assert(fd >= 0);
@@ -128,5 +194,10 @@ int main(void)
     puts("[PASS] AOF empty and missing files");
 
     puts("AOF replay tests passed");
+    /* 所有测试对象释放后，才销毁 allocator。 */
+    kvs_pool_stats_t stats;
+    assert(kvs_allocator_pool_stats(&stats) == 0);
+    assert(stats.live_objects == 0);
+    assert(kvs_allocator_destroy() == 0);
     return 0;
 }

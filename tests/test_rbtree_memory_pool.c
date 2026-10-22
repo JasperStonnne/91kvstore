@@ -1,121 +1,213 @@
-// 验证红黑树接入内存池后的节点申请、归还、复用和销毁
+/* 验证红黑树通过统一 allocator 管理节点、nil、key/value。 */
 
 #include <assert.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
+#include "kvs_allocator.h"
 #include "kvstore.h"
 
-#ifndef KVS_RBTREE_USE_MEMORY_POOL
-#define KVS_RBTREE_USE_MEMORY_POOL 1
-#endif
-// 独立测试不链接 src/kvstore.c，
-// 因此在测试中提供 kvs_malloc/kvs_free。
-void *kvs_malloc(size_t size) {
-    return malloc(size);
+/*
+ * -1：不注入失败。
+ *  0：下一次申请失败。
+ *  N：允许 N 次申请成功，之后申请失败。
+ */
+static long fail_after = -1;
+
+/* 独立测试通过这两个入口连接真实 allocator。 */
+void *kvs_malloc(size_t size)
+{
+    if (fail_after == 0) {
+        return NULL;
+    }
+
+    if (fail_after > 0) {
+        fail_after--;
+    }
+
+    return kvs_allocator_alloc(size);
 }
 
-void kvs_free(void *ptr) {
-    free(ptr);
+void kvs_free(void *ptr)
+{
+    kvs_allocator_free(ptr);
 }
-int main(void) {
-    // 创建一个初始全为 0 的红黑树实例
+
+/* 只在 pool 模式检查内部存活对象数。 */
+static void check_pool(
+    kvs_allocator_backend_t backend,
+    size_t live_objects,
+    size_t large_count)
+{
+    if (backend != KVS_ALLOCATOR_POOL) {
+        return;
+    }
+
+    kvs_pool_stats_t stats;
+    assert(kvs_allocator_pool_stats(&stats) == 0);
+    assert(stats.live_objects == live_objects);
+    assert(stats.large_count == large_count);
+}
+
+static void check_value(
+    kvs_rbtree_t *tree,
+    char *key,
+    const char *expected)
+{
+    char *value = kvs_rbtree_get(tree, key);
+
+    assert(value != NULL);
+    assert(strcmp(value, expected) == 0);
+}
+
+static void test_backend(kvs_allocator_backend_t backend)
+{
     kvs_rbtree_t tree = {0};
+    fail_after = -1;
 
-    // create 应该初始化 nil 哨兵和 node_pool
+    assert(kvs_allocator_init(backend) == 0);
+
+    /* 创建时 nil 申请失败，不应留下半初始化的树。 */
+    fail_after = 0;
+    assert(kvs_rbtree_create(&tree) < 0);
+    fail_after = -1;
+
+    assert(tree.nil == NULL);
+    assert(tree.root == NULL);
+    check_pool(backend, 0, 0);
+
+    /* 空树只有一个动态对象：nil 哨兵。 */
     assert(kvs_rbtree_create(&tree) == 0);
-
-    // nil 是一个真实存在的哨兵节点
     assert(tree.nil != NULL);
-
-    // 刚创建的树没有普通节点，所以 root 指向 nil
     assert(tree.root == tree.nil);
+    check_pool(backend, 1, 0);
 
-    // 节点池使用懒扩容；尚未 SET，所以还没有 Chunk
-#if KVS_RBTREE_USE_MEMORY_POOL
-    assert(tree.node_pool.chunk_list == NULL);
-    assert(tree.node_pool.free_list == NULL);
-#endif
-    // 插入第一个普通红黑树节点
+    /*
+     * 新增记录需要三次申请：节点、key、value。
+     * 分别让这三处失败，检查之前申请的对象是否被清理。
+     */
+    for (long allowed = 0; allowed < 3; allowed++) {
+        fail_after = allowed;
+        assert(kvs_rbtree_set(&tree, "failed", "value") < 0);
+        fail_after = -1;
+
+        assert(tree.root == tree.nil);
+        assert(kvs_rbtree_get(&tree, "failed") == NULL);
+        check_pool(backend, 1, 0);
+    }
+
     assert(kvs_rbtree_set(&tree, "name", "Jasper") == 0);
+    check_value(&tree, "name", "Jasper");
 
-    // 插入后，根节点不再是 nil
-    assert(tree.root != tree.nil);
+    /* nil + 普通节点 + key + value。 */
+    check_pool(backend, 4, 0);
 
-    // 第一次申请节点会触发 node_pool 创建 Chunk
-#if KVS_RBTREE_USE_MEMORY_POOL
-    assert(tree.node_pool.chunk_list != NULL);
-#endif
+    rbtree_node *original_node = tree.root;
 
-    // 验证业务数据正常
-    char *value = kvs_rbtree_get(&tree, "name");
-    assert(value != NULL);
-    assert(strcmp(value, "Jasper") == 0);
+    /* SET 覆盖失败，旧 value 和节点必须保持有效。 */
+    fail_after = 0;
+    assert(kvs_rbtree_set(&tree, "name", "Another") < 0);
+    fail_after = -1;
 
-    // 当前树只有一个普通节点，记录它的地址。
-    rbtree_node *first_node = tree.root;
-    assert(first_node != NULL);
+    assert(tree.root == original_node);
+    check_value(&tree, "name", "Jasper");
+    check_pool(backend, 4, 0);
 
-    // 重复 SET 覆盖 value，复用原来的节点。
+    /* MOD 失败同样必须保留旧 value。 */
+    fail_after = 0;
+    assert(kvs_rbtree_mod(&tree, "name", "Stone") < 0);
+    fail_after = -1;
+
+    check_value(&tree, "name", "Jasper");
+    check_pool(backend, 4, 0);
+
+    /* 成功覆盖只替换 value，不增加节点。 */
     assert(kvs_rbtree_set(&tree, "name", "Another") == 0);
-    assert(tree.root == first_node);
+    assert(tree.root == original_node);
+    check_value(&tree, "name", "Another");
 
-    value = kvs_rbtree_get(&tree, "name");
-    assert(value != NULL);
-    assert(strcmp(value, "Another") == 0);
+    assert(kvs_rbtree_mod(&tree, "name", "Stone") == 0);
+    check_value(&tree, "name", "Stone");
+    check_pool(backend, 4, 0);
 
-    // 删除唯一的普通节点。
+    /* MOD 不得创建不存在的 key。 */
+    assert(kvs_rbtree_mod(&tree, "missing", "value") == 1);
+    assert(kvs_rbtree_get(&tree, "missing") == NULL);
+    check_pool(backend, 4, 0);
+
+    /* 空字符串仍需要存放结尾的 '\0'。 */
+    assert(kvs_rbtree_mod(&tree, "name", "") == 0);
+    check_value(&tree, "name", "");
+    check_pool(backend, 4, 0);
+
+    /* 超过 4096 字节的 value 应走自研池大对象路径。 */
+    char long_value[8193];
+    memset(long_value, 'x', sizeof(long_value) - 1);
+    long_value[sizeof(long_value) - 1] = '\0';
+
+    assert(kvs_rbtree_mod(&tree, "name", long_value) == 0);
+    check_value(&tree, "name", long_value);
+    check_pool(backend, 4, 1);
+
+    /* 大 value 改回小 value，旧的大对象必须被释放。 */
+    assert(kvs_rbtree_mod(&tree, "name", "small") == 0);
+    check_value(&tree, "name", "small");
+    check_pool(backend, 4, 0);
+
     assert(kvs_rbtree_del(&tree, "name") == 0);
-
-    // 节点删除后，树重新变成空树
     assert(tree.root == tree.nil);
+    assert(kvs_rbtree_get(&tree, "name") == NULL);
+    check_pool(backend, 1, 0);
 
-    // 被删除的节点 Block 应该位于 free_list 表头
-#if KVS_RBTREE_USE_MEMORY_POOL
-    assert(tree.node_pool.free_list ==(free_node_t *)first_node);
-#endif
+    assert(kvs_rbtree_del(&tree, "missing") == 1);
+    check_pool(backend, 1, 0);
 
-    // 插入一个不同的业务节点
-    assert(kvs_rbtree_set(&tree, "city", "Shanghai") == 0);
+    /*
+     * 构造多节点树，删除有两个孩子的根节点。
+     * 验证删除过程中交换 key/value 后，剩余数据仍然正确。
+     */
+    char *keys[] = {"m", "g", "t", "d", "j", "p", "w"};
+    char *values[] = {"M", "G", "T", "D", "J", "P", "W"};
+    const size_t count = sizeof(keys) / sizeof(keys[0]);
 
-    // 当前又只有一个普通节点，所以它就是 root
-    rbtree_node *second_node = tree.root;
-    assert(second_node != tree.nil);
-#if KVS_RBTREE_USE_MEMORY_POOL
-    // Free List 采用头插、头取，应该复用刚才归还的 Block
-    assert(second_node == first_node);
-#endif
-    // 验证复用 Block 后，新 key/value 没有受到旧数据影响
-    value = kvs_rbtree_get(&tree, "city");
-    assert(value != NULL);
-    assert(strcmp(value, "Shanghai") == 0);
+    for (size_t i = 0; i < count; i++) {
+        assert(kvs_rbtree_set(&tree, keys[i], values[i]) == 0);
+    }
+    check_pool(backend, 1 + 3 * count, 0);
 
-    printf("first node  = %p\n", (void *)first_node);
-#if KVS_RBTREE_USE_MEMORY_POOL
-    printf("second node = %p (reused)\n", (void *)second_node);
-#else
-printf("second node = %p (malloc mode)\n", (void *)second_node);
-#endif
-        // 再插入多个节点，构造不止一个节点的红黑树
-    assert(kvs_rbtree_set(&tree, "alpha", "1") == 0);
-    assert(kvs_rbtree_set(&tree, "echo", "5") == 0);
-    assert(kvs_rbtree_set(&tree, "bravo", "2") == 0);
-    assert(kvs_rbtree_set(&tree, "delta", "4") == 0);
+    assert(tree.root->left != tree.nil);
+    assert(tree.root->right != tree.nil);
 
-    // 销毁红黑树：
-    // 释放所有 key/value、普通节点、nil 和内存池 Chunk
+    /* 删除会释放原 key，必须先复制到独立的栈空间。 */
+    char deleted_key[32];
+    snprintf(deleted_key, sizeof(deleted_key), "%s", tree.root->key);
+
+    assert(kvs_rbtree_del(&tree, deleted_key) == 0);
+    assert(kvs_rbtree_get(&tree, deleted_key) == NULL);
+
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(keys[i], deleted_key) != 0) {
+            check_value(&tree, keys[i], values[i]);
+        }
+    }
+    check_pool(backend, 1 + 3 * (count - 1), 0);
+
+    /* 故意保留剩余节点，由 destroy 释放整棵树及 nil。 */
     kvs_rbtree_destory(&tree);
 
-    // 销毁后不应保留失效的树指针
     assert(tree.root == NULL);
     assert(tree.nil == NULL);
-#if KVS_RBTREE_USE_MEMORY_POOL
-    // 内存池持有的 Chunk 和空闲链表都应该被清空
-    assert(tree.node_pool.chunk_list == NULL);
-    assert(tree.node_pool.free_list == NULL);
-#endif
-    printf("rbtree memory allocator test passed\n");
+    check_pool(backend, 0, 0);
 
+    assert(kvs_allocator_destroy() == 0);
+
+    printf("[PASS] RBTree lifecycle and failures allocator=%s\n",
+           backend == KVS_ALLOCATOR_SYSTEM ? "system" : "pool");
+}
+
+int main(void)
+{
+    test_backend(KVS_ALLOCATOR_SYSTEM);
+    test_backend(KVS_ALLOCATOR_POOL);
     return 0;
 }

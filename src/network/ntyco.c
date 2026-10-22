@@ -4,7 +4,7 @@
 
 #include "nty_coroutine.h"
 #include "server.h"
-#include "memory_pool.h"
+#include "kvs_allocator.h"
 #include "log.h"
 #include "protocol.h"
 #include <arpa/inet.h>
@@ -13,7 +13,6 @@
 #include <time.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#define NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK 64
 #define NTYCO_MAX_LISTENER_COUNT 2
 #define NTYCO_MAX_CONNECTOR_COUNT 1 // 当前一台 Replica 只连接一个 Primary
 #define NTYCO_STREAM_RETRY_INTERVAL_MS 50
@@ -26,7 +25,6 @@ typedef struct {
 	int listen_fd; /* 本监听器拥有的 socket；-1 表示尚未创建。 */
 	msg_handler handler;
 	kvs_connection_stream_handler stream_handler; // 当前监听器的可选流式输出函数
-	memory_pool_t connection_pool;  // 连接上下文专用池
 	msg_handler replication_handler;
     kvs_connection_stream_handler replication_stream_handler;
 	kvs_connection_close_handler replication_close_handler;
@@ -37,7 +35,8 @@ typedef struct {
 	msg_handler handler;
 	kvs_connection_stream_handler stream_handler; // 该连接可选的流式输出函数
 	kvs_connection_close_handler close_handler; // 连接关闭时通知业务层，可以为 NULL
-	memory_pool_t *pool;
+	/* 1：由 kvs_malloc 申请；0：借用调用者的对象。 */
+	int heap_owned;
 	msg_handler replication_handler;
     kvs_connection_stream_handler replication_stream_handler;
 	long long identification_deadline_ms;
@@ -160,11 +159,7 @@ static int ntyco_listener_context_init(
 		context->replication_handler = config->replication_handler;
 		context->replication_stream_handler =config->replication_stream_handler;
 		context->replication_close_handler =config->replication_close_handler;
-        return memory_pool_init(
-                &context->connection_pool,
-                sizeof(ntyco_connection_context_t),
-                NTYCO_CONNECTION_CONTEXT_BLOCKS_PER_CHUNK
-        );
+		return 0;
 }
 
 static void ntyco_listener_context_destroy(
@@ -177,7 +172,6 @@ static void ntyco_listener_context_destroy(
 			close(context->listen_fd);
 			context->listen_fd = -1;
 		}
-        memory_pool_destory(&context->connection_pool);
 }
 
 /*
@@ -300,10 +294,10 @@ void server_reader(void *arg) {
     int protocol_selected = (replication_handler == NULL);
 	long long identification_deadline_ms =context->identification_deadline_ms;
 
-    memory_pool_t *pool = context->pool;
-    if (pool != NULL) {
-        memory_pool_free(pool, context);
-    }
+	/* 所需参数已经复制到上面的局部变量，归还动态上下文。 */
+	if (context->heap_owned) {
+		kvs_free(context);
+	}
 	int ret = 0;//保存recv send的返回值
 	kvs_input_buffer_t input={0};//跨循环 保存请求数
 	kvs_output_buffer_t output={0};//保存当前链接尚未发送完的响应
@@ -558,7 +552,7 @@ static void ntyco_connector(void *arg)
 		.handler=context->message_handler,
 		.stream_handler=NULL, // Replica 上游连接当前只接收 Snapshot，不负责流式发送
 		.close_handler=context->close_handler,
-		.pool=NULL
+        .heap_owned = 0
 	};
 
 	server_reader(&connection);
@@ -608,7 +602,7 @@ void server(void *arg) {
         }
 		/* 只在 DEBUG 下记录连接建立；不打印每条请求或请求内容。 */
 		kvs_log_message(KVS_LOG_DEBUG, "client accepted fd=%d\n", cli_fd);
-		ntyco_connection_context_t *connection = memory_pool_alloc(&context->connection_pool);
+	ntyco_connection_context_t *connection =kvs_malloc(sizeof(*connection));
 		if(connection==NULL){
 			nty_close(cli_fd);
 			continue;
@@ -621,11 +615,12 @@ void server(void *arg) {
 		connection->replication_stream_handler =context->replication_stream_handler;
 		connection->replication_close_handler =context->replication_close_handler;
 		connection->close_handler=NULL; // 普通客户端连接不需要复制断开通知
-		connection->pool=&context->connection_pool;
+		connection->heap_owned = 1; /* 由读协程负责释放。 */
 		nty_coroutine *read_co;
+
 		if(nty_coroutine_create(&read_co, server_reader, connection)!=0){
 			nty_close(cli_fd);
-			memory_pool_free(&context->connection_pool,connection);
+			kvs_free(connection);
 		}
 
 	}

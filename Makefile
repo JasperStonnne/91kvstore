@@ -1,14 +1,6 @@
 CC := gcc
 
-# 1：Hash 节点使用内存池
-# 0：Hash 节点使用 malloc
-HASH_USE_MEMORY_POOL ?= 1
-# 1：红黑树节点使用内存池
-# 0：红黑树节点使用 malloc
-RBTREE_USE_MEMORY_POOL ?= 1
-# 1：跳表普通节点使用内存池
-# 0：跳表普通节点使用 malloc
-SKIPLIST_USE_MEMORY_POOL ?= 1
+
 
 SRC_DIR := src
 ENGINE_DIR := $(SRC_DIR)/engines
@@ -27,18 +19,9 @@ BIN_DIR := bin
 
 CPPFLAGS := \
 	-I$(INCLUDE_DIR) \
-	-I$(NTYCO_DIR)/core \
-	-DKVS_HASH_USE_MEMORY_POOL=$(HASH_USE_MEMORY_POOL) \
-	-DKVS_RBTREE_USE_MEMORY_POOL=$(RBTREE_USE_MEMORY_POOL) \
-	-DKVS_SKIPLIST_USE_MEMORY_POOL=$(SKIPLIST_USE_MEMORY_POOL)
+	-I$(NTYCO_DIR)/core
 
 CFLAGS := -std=gnu11 -Wall -Wextra -g
-BENCH_CFLAGS := $(CFLAGS) -O2 -Werror
-
-ARRAY_USE_JEMALLOC ?= 0
-ARRAY_BENCH_DEFINE := $(if $(filter 1,$(ARRAY_USE_JEMALLOC)),-DKVS_BENCHMARK_JEMALLOC)
-ARRAY_BENCH_LIB := $(if $(filter 1,$(ARRAY_USE_JEMALLOC)),-ljemalloc)
-
 
 LDFLAGS := -L$(NTYCO_DIR)
 LDLIBS := -lntyco -lpthread -ldl
@@ -59,26 +42,17 @@ OBJS := \
 	$(BUILD_DIR)/mapped_file.o \
 	$(BUILD_DIR)/uring_io.o \
 	$(BUILD_DIR)/replication.o \
-	$(BUILD_DIR)/memory_pool.o \
+	$(BUILD_DIR)/kvs_allocator.o \
 	$(BUILD_DIR)/buffer.o
 
 
 .PHONY: \
 	all \
 	testcase \
-	test-memory-pool \
 	test-hash-memory-pool \
-	benchmark-hash \
-	benchmark-hash-memory \
 	test-rbtree-memory-pool \
-	benchmark-rbtree \
-	benchmark-rbtree-memory \
 	test-skiplist-memory-pool \
-	benchmark-skiplist \
-	benchmark-skiplist-memory \
 	test-array-memory \
-	benchmark-array \
-	benchmark-array-memory \
 	clean
 
 all: $(BIN_DIR)/kvstore
@@ -122,7 +96,7 @@ $(BUILD_DIR)/codec.o: \
 $(BUILD_DIR)/ntyco.o: \
 	$(NETWORK_DIR)/ntyco.c \
 	$(INCLUDE_DIR)/server.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kvs_array.o: \
@@ -133,13 +107,13 @@ $(BUILD_DIR)/kvs_array.o: \
 $(BUILD_DIR)/kvs_rbtree.o: \
 	$(ENGINE_DIR)/kvs_rbtree.c \
 	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kvs_hash.o: \
 	$(ENGINE_DIR)/kvs_hash.c \
 	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kvs_skiplist.o: \
@@ -150,6 +124,7 @@ $(BUILD_DIR)/kvs_skiplist.o: \
 $(BUILD_DIR)/aof.o: \
     $(PERSISTENCE_DIR)/aof.c \
     $(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/kvs_allocator.h \
     $(INCLUDE_DIR)/mapped_file.h \
     $(INCLUDE_DIR)/uring_io.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -164,10 +139,11 @@ $(BUILD_DIR)/snapshot_store.o: \
 	$(PERSISTENCE_DIR)/snapshot_store.c \
 	$(INCLUDE_DIR)/persistence.h \
 	$(INCLUDE_DIR)/mapped_file.h \
+	$(INCLUDE_DIR)/kvs_allocator.h \
     $(INCLUDE_DIR)/uring_io.h \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/protocol.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/mapped_file.o: \
@@ -187,14 +163,10 @@ $(BUILD_DIR)/replication.o: \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/memory_pool.o: \
-	$(MEMORY_DIR)/memory_pool.c \
-	$(INCLUDE_DIR)/memory_pool.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
 $(BUILD_DIR)/buffer.o: \
 	$(NETWORK_DIR)/buffer.c \
-	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
+	$(INCLUDE_DIR)/server.h \
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BIN_DIR)/testcase: \
@@ -213,66 +185,23 @@ $(BIN_DIR)/test_protocol: \
 		$(SRC_DIR)/protocol/codec.c \
 		-o $@
 
-test-memory-pool: $(BIN_DIR)/test_memory_pool
-	./$(BIN_DIR)/test_memory_pool
-
-$(BIN_DIR)/test_memory_pool: \
-	$(TEST_DIR)/test_memory_pool.c \
-	$(MEMORY_DIR)/memory_pool.c \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
-		-fsanitize=address \
-		-fno-omit-frame-pointer \
-		$(TEST_DIR)/test_memory_pool.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $@
-
 test-hash-memory-pool: $(BIN_DIR)/test_hash_memory_pool
 	./$(BIN_DIR)/test_hash_memory_pool
 
 $(BIN_DIR)/test_hash_memory_pool: \
 	$(TEST_DIR)/test_hash_memory_pool.c \
 	$(ENGINE_DIR)/kvs_hash.c \
-	$(MEMORY_DIR)/memory_pool.c \
+	$(MEMORY_DIR)/kvs_allocator.c \
 	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
 		-fsanitize=address \
 		-fno-omit-frame-pointer \
 		$(TEST_DIR)/test_hash_memory_pool.c \
 		$(ENGINE_DIR)/kvs_hash.c \
-		$(MEMORY_DIR)/memory_pool.c \
+		$(MEMORY_DIR)/kvs_allocator.c \
 		-o $@
 
-# 编译 Hash 分配速度测试，不自动运行。
-#
-# 使用方法：
-# make HASH_USE_MEMORY_POOL=1 benchmark-hash
-# ./bin/benchmark_hash_allocator
-#
-# make HASH_USE_MEMORY_POOL=0 benchmark-hash
-# ./bin/benchmark_hash_allocator
-benchmark-hash: | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
-		$(TEST_DIR)/benchmark_hash_allocator.c \
-		$(ENGINE_DIR)/kvs_hash.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $(BIN_DIR)/benchmark_hash_allocator
-
-# 编译 Hash 内存占用测试，不自动运行。
-#
-# 使用方法：
-# make HASH_USE_MEMORY_POOL=1 benchmark-hash-memory
-# ./bin/benchmark_hash_memory
-#
-# make HASH_USE_MEMORY_POOL=0 benchmark-hash-memory
-# ./bin/benchmark_hash_memory
-benchmark-hash-memory: | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
-		$(TEST_DIR)/benchmark_hash_memory.c \
-		$(ENGINE_DIR)/kvs_hash.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $(BIN_DIR)/benchmark_hash_memory
 
 test-rbtree-memory-pool: $(BIN_DIR)/test_rbtree_memory_pool
 	./$(BIN_DIR)/test_rbtree_memory_pool
@@ -280,45 +209,16 @@ test-rbtree-memory-pool: $(BIN_DIR)/test_rbtree_memory_pool
 $(BIN_DIR)/test_rbtree_memory_pool: \
 	$(TEST_DIR)/test_rbtree_memory_pool.c \
 	$(ENGINE_DIR)/kvs_rbtree.c \
-	$(MEMORY_DIR)/memory_pool.c \
-	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(MEMORY_DIR)/kvs_allocator.c \
+	$(INCLUDE_DIR)/kvs_allocator.h \
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
 		-fsanitize=address \
 		-fno-omit-frame-pointer \
 		$(TEST_DIR)/test_rbtree_memory_pool.c \
 		$(ENGINE_DIR)/kvs_rbtree.c \
-		$(MEMORY_DIR)/memory_pool.c \
+		$(MEMORY_DIR)/kvs_allocator.c \
 		-o $@
-# 编译红黑树节点分配速度测试，不自动运行。
-#
-# 使用方法：
-# make RBTREE_USE_MEMORY_POOL=1 benchmark-rbtree
-# ./bin/benchmark_rbtree_allocator
-#
-# make RBTREE_USE_MEMORY_POOL=0 benchmark-rbtree
-# ./bin/benchmark_rbtree_allocator
-benchmark-rbtree: | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
-		$(TEST_DIR)/benchmark_rbtree_allocator.c \
-		$(ENGINE_DIR)/kvs_rbtree.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $(BIN_DIR)/benchmark_rbtree_allocator
-
-# 编译红黑树内存占用测试，不自动运行。
-#
-# 使用方法：
-# make RBTREE_USE_MEMORY_POOL=1 benchmark-rbtree-memory
-# ./bin/benchmark_rbtree_memory
-#
-# make RBTREE_USE_MEMORY_POOL=0 benchmark-rbtree-memory
-# ./bin/benchmark_rbtree_memory
-benchmark-rbtree-memory: | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
-		$(TEST_DIR)/benchmark_rbtree_memory.c \
-		$(ENGINE_DIR)/kvs_rbtree.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $(BIN_DIR)/benchmark_rbtree_memory
 
 test-skiplist-memory-pool: $(BIN_DIR)/test_skiplist_memory_pool
 	./$(BIN_DIR)/test_skiplist_memory_pool
@@ -326,46 +226,17 @@ test-skiplist-memory-pool: $(BIN_DIR)/test_skiplist_memory_pool
 $(BIN_DIR)/test_skiplist_memory_pool: \
 	$(TEST_DIR)/test_skiplist_memory_pool.c \
 	$(ENGINE_DIR)/kvs_skiplist.c \
-	$(MEMORY_DIR)/memory_pool.c \
+	$(MEMORY_DIR)/kvs_allocator.c \
 	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(INCLUDE_DIR)/kvs_allocator.h \
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
 		-fsanitize=address \
 		-fno-omit-frame-pointer \
 		$(TEST_DIR)/test_skiplist_memory_pool.c \
 		$(ENGINE_DIR)/kvs_skiplist.c \
-		$(MEMORY_DIR)/memory_pool.c \
+		$(MEMORY_DIR)/kvs_allocator.c \
 		-o $@
-
-# 编译跳表节点分配速度测试，不自动运行。
-#
-# 使用方法：
-# make SKIPLIST_USE_MEMORY_POOL=1 benchmark-skiplist
-# ./bin/benchmark_skiplist_allocator
-#
-# make SKIPLIST_USE_MEMORY_POOL=0 benchmark-skiplist
-# ./bin/benchmark_skiplist_allocator
-benchmark-skiplist: | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
-		$(TEST_DIR)/benchmark_skiplist_allocator.c \
-		$(ENGINE_DIR)/kvs_skiplist.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $(BIN_DIR)/benchmark_skiplist_allocator
-
-# 编译跳表内存占用测试，不自动运行。
-#
-# 使用方法：
-# make SKIPLIST_USE_MEMORY_POOL=1 benchmark-skiplist-memory
-# ./bin/benchmark_skiplist_memory
-#
-# make SKIPLIST_USE_MEMORY_POOL=0 benchmark-skiplist-memory
-# ./bin/benchmark_skiplist_memory
-benchmark-skiplist-memory: | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
-		$(TEST_DIR)/benchmark_skiplist_memory.c \
-		$(ENGINE_DIR)/kvs_skiplist.c \
-		$(MEMORY_DIR)/memory_pool.c \
-		-o $(BIN_DIR)/benchmark_skiplist_memory
 
 test-array-memory: $(BIN_DIR)/test_array_memory
 	./$(BIN_DIR)/test_array_memory
@@ -373,29 +244,16 @@ test-array-memory: $(BIN_DIR)/test_array_memory
 $(BIN_DIR)/test_array_memory: \
 	$(TEST_DIR)/test_array_memory.c \
 	$(ENGINE_DIR)/kvs_array.c \
-	$(INCLUDE_DIR)/kvstore.h | $(BIN_DIR)
+	$(MEMORY_DIR)/kvs_allocator.c \
+	$(INCLUDE_DIR)/kvstore.h \
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
 		-fsanitize=address \
 		-fno-omit-frame-pointer \
 		$(TEST_DIR)/test_array_memory.c \
 		$(ENGINE_DIR)/kvs_array.c \
+		$(MEMORY_DIR)/kvs_allocator.c \
 		-o $@
-
-benchmark-array: | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
-		$(ARRAY_BENCH_DEFINE) \
-		$(TEST_DIR)/benchmark_array_allocator.c \
-		$(ENGINE_DIR)/kvs_array.c \
-		$(ARRAY_BENCH_LIB) \
-		-o $(BIN_DIR)/benchmark_array_allocator
-
-benchmark-array-memory: | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) \
-		$(ARRAY_BENCH_DEFINE) \
-		$(TEST_DIR)/benchmark_array_memory.c \
-		$(ENGINE_DIR)/kvs_array.c \
-		$(ARRAY_BENCH_LIB) \
-		-o $(BIN_DIR)/benchmark_array_memory
 
 clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
@@ -405,7 +263,6 @@ UNIT_TEST_TARGETS := \
 	test-protocol \
 	test-config \
 	test-snapshot \
-	test-memory-pool \
 	test-hash-memory-pool \
 	test-rbtree-memory-pool \
 	test-skiplist-memory-pool \
@@ -413,8 +270,9 @@ UNIT_TEST_TARGETS := \
 	test-aof-replay \
 	test-connection-protocol \
 	test-replication-boundary \
-	test-array-memory
-
+	test-array-memory \
+    test-allocator \
+    test-buffer-allocator
 .PHONY: test-unit test-integration test
 
 test-unit:
@@ -480,13 +338,14 @@ $(BIN_DIR)/test_snapshot_store: \
 	$(ENGINE_DIR)/kvs_rbtree.c \
 	$(ENGINE_DIR)/kvs_hash.c \
 	$(ENGINE_DIR)/kvs_skiplist.c \
-	$(MEMORY_DIR)/memory_pool.c \
+	$(MEMORY_DIR)/kvs_allocator.c \
+	$(INCLUDE_DIR)/kvs_allocator.h \
 	$(INCLUDE_DIR)/persistence.h \
 	$(INCLUDE_DIR)/mapped_file.h \
 	$(INCLUDE_DIR)/uring_io.h \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/protocol.h \
-	$(INCLUDE_DIR)/memory_pool.h | $(BIN_DIR)
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
 		$(TEST_DIR)/test_snapshot_store.c \
 		$(PERSISTENCE_DIR)/snapshot_store.c \
@@ -496,7 +355,7 @@ $(BIN_DIR)/test_snapshot_store: \
 		$(ENGINE_DIR)/kvs_rbtree.c \
 		$(ENGINE_DIR)/kvs_hash.c \
 		$(ENGINE_DIR)/kvs_skiplist.c \
-		$(MEMORY_DIR)/memory_pool.c \
+		$(MEMORY_DIR)/kvs_allocator.c \
 		-o $@ -luring
 .PHONY: test-snapshot-restart
 
@@ -532,22 +391,25 @@ test-aof-replay: $(BIN_DIR)/test_aof_replay
 	./$(BIN_DIR)/test_aof_replay
 
 $(BIN_DIR)/test_aof_replay: \
-    $(TEST_DIR)/test_aof_replay.c \
-    $(PERSISTENCE_DIR)/aof.c \
-    $(PERSISTENCE_DIR)/mapped_file.c \
-    $(PERSISTENCE_DIR)/uring_io.c \
-    $(SRC_DIR)/protocol/codec.c \
-    $(INCLUDE_DIR)/persistence.h \
-    $(INCLUDE_DIR)/mapped_file.h \
-    $(INCLUDE_DIR)/uring_io.h \
-    $(INCLUDE_DIR)/protocol.h | $(BIN_DIR)
+	$(TEST_DIR)/test_aof_replay.c \
+	$(PERSISTENCE_DIR)/aof.c \
+	$(PERSISTENCE_DIR)/mapped_file.c \
+	$(PERSISTENCE_DIR)/uring_io.c \
+	$(SRC_DIR)/protocol/codec.c \
+	$(MEMORY_DIR)/kvs_allocator.c \
+	$(INCLUDE_DIR)/kvs_allocator.h \
+	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/mapped_file.h \
+	$(INCLUDE_DIR)/uring_io.h \
+	$(INCLUDE_DIR)/protocol.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
-	    $(TEST_DIR)/test_aof_replay.c \
-	    $(PERSISTENCE_DIR)/aof.c \
-	    $(PERSISTENCE_DIR)/mapped_file.c \
-	    $(PERSISTENCE_DIR)/uring_io.c \
-	    $(SRC_DIR)/protocol/codec.c \
-	    -o $@ -luring
+		$(TEST_DIR)/test_aof_replay.c \
+		$(PERSISTENCE_DIR)/aof.c \
+		$(PERSISTENCE_DIR)/mapped_file.c \
+		$(PERSISTENCE_DIR)/uring_io.c \
+		$(SRC_DIR)/protocol/codec.c \
+		$(MEMORY_DIR)/kvs_allocator.c \
+		-o $@ -luring
 
 .PHONY: test-uring-io
 
@@ -598,3 +460,41 @@ $(BIN_DIR)/test_replication_boundary: \
 		$(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/ntyco.o,$(OBJS)) \
 		-luring -lpthread -ldl -o $@
 include tests/demo.mk
+
+.PHONY: test-allocator
+
+test-allocator: $(BIN_DIR)/test_allocator
+	./$(BIN_DIR)/test_allocator
+
+$(BIN_DIR)/test_allocator: \
+	$(TEST_DIR)/test_allocator.c \
+	$(MEMORY_DIR)/kvs_allocator.c \
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		$(TEST_DIR)/test_allocator.c \
+		$(MEMORY_DIR)/kvs_allocator.c \
+		-o $@
+
+$(BUILD_DIR)/kvs_allocator.o: \
+	$(MEMORY_DIR)/kvs_allocator.c \
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+.PHONY: test-buffer-allocator
+
+test-buffer-allocator: $(BIN_DIR)/test_buffer_allocator
+	./$(BIN_DIR)/test_buffer_allocator
+
+$(BIN_DIR)/test_buffer_allocator: \
+	$(TEST_DIR)/test_buffer_allocator.c \
+	$(NETWORK_DIR)/buffer.c \
+	$(MEMORY_DIR)/kvs_allocator.c \
+	$(INCLUDE_DIR)/server.h \
+	$(INCLUDE_DIR)/kvs_allocator.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
+		-fsanitize=address,undefined \
+		-fno-omit-frame-pointer \
+		$(TEST_DIR)/test_buffer_allocator.c \
+		$(NETWORK_DIR)/buffer.c \
+		$(MEMORY_DIR)/kvs_allocator.c \
+		-o $@

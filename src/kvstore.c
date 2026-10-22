@@ -1,6 +1,7 @@
 //kvstore.c
 
 #include"kvstore.h"
+#include "kvs_allocator.h"
 #include "persistence.h"
 #include "replication.h"
 #include "server.h"
@@ -31,15 +32,16 @@ extern kvs_hash_t global_hash;
 extern kvs_skiplist_t global_skiplist;
 #endif
 
-void *kvs_malloc(size_t size){
-
-
-    return malloc(size);
+/* 统一分配入口，由 allocator 决定使用哪个后端。 */
+void *kvs_malloc(size_t size)
+{
+    return kvs_allocator_alloc(size);
 }
 
-void kvs_free(void *ptr){
-
-    return free(ptr);
+/* 与统一分配入口配对使用。 */
+void kvs_free(void *ptr)
+{
+    kvs_allocator_free(ptr);
 }
 
 const char *command[]={
@@ -153,7 +155,7 @@ static int kvs_fields_to_tokens(
             goto fail;
         }
 
-        tokens[i] = malloc(fields[i].length + 1);
+        tokens[i] = kvs_malloc(fields[i].length + 1);
         if (tokens[i] == NULL) goto fail;
 
         memcpy(tokens[i], fields[i].data, fields[i].length);
@@ -163,7 +165,7 @@ static int kvs_fields_to_tokens(
 
 fail:
     for (size_t i = 0; i < field_count; i++) {
-        free(tokens[i]);
+        kvs_free(tokens[i]);
         tokens[i] = NULL;
     }
     return -1;
@@ -698,7 +700,7 @@ static int kvs_execute_fields(
         }
 
         for (size_t i = 0; i < field_count; i++) {
-            free(tokens[i]);
+            kvs_free(tokens[i]);
         }
         return result;
     }
@@ -732,7 +734,7 @@ static int kvs_execute_fields(
         }
 
         for (size_t i = 0; i < field_count; i++) {
-            free(tokens[i]);
+            kvs_free(tokens[i]);
         }
         return result;
     }
@@ -769,7 +771,7 @@ static int kvs_execute_fields(
             }
 
             for (size_t i = 0; i < field_count; i++) {
-                free(tokens[i]);
+                kvs_free(tokens[i]);
             }
             return written;
         }
@@ -788,7 +790,7 @@ static int kvs_execute_fields(
         }
 
         for (size_t i = 0; i < field_count; i++) {
-            free(tokens[i]);
+            kvs_free(tokens[i]);
         }
         return result;
     }
@@ -821,7 +823,7 @@ static int kvs_execute_fields(
             }
 
             for (size_t i = 0; i < field_count; i++) {
-                free(tokens[i]);
+                kvs_free(tokens[i]);
             }
 
             return result;
@@ -958,7 +960,7 @@ static int kvs_execute_fields(
     }
 
     for (size_t i = 0; i < field_count; i++) {
-        free(tokens[i]);
+        kvs_free(tokens[i]);
     }
 
     return result;
@@ -1105,30 +1107,91 @@ static int kvs_network_protocol(
         return response_length;
 
 }
-int init_kvengine(void){
+int init_kvengine(void)
+{
+    int failed = 0;
 
 #if ENABLE_ARRAY
-    memset(&global_array,0,sizeof(kvs_array_t));
-    kvs_array_create(&global_array);
+    int array_created = 0;
+
+    memset(&global_array, 0, sizeof(global_array));
+    if (kvs_array_create(&global_array) != 0) {
+        failed = 1;
+    } else {
+        array_created = 1;
+    }
 #endif
 
 #if ENABLE_RBTREE
-    memset(&global_rbtree,0,sizeof(kvs_rbtree_t));
-    kvs_rbtree_create(&global_rbtree);
+    int rbtree_created = 0;
+
+    memset(&global_rbtree, 0, sizeof(global_rbtree));
+    if (!failed) {
+        if (kvs_rbtree_create(&global_rbtree) != 0) {
+            failed = 1;
+        } else {
+            rbtree_created = 1;
+        }
+    }
 #endif
 
 #if ENABLE_HASH
-    memset(&global_hash,0,sizeof(kvs_hash_t));
-    kvs_hash_create(&global_hash);
+    int hash_created = 0;
+
+    memset(&global_hash, 0, sizeof(global_hash));
+    if (!failed) {
+        if (kvs_hash_create(&global_hash) != 0) {
+            failed = 1;
+        } else {
+            hash_created = 1;
+        }
+    }
 #endif
 
 #if ENABLE_SKIPLIST
-    memset(&global_skiplist,0,sizeof(kvs_skiplist_t));
-    kvs_skiplist_create(&global_skiplist);
-#endif
-    return 0;
-}
+    int skiplist_created = 0;
 
+    memset(&global_skiplist, 0, sizeof(global_skiplist));
+    if (!failed) {
+        if (kvs_skiplist_create(&global_skiplist) != 0) {
+            failed = 1;
+        } else {
+            skiplist_created = 1;
+        }
+    }
+#endif
+
+    if (!failed) {
+        return 0;
+    }
+
+    /* 创建失败，按相反顺序释放此前创建成功的引擎。 */
+#if ENABLE_SKIPLIST
+    if (skiplist_created) {
+        kvs_skiplist_destory(&global_skiplist);
+    }
+#endif
+
+#if ENABLE_HASH
+    if (hash_created) {
+        kvs_hash_destory(&global_hash);
+    }
+#endif
+
+#if ENABLE_RBTREE
+    if (rbtree_created) {
+        kvs_rbtree_destory(&global_rbtree);
+    }
+#endif
+
+#if ENABLE_ARRAY
+    if (array_created) {
+        kvs_array_destory(&global_array);
+    }
+#endif
+
+    return -1;
+}
 void dest_kvengine(void){
 
 #if ENABLE_ARRAY
@@ -1165,8 +1228,10 @@ static int kvs_install_replication_snapshot(
     dest_kvengine();
 
     // 重新创建一个空的 KV Engine。
-    if(init_kvengine()<0){
-        return -1;
+    if (init_kvengine() < 0) {
+        fprintf(stderr,
+                "fatal: failed to recreate KV engines for replication\n");
+        exit(EXIT_FAILURE);
     }
 
     /*
@@ -1179,12 +1244,16 @@ static int kvs_install_replication_snapshot(
     );
 
     if(snapshot_offset<0){
-        /*
-         * 加载失败时，Snapshot 可能只恢复了一部分。
-         * 再次清空，避免对外提供半套数据。
-         */
+
         dest_kvengine();
-        init_kvengine();
+
+        if (init_kvengine() < 0) {
+            fprintf(stderr,
+                    "fatal: failed to recreate empty KV engines "
+                    "after replication snapshot failure\n");
+            exit(EXIT_FAILURE);
+        }
+
         return -1;
     }
 
@@ -1194,7 +1263,14 @@ static int kvs_install_replication_snapshot(
          * 否则当前内存与重启后的恢复结果可能不一致。
          */
         dest_kvengine();
-        init_kvengine();
+
+        if (init_kvengine() < 0) {
+            fprintf(stderr,
+                    "fatal: failed to recreate empty KV engines "
+                    "after replication snapshot failure\n");
+            exit(EXIT_FAILURE);
+        }
+
         return -1;
     }
 
@@ -1203,25 +1279,9 @@ static int kvs_install_replication_snapshot(
     return 0;
 }
 
-int main(int argc, char *argv[])
+/* 配置已由 main 完成解析；这里负责运行和清理服务。 */
+static int kvs_server_run(kvs_config_t config)
 {
-    /* 唯一正式入口：启动参数必须是配置文件路径。 */
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <config-file>\n", argv[0]);
-        return 1;
-    }
-
-    /*
-     * 配置模块负责默认值、解析和校验。
-     * config 自己持有地址字符串，直到 main() 结束都有效。
-     */
-    kvs_config_t config = {0};
-    char error[256] = {0};
-
-    if (kvs_config_load(argv[1], &config, error, sizeof(error)) < 0) {
-        fprintf(stderr, "%s\n", error);
-        return 1;
-    }
 
         /* 配置解析成功后，运行日志采用配置文件指定的级别。 */
     kvs_log_set_level(config.log_level);
@@ -1230,7 +1290,11 @@ int main(int argc, char *argv[])
        /* 初始化引擎，并按配置选择持久化恢复路径。 */
     kvs_server_role = config.role;
     kvs_persistence_mode = config.persistence_mode;
-    init_kvengine();
+
+    if (init_kvengine() < 0) {
+        fprintf(stderr, "failed to initialize KV engines\n");
+        return EXIT_FAILURE;
+    }
 
     if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
         int load_result = kvs_snapshot_store_load("snapshot.bin");
@@ -1358,7 +1422,46 @@ kvs_listener_config_t listener = {
     kvs_close_current_persistence();
     dest_kvengine();
 
+    return EXIT_SUCCESS;
 
 }
 
+int main(int argc, char *argv[])
+{
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <config-file>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
 
+    /* 先解析配置，才能知道要使用哪个 allocator。 */
+    kvs_config_t config = {0};
+    char error[256] = {0};
+
+    if (kvs_config_load(argv[1], &config, error, sizeof(error)) < 0) {
+        fprintf(stderr, "%s\n", error);
+        return EXIT_FAILURE;
+    }
+
+/* 在创建引擎之前初始化配置指定的分配后端。 */
+    if (kvs_allocator_init(config.allocator_backend) != 0) {
+        fprintf(stderr, "failed to initialize allocator backend=%d\n",
+                (int)config.allocator_backend);
+        return EXIT_FAILURE;
+    }
+
+    const char *name =
+        config.allocator_backend == KVS_ALLOCATOR_SYSTEM
+        ? "system" : "pool";
+
+    fprintf(stderr, "allocator initialized: %s\n", name);
+
+    int result = kvs_server_run(config);
+
+    /* 服务对象清理完成后，最后销毁 allocator。 */
+    if (kvs_allocator_destroy() != 0) {
+        fprintf(stderr, "failed to destroy allocator\n");
+        return EXIT_FAILURE;
+    }
+
+    return result;
+}

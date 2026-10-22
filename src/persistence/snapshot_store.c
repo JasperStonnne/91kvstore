@@ -198,7 +198,7 @@ static int snapshot_writer_init(snapshot_writer_t *writer, int fd)
     writer->next_file_offset = 0;
 
     /* 申请一片连续缓冲区，之后分成最多四块提交。 */
-    writer->buffer = malloc(SNAPSHOT_WRITE_BUFFER_SIZE);
+    writer->buffer = kvs_malloc(SNAPSHOT_WRITE_BUFFER_SIZE);
     if (writer->buffer == NULL) {
         return -1;
     }
@@ -208,7 +208,7 @@ static int snapshot_writer_init(snapshot_writer_t *writer, int fd)
         int saved_errno = errno;
 
         /* 队列创建失败，归还已经申请的缓冲区。 */
-        free(writer->buffer);
+        kvs_free(writer->buffer);
         writer->buffer = NULL;
 
         errno = saved_errno;
@@ -233,7 +233,7 @@ static void snapshot_writer_close(snapshot_writer_t *writer)
 
     /* 先释放队列，再释放它曾经引用的数据缓冲区。 */
     kvs_uring_io_close(&writer->io);
-    free(writer->buffer);
+    kvs_free(writer->buffer);
 
     /* 清空对象，使重复清理安全。 */
     memset(writer, 0, sizeof(*writer));
@@ -404,10 +404,14 @@ static int snapshot_open_parent_directory(const char *path)
         return -1;
     }
 
-    char *directory = strdup(path);
+    /* 通过统一入口复制路径，后面会在副本上截取父目录。 */
+    size_t directory_size = strlen(path) + 1;
+    char *directory = kvs_malloc(directory_size);
     if (directory == NULL) {
         return -1;
     }
+
+    memcpy(directory, path, directory_size);
 
     char *slash = strrchr(directory, '/');
 
@@ -422,7 +426,7 @@ static int snapshot_open_parent_directory(const char *path)
     int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     int saved_errno = errno;
 
-    free(directory);
+    kvs_free(directory);
 
     errno = saved_errno;
     return fd;
@@ -863,7 +867,7 @@ static char *snapshot_read_field(
         return NULL;
     }
 
-    char *text = malloc(capacity);
+    char *text = kvs_malloc(capacity);
     if (text == NULL) {
         return NULL;
     }
@@ -946,7 +950,7 @@ static int snapshot_load_record(snapshot_read_cursor_t *cursor)
     if (value == NULL) {
         /* value准备失败，也要释放已经准备好的key。 */
         int saved_errno = errno;
-        free(key);
+        kvs_free(key);
         errno = saved_errno;
         return -1;
     }
@@ -961,8 +965,8 @@ static int snapshot_load_record(snapshot_read_cursor_t *cursor)
 
     /* 无论插入成功与否，这两个临时字符串都需要释放。 */
     int saved_errno = errno;
-    free(key);
-    free(value);
+    kvs_free(key);
+    kvs_free(value);
 
     if (result > 0) {
         errno = EEXIST;
@@ -998,7 +1002,7 @@ int kvs_snapshot_store_save(const char *path)
         return -1;
     }
 
-    char *temp_path = malloc(path_length + sizeof(suffix));
+    char *temp_path = kvs_malloc(path_length + sizeof(suffix));
     if (temp_path == NULL) {
         return -1;
     }
@@ -1009,7 +1013,7 @@ int kvs_snapshot_store_save(const char *path)
     int directory_fd = snapshot_open_parent_directory(path);
     if (directory_fd < 0) {
         int saved_errno = errno;
-        free(temp_path);
+        kvs_free(temp_path);
         errno = saved_errno;
         return -1;
     }
@@ -1097,7 +1101,7 @@ done:
         saved_errno = errno;
     }
 
-    free(temp_path);
+    kvs_free(temp_path);
     errno = saved_errno;
     return result;
 }

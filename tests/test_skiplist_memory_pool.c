@@ -1,167 +1,272 @@
-// 验证跳表创建和销毁时的基础内存生命周期
+/* 验证 Skiplist 通过统一 allocator 管理全部动态数据对象。 */
 
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
+#include "kvs_allocator.h"
 #include "kvstore.h"
 
-#ifndef KVS_SKIPLIST_USE_MEMORY_POOL
-#define KVS_SKIPLIST_USE_MEMORY_POOL 1
-#endif
+/*
+ * -1：正常申请。
+ *  0：申请失败。
+ *  N：允许 N 次申请，之后失败。
+ */
+static long fail_after = -1;
 
-// 独立测试不链接 src/kvstore.c，
-// 因此在这里提供 kvs_malloc/kvs_free。
-void *kvs_malloc(size_t size) {
-    return malloc(size);
+void *kvs_malloc(size_t size)
+{
+    if (fail_after == 0) {
+        return NULL;
+    }
+
+    if (fail_after > 0) {
+        fail_after--;
+    }
+
+    return kvs_allocator_alloc(size);
 }
 
-void kvs_free(void *ptr) {
-    free(ptr);
+void kvs_free(void *ptr)
+{
+    kvs_allocator_free(ptr);
 }
 
-int main(void) {
-    // 所有字段先初始化为 0
+/* system 没有池统计；pool 模式额外核对存活对象数。 */
+static void check_live(
+    kvs_allocator_backend_t backend,
+    size_t expected)
+{
+    if (backend == KVS_ALLOCATOR_POOL) {
+        kvs_pool_stats_t stats;
+        assert(kvs_allocator_pool_stats(&stats) == 0);
+        assert(stats.live_objects == expected);
+    }
+}
+
+static void check_value(
+    kvs_skiplist_t *list,
+    char *key,
+    const char *expected)
+{
+    char *value = kvs_skiplist_get(list, key);
+    assert(value != NULL);
+    assert(strcmp(value, expected) == 0);
+}
+
+/* 第 0 层应包含全部普通节点，并严格按 key 排序。 */
+static void check_order(kvs_skiplist_t *list, size_t expected)
+{
+    kvs_skiplist_node_t *previous = NULL;
+    kvs_skiplist_node_t *node = list->header->forward[0];
+    size_t count = 0;
+
+    while (node != NULL) {
+        /* 同时避免错误链表形成环后，测试无限循环。 */
+        assert(count < expected);
+
+        if (previous != NULL) {
+            assert(strcmp(previous->key, node->key) < 0);
+        }
+
+        previous = node;
+        node = node->forward[0];
+        count++;
+    }
+
+    assert(count == expected);
+}
+
+static void test_backend(kvs_allocator_backend_t backend)
+{
     kvs_skiplist_t list = {0};
 
-    // 创建空跳表
-    assert(kvs_skiplist_create(&list) == 0);
+    /* 两个后端使用相同的随机层数序列。 */
+    srand(1);
+    fail_after = -1;
+    assert(kvs_allocator_init(backend) == 0);
 
-    // header 已创建，目前没有普通业务节点
+    /*
+     * header 需要申请：
+     * 节点、空 key、空 value、forward。
+     * 逐一模拟失败，检查中间对象是否全部清理。
+     */
+    for (long allowed = 0; allowed < 4; allowed++) {
+        fail_after = allowed;
+        assert(kvs_skiplist_create(&list) < 0);
+        fail_after = -1;
+
+        assert(list.header == NULL);
+        assert(list.level == 0);
+        check_live(backend, 0);
+    }
+
+    assert(kvs_skiplist_create(&list) == 0);
     assert(list.header != NULL);
     assert(list.level == 0);
-    assert(list.header->forward[0] == NULL);
+    check_order(&list, 0);
+    check_live(backend, 4);
 
-#if KVS_SKIPLIST_USE_MEMORY_POOL
-    // header 使用 malloc，因此此时 node_pool 仍未创建 Chunk
-    assert(list.node_pool.chunk_list == NULL);
-    assert(list.node_pool.free_list == NULL);
-#endif
-    // 插入第一个普通业务节点
+    /*
+     * 普通节点也需要四次申请。
+     * 创建失败不能增加节点，也不能改变有效层数。
+     */
+    for (long allowed = 0; allowed < 4; allowed++) {
+        int old_level = list.level;
+
+        fail_after = allowed;
+        assert(kvs_skiplist_set(&list, "failed", "value") < 0);
+        fail_after = -1;
+
+        assert(list.level == old_level);
+        assert(kvs_skiplist_get(&list, "failed") == NULL);
+
+        for (int i = 0; i <= KVS_SKIPLIST_MAX_LEVEL; i++) {
+            assert(list.header->forward[i] == NULL);
+        }
+
+        check_order(&list, 0);
+        check_live(backend, 4);
+    }
+
     assert(kvs_skiplist_set(&list, "name", "Jasper") == 0);
+    check_value(&list, "name", "Jasper");
+    check_live(backend, 8);
 
-// 验证业务数据能够正常查询
-    char *value = kvs_skiplist_get(&list, "name");
-    assert(value != NULL);
-    assert(strcmp(value, "Jasper") == 0);
-
-// 目前只有一个普通节点，它位于第 0 层的第一个位置
-kvs_skiplist_node_t *first_node =
-    list.header->forward[0];
-
-    assert(first_node != NULL);
-    assert(strcmp(first_node->key, "name") == 0);
-
-    // 重复 SET 覆盖 value，节点和跳表层数保持不变。
+    kvs_skiplist_node_t *original = list.header->forward[0];
     int original_level = list.level;
 
+    /* SET 覆盖失败，必须保留旧 value。 */
+    fail_after = 0;
+    assert(kvs_skiplist_set(&list, "name", "Another") < 0);
+    fail_after = -1;
+
+    check_value(&list, "name", "Jasper");
+    check_live(backend, 8);
+
+    /* MOD 失败也必须保留旧 value。 */
+    fail_after = 0;
+    assert(kvs_skiplist_mod(&list, "name", "Stone") < 0);
+    fail_after = -1;
+
+    check_value(&list, "name", "Jasper");
+    check_live(backend, 8);
+
+    /* 成功覆盖不应替换节点或改变层数。 */
     assert(kvs_skiplist_set(&list, "name", "Another") == 0);
-    assert(list.header->forward[0] == first_node);
+    check_value(&list, "name", "Another");
+
+    assert(kvs_skiplist_mod(&list, "name", "Stone") == 0);
+    check_value(&list, "name", "Stone");
+
+    assert(list.header->forward[0] == original);
     assert(list.level == original_level);
-    assert(first_node->forward[0] == NULL);
+    check_live(backend, 8);
 
-    value = kvs_skiplist_get(&list, "name");
-    assert(value != NULL);
-    assert(strcmp(value, "Another") == 0);
+    /* MOD 不创建不存在的 key。 */
+    assert(kvs_skiplist_mod(&list, "missing", "value") == 1);
+    assert(kvs_skiplist_get(&list, "missing") == NULL);
+    check_live(backend, 8);
 
-#if KVS_SKIPLIST_USE_MEMORY_POOL
-// 第一个普通节点触发 node_pool 创建 Chunk
-    assert(list.node_pool.chunk_list != NULL);
-    #endif
-        // 删除刚才插入的普通节点
+    assert(kvs_skiplist_mod(&list, "name", "") == 0);
+    check_value(&list, "name", "");
+
+    /* 记录修改前的大对象数量，随后验证它增加再恢复。 */
+    size_t original_large_count = 0;
+    if (backend == KVS_ALLOCATOR_POOL) {
+        kvs_pool_stats_t stats;
+        assert(kvs_allocator_pool_stats(&stats) == 0);
+        original_large_count = stats.large_count;
+    }
+
+    char long_value[8193];
+    memset(long_value, 'x', sizeof(long_value) - 1);
+    long_value[sizeof(long_value) - 1] = '\0';
+
+    assert(kvs_skiplist_mod(&list, "name", long_value) == 0);
+    check_value(&list, "name", long_value);
+    check_live(backend, 8);
+
+    if (backend == KVS_ALLOCATOR_POOL) {
+        kvs_pool_stats_t stats;
+        assert(kvs_allocator_pool_stats(&stats) == 0);
+        assert(stats.large_count == original_large_count + 1);
+    }
+
+    assert(kvs_skiplist_mod(&list, "name", "small") == 0);
+    check_value(&list, "name", "small");
+
+    if (backend == KVS_ALLOCATOR_POOL) {
+        kvs_pool_stats_t stats;
+        assert(kvs_allocator_pool_stats(&stats) == 0);
+        assert(stats.large_count == original_large_count);
+    }
+
     assert(kvs_skiplist_del(&list, "name") == 0);
-
-    // 删除后无法再查询到旧 key
     assert(kvs_skiplist_get(&list, "name") == NULL);
+    assert(list.level == 0);
+    check_order(&list, 0);
+    check_live(backend, 4);
 
-    // 当前没有普通节点，第 0 层重新变为空
-    assert(list.header->forward[0] == NULL);
+    assert(kvs_skiplist_del(&list, "missing") == 1);
+    check_live(backend, 4);
 
-    #if KVS_SKIPLIST_USE_MEMORY_POOL
-    // 普通节点外壳已经归还，并位于 Free List 表头
-    assert(
-        list.node_pool.free_list ==
-        (free_node_t *)first_node
-    );
-    #endif
-    // 插入一个不同的业务节点
-    assert(
-        kvs_skiplist_set(
-            &list,
-            "city",
-            "Shanghai"
-        ) == 0
-    );
-
-    // 它是当前第 0 层的第一个普通节点
-    kvs_skiplist_node_t *second_node =
-        list.header->forward[0];
-
-    assert(second_node != NULL);
-
-    #if KVS_SKIPLIST_USE_MEMORY_POOL
-    // Free List 头插头取，应复用刚才删除的节点外壳
-    assert(second_node == first_node);
-    #endif
-
-    // 验证复用节点后，新数据没有受到旧内容影响
-    value = kvs_skiplist_get(&list, "city");
-    assert(value != NULL);
-    assert(strcmp(value, "Shanghai") == 0);
-
-    printf("first node  = %p\n", (void *)first_node);
-
-    #if KVS_SKIPLIST_USE_MEMORY_POOL
-    printf("second node = %p (reused)\n", (void *)second_node);
-    #else
-    printf("second node = %p (malloc mode)\n", (void *)second_node);
-    #endif
-    // 插入多个节点，让随机层数和不同长度的 forward 数组参与测试
-    char key_buffer[64];
-    char value_buffer[64];
+    /* 批量插入，让多个 slab 和不同长度的 forward 参与测试。 */
+    char key[32];
+    char value[32];
 
     for (int i = 0; i < 2000; i++) {
-        snprintf(
-            key_buffer,
-            sizeof(key_buffer),
-            "key-%04d",
-            i
-        );
-
-        snprintf(
-            value_buffer,
-            sizeof(value_buffer),
-            "value-%04d",
-            i
-        );
-
-        assert(
-            kvs_skiplist_set(
-                &list,
-                key_buffer,
-                value_buffer
-            ) == 0
-        );
+        snprintf(key, sizeof(key), "key-%04d", i);
+        snprintf(value, sizeof(value), "value-%04d", i);
+        assert(kvs_skiplist_set(&list, key, value) == 0);
     }
-    #if KVS_SKIPLIST_USE_MEMORY_POOL
-    // 2001 个存活节点超过一个 Chunk 的 1024 个 Block，
-    // 所以 chunk_list 中至少应该存在两个 Chunk。
-    assert(list.node_pool.chunk_list != NULL);
-    assert(list.node_pool.chunk_list->next != NULL);
-    #endif 
-   // 销毁包含多个普通节点的跳表
-    kvs_skiplist_destory(&list);
 
-    // 销毁后不再保留 header
+    check_order(&list, 2000);
+    check_live(backend, 4 + 4 * 2000);
+
+    /* 查询全部记录，覆盖跳表的多层查找路径。 */
+    for (int i = 0; i < 2000; i++) {
+        snprintf(key, sizeof(key), "key-%04d", i);
+        snprintf(value, sizeof(value), "value-%04d", i);
+        check_value(&list, key, value);
+    }
+
+    /* 删除偶数编号，保留奇数编号。 */
+    for (int i = 0; i < 2000; i += 2) {
+        snprintf(key, sizeof(key), "key-%04d", i);
+        assert(kvs_skiplist_del(&list, key) == 0);
+    }
+
+    check_order(&list, 1000);
+    check_live(backend, 4 + 4 * 1000);
+
+    for (int i = 0; i < 2000; i++) {
+        snprintf(key, sizeof(key), "key-%04d", i);
+
+        if (i % 2 == 0) {
+            assert(kvs_skiplist_get(&list, key) == NULL);
+        } else {
+            snprintf(value, sizeof(value), "value-%04d", i);
+            check_value(&list, key, value);
+        }
+    }
+
+    /* 剩余 1000 条记录及 header 都由 destroy 释放。 */
+    kvs_skiplist_destory(&list);
     assert(list.header == NULL);
     assert(list.level == 0);
+    check_live(backend, 0);
 
-#if KVS_SKIPLIST_USE_MEMORY_POOL
-    // 节点池的链表也应处于清空状态
-    assert(list.node_pool.chunk_list == NULL);
-    assert(list.node_pool.free_list == NULL);
-#endif
+    assert(kvs_allocator_destroy() == 0);
 
-    printf("skiplist allocator integration test passed\n");
+    printf("[PASS] Skiplist lifecycle and failures allocator=%s\n",
+           backend == KVS_ALLOCATOR_SYSTEM ? "system" : "pool");
+}
+
+int main(void)
+{
+    test_backend(KVS_ALLOCATOR_SYSTEM);
+    test_backend(KVS_ALLOCATOR_POOL);
     return 0;
 }

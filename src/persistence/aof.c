@@ -12,6 +12,7 @@
 #include "uring_io.h"
 #include"persistence.h"
 #include "protocol.h"
+#include "kvstore.h"
 
 /*
  * AOF 写入侧的状态。
@@ -322,7 +323,7 @@ int kvs_aof_append(char **tokens, int count)
         return -1;
     }
 
-    char *encoded = malloc(required);
+    char *encoded = kvs_malloc(required);
     if (encoded == NULL) {
         return -1;
     }
@@ -334,7 +335,7 @@ int kvs_aof_append(char **tokens, int count)
             encoded,
             required,
             &encoded_length) != 0) {
-        free(encoded);
+        kvs_free(encoded);
         return -1;
     }
 
@@ -342,7 +343,7 @@ int kvs_aof_append(char **tokens, int count)
     off_t next_offset;
     if (__builtin_add_overflow(
             aof_writer.offset, encoded_length, &next_offset)) {
-        free(encoded);
+        kvs_free(encoded);
         errno = EOVERFLOW;
         return -1;
     }
@@ -363,7 +364,7 @@ int kvs_aof_append(char **tokens, int count)
 
     /* 写请求已经结束，才能释放它借用的内存。 */
     int saved_errno = errno;
-    free(encoded);
+    kvs_free(encoded);
     errno = saved_errno;
 
     if (write_result < 0) {

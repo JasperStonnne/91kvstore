@@ -22,6 +22,7 @@ enum config_field {
     FIELD_REPLICATION_PORT,
     FIELD_PRIMARY_HOST,
     FIELD_PRIMARY_PORT,
+    FIELD_ALLOCATOR,
     FIELD_COUNT
 };
 
@@ -33,7 +34,8 @@ static const char *const field_names[FIELD_COUNT] = {
     "persistence_mode",
     "replication_port",
     "primary_host",
-    "primary_port"
+    "primary_port",
+    "allocator"
 };
 
 /* 把错误位置和原因统一写入调用方提供的缓冲区。 */
@@ -257,6 +259,19 @@ static int parse_field(
             );
         }
         return 0;
+    case FIELD_ALLOCATOR:
+        if (strcmp(value, "system") == 0) {
+            parsed->allocator_backend = KVS_ALLOCATOR_SYSTEM;
+        } else if (strcmp(value, "pool") == 0) {
+            parsed->allocator_backend = KVS_ALLOCATOR_POOL;
+        } else {
+            return config_error(
+                error, error_capacity, path, line_number,
+                "invalid allocator '%s'; expected system or pool",
+                value
+            );
+        }
+        return 0;
 
     default:
         return config_error(
@@ -420,6 +435,7 @@ int kvs_config_load(
     snprintf(parsed.bind_ip, sizeof(parsed.bind_ip), "%s", "0.0.0.0");
     parsed.log_level = KVS_LOG_INFO;
     parsed.persistence_mode = KVS_PERSISTENCE_LEGACY_HYBRID;
+    parsed.allocator_backend = KVS_ALLOCATOR_POOL;
 
     file = fopen(path, "r");
     if (file == NULL) {

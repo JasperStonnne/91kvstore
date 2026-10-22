@@ -74,6 +74,7 @@ def main():
         "role=standalone\n"
         "bind_ip=127.0.0.1\n"
         f"service_port={port}\n"
+        "allocator=pool\n"
         "persistence_mode=snapshot\n",
         encoding="utf-8",
     )

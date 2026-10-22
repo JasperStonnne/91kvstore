@@ -373,6 +373,60 @@ static void test_example_config_files(void)
 
     puts("example config files: 3 passed");
 }
+static void test_allocator_config(void)
+{
+    /* 不写 allocator 时，保持当前默认的 pool。 */
+    kvs_config_t config = load_valid(
+        "role=standalone\n"
+        "service_port=29000\n"
+    );
+    assert(config.allocator_backend == KVS_ALLOCATOR_POOL);
+
+    /* 三个合法名称分别转换为对应枚举。 */
+    config = load_valid(
+        "role=standalone\n"
+        "service_port=29000\n"
+        "allocator=system\n"
+    );
+    assert(config.allocator_backend == KVS_ALLOCATOR_SYSTEM);
+
+    config = load_valid(
+        "role=standalone\n"
+        "service_port=29000\n"
+        "allocator=pool\n"
+    );
+    assert(config.allocator_backend == KVS_ALLOCATOR_POOL);
+
+    /* jemalloc 仅用于 benchmark 预加载，不是正式配置后端。 */
+    expect_invalid(
+        "jemalloc is not a service backend",
+        "role=standalone\n"
+        "service_port=29000\n"
+        "allocator=jemalloc\n",
+        "invalid allocator"
+    );
+
+    /* 未知后端必须拒绝，不能回退到默认值。 */
+    expect_invalid(
+        "unknown allocator",
+        "role=standalone\n"
+        "service_port=29000\n"
+        "allocator=invalid\n",
+        "invalid allocator"
+    );
+
+    /* 重复字段必须拒绝，即使两次值相同。 */
+    expect_invalid(
+        "duplicate allocator",
+        "role=standalone\n"
+        "service_port=29000\n"
+        "allocator=pool\n"
+        "allocator=pool\n",
+        "duplicate"
+    );
+
+    puts("[PASS] allocator config defaults, names and rejection");
+}
 int main(void)
 {
     test_valid_standalone();
@@ -382,6 +436,7 @@ int main(void)
     test_example_config_files();
     test_valid_snapshot_mode();
     test_valid_aof_mode();
+    test_allocator_config();
     puts("config parser tests passed");
     return 0;
 }

@@ -2,7 +2,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include"server.h"
-
+#include "kvs_allocator.h"
 /* 输入、输出缓冲区共用的扩容逻辑；只管理内存，不读写数据。 */
 static int ensure_buffer_space(
     char **data,
@@ -33,9 +33,19 @@ static int ensure_buffer_space(
             ? required : new_capacity * 2;
     }
 
-    char *new_data = realloc(*data, (size_t)new_capacity);
-    if (new_data == NULL) return -1;
+    /* 先申请新空间；失败时不改变旧缓冲的任何状态。 */
+    char *new_data = kvs_malloc((size_t)new_capacity);
+    if (new_data == NULL) {
+        return -1;
+    }
 
+    /* 保留全部有效字节，输出缓冲的 offset 不变。 */
+    if (length > 0) {
+        memcpy(new_data, *data, (size_t)length);
+    }
+
+    /* 复制完成后，再释放旧空间并安装新空间。 */
+    kvs_free(*data);
     *data = new_data;
     *capacity = new_capacity;
     return 0;
@@ -61,7 +71,7 @@ void kvs_input_buffer_free(kvs_input_buffer_t *buffer)
 {
     if (buffer == NULL) return;
 
-    free(buffer->data);
+    kvs_free(buffer->data);
     buffer->data = NULL;
     buffer->length = 0;
     buffer->capacity = 0;
@@ -91,7 +101,7 @@ void kvs_output_buffer_free(kvs_output_buffer_t *buffer)
 {
     if (buffer == NULL) return;
 
-    free(buffer->data);
+    kvs_free(buffer->data);
     buffer->data = NULL;
     buffer->length = 0;
     buffer->offset = 0;

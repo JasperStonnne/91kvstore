@@ -6,11 +6,6 @@
 #include <string.h>
 #include"kvstore.h"
 
-#define RBTREE_NODE_BLOCKS_PER_CHUNK 1024
-#ifndef KVS_RBTREE_USE_MEMORY_POOL
-#define KVS_RBTREE_USE_MEMORY_POOL 1
-#endif
-
 rbtree_node *rbtree_mini(rbtree *T, rbtree_node *x) {
 	while (x->left != T->nil) {
 		x = x->left;
@@ -436,84 +431,81 @@ int main() {
 #endif
 
 kvs_rbtree_t global_rbtree;
-#ifndef KVS_RBTREE_USE_MEMORY_POOL
-#define KVS_RBTREE_USE_MEMORY_POOL 1
-#endif
-// 根据编译开关，选择节点从内存池还是通用分配器申请
-static rbtree_node *rbtree_node_alloc(kvs_rbtree_t *inst) {
-#if KVS_RBTREE_USE_MEMORY_POOL
-    return (rbtree_node *)memory_pool_alloc(&inst->node_pool);
-#else
-    (void)inst;
-    return (rbtree_node *)kvs_malloc(sizeof(rbtree_node));
-#endif
+
+/* 申请节点本身，key/value 由插入函数另外申请。 */
+static rbtree_node *rbtree_node_alloc(kvs_rbtree_t *inst)
+{
+    if (inst == NULL) {
+        return NULL;
+    }
+
+    return kvs_malloc(sizeof(rbtree_node));
 }
-// 只释放 rbtree_node 本身，不处理 key/value
+
+/* 用于节点构造失败时的清理，不读取尚未初始化的 key/value。 */
 static void rbtree_node_storage_free(kvs_rbtree_t *inst,
-                                     rbtree_node *node) {
+                                     rbtree_node *node)
+{
     if (inst == NULL || node == NULL) {
         return;
     }
 
-#if KVS_RBTREE_USE_MEMORY_POOL
-    memory_pool_free(&inst->node_pool, node);
-#else
     kvs_free(node);
-#endif
-}
-//节点从内存池申请之后就不能再用kvs_free 必须还给原来的nodepool 为了避免 del destory各写一遍释放逻辑 所以在这直接写一个nodefree函数
-static void rbtree_node_free(kvs_rbtree_t *inst,rbtree_node *node){
-	if(inst==NULL||node==NULL) return;//大白话参数校验
-	kvs_free(node->key);
-	kvs_free(node->value);
-	rbtree_node_storage_free(inst, node);
 }
 
+/* 完整业务节点拥有 key/value，必须一起释放。 */
+static void rbtree_node_free(kvs_rbtree_t *inst, rbtree_node *node)
+{
+    if (inst == NULL || node == NULL) {
+        return;
+    }
 
-int kvs_rbtree_create(kvs_rbtree_t *inst){
-    if(inst==NULL) return -1;
-#if KVS_RBTREE_USE_MEMORY_POOL
-	if(memory_pool_init(&inst->node_pool,sizeof(rbtree_node),RBTREE_NODE_BLOCKS_PER_CHUNK)!=0){
-		return -1;
-	}
-#endif
-    inst->nil = (rbtree_node*)kvs_malloc(sizeof(rbtree_node));
-	// nil 申请失败，需要清理已经初始化的 node_pool
-	if (inst->nil == NULL) {
-#if KVS_RBTREE_USE_MEMORY_POOL
-		memory_pool_destory(&inst->node_pool);
-#endif
-		return -1;
-	}
+    kvs_free(node->key);
+    kvs_free(node->value);
+    rbtree_node_storage_free(inst, node);
+}
 
-	inst->nil->color = BLACK;
-	inst->nil->left = inst->nil;
-	inst->nil->right = inst->nil;
-	inst->nil->parent = inst->nil;
-	// nil 不保存业务数据
-	inst->nil->key = NULL;
-	inst->nil->value = NULL;
+int kvs_rbtree_create(kvs_rbtree_t *inst)
+{
+    if (inst == NULL) {
+        return -1;
+    }
 
-	// 空树的 root 指向 nil
-	inst->root = inst->nil;
+    /* nil 也是动态对象，使用同一个分配入口。 */
+    inst->nil = kvs_malloc(sizeof(rbtree_node));
+    if (inst->nil == NULL) {
+        inst->root = NULL;
+        return -1;
+    }
 
+    inst->nil->color = BLACK;
+    inst->nil->left = inst->nil;
+    inst->nil->right = inst->nil;
+    inst->nil->parent = inst->nil;
+    inst->nil->key = NULL;
+    inst->nil->value = NULL;
+
+    inst->root = inst->nil;
     return 0;
 }
 
+void kvs_rbtree_destory(kvs_rbtree_t *inst)
+{
+    if (inst == NULL || inst->nil == NULL) {
+        return;
+    }
 
-void kvs_rbtree_destory(kvs_rbtree_t *inst){
-    if(inst==NULL) return;
-	while(inst->root!=inst->nil){
-		rbtree_node *mini = rbtree_mini(inst,inst->root);
-		rbtree_node *removed = rbtree_delete(inst, mini);
-		rbtree_node_free(inst,removed);
-	}
-	kvs_free(inst->nil);
-#if KVS_RBTREE_USE_MEMORY_POOL
-	memory_pool_destory(&inst->node_pool);
-#endif
-	inst->nil=NULL;
-	inst->root=NULL;
+    /* 沿用原来的树删除逻辑，逐个释放业务节点。 */
+    while (inst->root != inst->nil) {
+        rbtree_node *mini = rbtree_mini(inst, inst->root);
+        rbtree_node *removed = rbtree_delete(inst, mini);
+        rbtree_node_free(inst, removed);
+    }
+
+    /* 最后释放哨兵，避免树删除过程中访问已释放的 nil。 */
+    kvs_free(inst->nil);
+    inst->nil = NULL;
+    inst->root = NULL;
 }
 
 
@@ -575,17 +567,30 @@ int kvs_rbtree_del(kvs_rbtree_t *inst,char *key){
     return 0;
 }
 
-int kvs_rbtree_mod(kvs_rbtree_t *inst,char *key,char *value){
-    if(!inst||!key||!value) return -1;
-    rbtree_node *node = rbtree_search(inst, key);
-    if(node==inst->nil) return 1;//no exist 
-    kvs_free(node->value);
-    node->value=kvs_malloc(strlen(value)+1);
-    if(!node->value) return -2;
-    memset(node->value,0,strlen(value)+1);
-    strcpy(node->value,value);
+int kvs_rbtree_mod(kvs_rbtree_t *inst, char *key, char *value)
+{
+    if (inst == NULL || key == NULL || value == NULL) {
+        return -1;
+    }
 
-    
+    rbtree_node *node = rbtree_search(inst, key);
+    if (node == inst->nil) {
+        return 1;  /* MOD 不创建不存在的 key。 */
+    }
+
+    /* 先准备完整的新值，申请失败时保持旧节点不变。 */
+    size_t value_size = strlen(value) + 1;
+    char *new_value = kvs_malloc(value_size);
+    if (new_value == NULL) {
+        return -2;
+    }
+
+    memcpy(new_value, value, value_size);
+
+    /* 新值准备成功后，才释放旧值并完成替换。 */
+    kvs_free(node->value);
+    node->value = new_value;
+
     return 0;
 }
 

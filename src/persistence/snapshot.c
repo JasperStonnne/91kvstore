@@ -82,7 +82,7 @@ static int snapshot_write_item(
         return -1;
     }
 
-    char *encoded = malloc(required);
+    char *encoded = kvs_malloc(required);
     if (encoded == NULL) {
         return -1;
     }
@@ -90,13 +90,13 @@ static int snapshot_write_item(
     size_t encoded_length = 0;
     if (kvs_encode_command(
             fields, 3, encoded, required, &encoded_length) != 0) {
-        free(encoded);
+        kvs_free(encoded);
         return -1;
     }
 
     /* fwrite 按字节写入；帧与帧之间不需要再加换行分隔。 */
     size_t written = fwrite(encoded, 1, encoded_length, ctx->fp);
-    free(encoded);
+    kvs_free(encoded);
 
     return written == encoded_length ? 0 : -1;
 }
@@ -505,16 +505,23 @@ long long kvs_snapshot_load(const char* path,snapshot_replay_handler handler){
                 break;
             }
 
-            char *new_input = realloc(input, new_capacity);
+            /* 先申请新空间，失败时旧 input 仍然有效。 */
+            char *new_input = kvs_malloc(new_capacity);
             if (new_input == NULL) {
                 load_result = -1;
                 break;
             }
 
+            /* 只复制已经读入的有效字节。 */
+            if (input_length != 0) {
+                memcpy(new_input, input, input_length);
+            }
+
+            /* 复制完成后，才能归还旧空间。 */
+            kvs_free(input);
             input = new_input;
             input_capacity = new_capacity;
         }
-
         input[input_length++] = (char)byte;
 
         /* Snapshot 每条记录包含命令名、key、value 三个字段。 */
@@ -558,7 +565,7 @@ long long kvs_snapshot_load(const char* path,snapshot_replay_handler handler){
         input_length = 0;
     }
 
-    free(input);
+    kvs_free(input);
     if(ferror(fp)){
         load_result=-1;
     }

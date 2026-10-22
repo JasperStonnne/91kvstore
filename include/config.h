@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include "log.h"
 #include "role.h"
+#include "kvs_allocator.h"
 
 /* IPv4 文本地址最长 15 个字符，再留 1 个位置给结尾的 '\0'。 */
 #define KVS_CONFIG_IPV4_CAPACITY 16
@@ -38,6 +39,9 @@ typedef struct {
 
     kvs_log_level_t log_level;
     kvs_persistence_mode_t persistence_mode;
+    /* 保存启动时选择的内存分配后端。 */
+    kvs_allocator_backend_t allocator_backend;
+
 } kvs_config_t;
 
 /*

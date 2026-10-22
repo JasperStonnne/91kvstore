@@ -1,5 +1,6 @@
 #include "kvstore.h"
 #include "persistence.h"
+#include "kvs_allocator.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,15 +16,15 @@ extern kvs_rbtree_t global_rbtree;
 extern kvs_hash_t global_hash;
 extern kvs_skiplist_t global_skiplist;
 
-/* 独立测试不链接包含 main 的 kvstore.c。 */
+/* 独立测试连接真实 allocator。 */
 void *kvs_malloc(size_t size)
 {
-    return malloc(size);
+    return kvs_allocator_alloc(size);
 }
 
 void kvs_free(void *ptr)
 {
-    free(ptr);
+    kvs_allocator_free(ptr);
 }
 
 static void create_engines(void)
@@ -175,6 +176,8 @@ static void test_save_failure_preserves_old_snapshot(const char *path)
 
 int main(void)
 {
+    assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
+
     char directory[] = "/tmp/91kv-snapshot-test-XXXXXX";
     assert(mkdtemp(directory) != NULL);
 
@@ -245,6 +248,15 @@ int main(void)
     assert(unlink(path) == 0);
     assert(rmdir(directory) == 0);
 
-    puts("snapshot public API tests passed");
+    /* 引擎与 Snapshot 临时对象都应该已经释放。 */
+    kvs_pool_stats_t stats;
+    assert(kvs_allocator_pool_stats(&stats) == 0);
+    assert(stats.live_objects == 0);
+    assert(stats.large_count == 0);
+
+    assert(kvs_allocator_destroy() == 0);
+
+    puts("snapshot public API tests passed allocator=pool");
+    return 0;
     return 0;
 }

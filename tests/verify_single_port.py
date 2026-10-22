@@ -82,6 +82,7 @@ class Fixture:
         port = self.primary_port if role == "primary" else self.replica_port
         config = (
             f"role={role}\nbind_ip=127.0.0.1\nservice_port={port}\n"
+            "allocator=pool\n"
             "log_level=info\npersistence_mode=legacy_hybrid\n"
         )
         if role == "replica":
