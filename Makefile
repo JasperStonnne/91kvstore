@@ -38,6 +38,7 @@ OBJS := \
 	$(BUILD_DIR)/kvs_skiplist.o \
 	$(BUILD_DIR)/aof.o \
 	$(BUILD_DIR)/snapshot.o \
+	$(BUILD_DIR)/snapshot_io.o \
 	$(BUILD_DIR)/snapshot_store.o \
 	$(BUILD_DIR)/mapped_file.o \
 	$(BUILD_DIR)/uring_io.o \
@@ -133,6 +134,12 @@ $(BUILD_DIR)/snapshot.o: \
 	$(PERSISTENCE_DIR)/snapshot.c \
 	$(INCLUDE_DIR)/persistence.h \
 	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/snapshot_io.o: \
+	$(PERSISTENCE_DIR)/snapshot_io.c \
+	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/snapshot_store.o: \
