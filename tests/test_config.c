@@ -127,6 +127,11 @@ static void test_invalid_configs(void)
             "missing required field 'service_port'"
         },
         {
+            "missing persistence mode",
+            "role=standalone\nservice_port=29000\n",
+            "missing required field 'persistence_mode'"
+        },
+        {
             "non-numeric port",
             "role=standalone\nservice_port=12abc\n",
             "invalid service_port"
@@ -165,30 +170,35 @@ static void test_invalid_configs(void)
         {
             "primary rejects old equal replication port",
             "role=primary\nservice_port=29000\n"
-            "replication_port=29000\n",
+            "replication_port=29000\n"
+            "persistence_mode=legacy_hybrid\n",
             "replication_port has been removed; use service_port"
         },
         {
             "primary rejects old different replication port",
             "role=primary\nservice_port=29000\n"
-            "replication_port=29100\n",
+            "replication_port=29100\n"
+            "persistence_mode=legacy_hybrid\n",
             "replication_port has been removed; use service_port"
         },
         {
             "replica missing primary host",
-            "role=replica\nservice_port=29001\nprimary_port=29100\n",
+            "role=replica\nservice_port=29001\nprimary_port=29100\n"
+            "persistence_mode=legacy_hybrid\n",
             "requires primary_host"
         },
         {
             "replica missing primary port",
             "role=replica\nservice_port=29001\n"
-            "primary_host=127.0.0.1\n",
+            "primary_host=127.0.0.1\n"
+            "persistence_mode=legacy_hybrid\n",
             "requires primary_port"
         },
         {
             "standalone with replication field",
             "role=standalone\nservice_port=29000\n"
-            "replication_port=29100\n",
+            "replication_port=29100\n"
+            "persistence_mode=legacy_hybrid\n",
             "replication_port is only valid"
         },
         {
@@ -292,6 +302,7 @@ static void test_valid_primary_and_replica(void)
         "bind_ip = 127.0.0.1\n"
         "service_port = 29000\n"
         "log_level = error\n"
+        "persistence_mode=legacy_hybrid\n"
     );
 
     assert(primary.role == KVS_ROLE_PRIMARY);
@@ -304,6 +315,7 @@ static void test_valid_primary_and_replica(void)
         "service_port = 29001\n"
         "primary_host = 127.0.0.1\n"
         "primary_port = 29100\n"
+        "persistence_mode=legacy_hybrid\n"
     );
 
     assert(replica.role == KVS_ROLE_REPLICA);
@@ -379,6 +391,7 @@ static void test_allocator_config(void)
     kvs_config_t config = load_valid(
         "role=standalone\n"
         "service_port=29000\n"
+        "persistence_mode=snapshot\n"
     );
     assert(config.allocator_backend == KVS_ALLOCATOR_POOL);
 
@@ -387,6 +400,7 @@ static void test_allocator_config(void)
         "role=standalone\n"
         "service_port=29000\n"
         "allocator=system\n"
+        "persistence_mode=snapshot\n"
     );
     assert(config.allocator_backend == KVS_ALLOCATOR_SYSTEM);
 
@@ -394,6 +408,7 @@ static void test_allocator_config(void)
         "role=standalone\n"
         "service_port=29000\n"
         "allocator=pool\n"
+        "persistence_mode=snapshot\n"
     );
     assert(config.allocator_backend == KVS_ALLOCATOR_POOL);
 

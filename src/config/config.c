@@ -308,6 +308,13 @@ static int validate_config(
         );
     }
 
+    if (!seen[FIELD_PERSISTENCE_MODE]) {
+        return config_error(
+            error, error_capacity, path, 0,
+            "missing required field 'persistence_mode'"
+        );
+    }
+
     switch (parsed->role) {
     case KVS_ROLE_STANDALONE:
         if (seen[FIELD_REPLICATION_PORT]) {
@@ -434,7 +441,6 @@ int kvs_config_load(
     /* 默认值只放在临时对象中；解析失败不会改动调用方的 config。 */
     snprintf(parsed.bind_ip, sizeof(parsed.bind_ip), "%s", "0.0.0.0");
     parsed.log_level = KVS_LOG_INFO;
-    parsed.persistence_mode = KVS_PERSISTENCE_LEGACY_HYBRID;
     parsed.allocator_backend = KVS_ALLOCATOR_POOL;
 
     file = fopen(path, "r");
