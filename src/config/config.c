@@ -338,6 +338,14 @@ static int validate_config(
                 "primary_port is only valid for role=replica"
             );
         }
+        if (parsed->persistence_mode != KVS_PERSISTENCE_SNAPSHOT &&
+            parsed->persistence_mode != KVS_PERSISTENCE_AOF) {
+            return config_error(
+                error, error_capacity, path,
+                field_lines[FIELD_PERSISTENCE_MODE],
+                "standalone supports only persistence_mode=snapshot or aof"
+            );
+        }
         break;
 
     case KVS_ROLE_PRIMARY:

@@ -12,8 +12,8 @@
 #define KVS_CONFIG_PRIMARY_HOST_CAPACITY 256
 
 /*
- * standalone 支持以下三种持久化模式。
- * primary/replica 当前只允许 legacy_hybrid，以保留现有复制流程。
+ * standalone 只支持 snapshot 和 aof。
+ * primary/replica 暂时保留 legacy_hybrid，等待后续迁移。
  */
 typedef enum {
     KVS_PERSISTENCE_LEGACY_HYBRID = 0,

@@ -17,7 +17,7 @@ static void test_valid_standalone(void)
         "\n"
         " log_level = debug \n"
         " service_port = 29000 \n"
-        " persistence_mode = legacy_hybrid \n"
+        " persistence_mode = snapshot \n"
         " bind_ip = 127.0.0.1 \n"
         " role = standalone \n";
 
@@ -43,7 +43,7 @@ static void test_valid_standalone(void)
     assert(strcmp(config.bind_ip, "127.0.0.1") == 0);
     assert(config.service_port == 29000);
     assert(config.log_level == KVS_LOG_DEBUG);
-    assert(config.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
+    assert(config.persistence_mode == KVS_PERSISTENCE_SNAPSHOT);
 
     /* 单机角色不应凭空产生主从端口或上游地址。 */
     assert(config.replication_port == 0);
@@ -106,6 +106,13 @@ static void test_invalid_configs(void)
     };
 
     static const struct invalid_case cases[] = {
+        {
+            "standalone rejects legacy hybrid",
+            "role=standalone\n"
+            "service_port=29000\n"
+            "persistence_mode=legacy_hybrid\n",
+            "standalone supports only persistence_mode=snapshot or aof"
+        },
         {
             "unknown field",
             "role=standalone\nservice_port=29000\nmystery=1\n",
@@ -365,7 +372,7 @@ static void test_example_config_files(void)
     assert(strcmp(standalone.bind_ip, "127.0.0.1") == 0);
     assert(standalone.service_port == 29002);
     assert(standalone.log_level == KVS_LOG_INFO);
-    assert(standalone.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
+    assert(standalone.persistence_mode == KVS_PERSISTENCE_SNAPSHOT);
 
     kvs_config_t primary = load_example("config/primary.conf");
     assert(primary.role == KVS_ROLE_PRIMARY);

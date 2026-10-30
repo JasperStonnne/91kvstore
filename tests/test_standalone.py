@@ -325,7 +325,7 @@ def test_other_log_level(test_dir, level):
             "bind_ip = 127.0.0.1\n"
             f"service_port = {port}\n"
             f"log_level = {level}\n"
-            "persistence_mode = legacy_hybrid\n",
+            "persistence_mode = snapshot\n",
             encoding="utf-8",
         )
 
@@ -395,7 +395,7 @@ def test_invalid_config_startup(test_dir):
         "bind_ip = 127.0.0.1\n"
         f"service_port = {port}\n"
         "log_level = verbose\n"
-        "persistence_mode = legacy_hybrid\n",
+        "persistence_mode = snapshot\n",
         encoding="utf-8",
     )
 
@@ -643,8 +643,8 @@ def test_resp2_save(port, test_dir):
         raise TestFailure(f"RESP2 SAVE returned {save_reply!r}")
     if wrong_arity != b"-ERR wrong number of arguments for SAVE\r\n":
         raise TestFailure(f"RESP2 SAVE wrong arity returned {wrong_arity!r}")
-    if not (test_dir / "snapshot.db").is_file():
-        raise TestFailure("RESP2 SAVE did not create snapshot.db")
+    if not (test_dir / "snapshot.bin").is_file():
+        raise TestFailure("RESP2 SAVE did not create snapshot.bin")
 
     print("[PASS] RESP2 SAVE reply, arity and Snapshot file")
 
@@ -782,7 +782,7 @@ def main():
                 "bind_ip = 127.0.0.1\n"
                 f"service_port = {port}\n"
                 "log_level = info\n"
-                "persistence_mode = legacy_hybrid\n",
+            "persistence_mode = snapshot\n",
                 encoding="utf-8",
             )
             with log_path.open("ab") as log:
