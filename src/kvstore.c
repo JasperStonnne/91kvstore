@@ -705,6 +705,30 @@ static int kvs_execute_fields(
         return result;
     }
 
+    /* Replica 未同步完成时，只允许客户端 PING 探活。 */
+    if (source == KVS_COMMAND_SOURCE_CLIENT &&
+        kvs_server_role == KVS_ROLE_REPLICA &&
+        !kvs_replication_is_online()) {
+
+        static const char reply[] =
+            "-LOADING replica synchronization in progress\r\n";
+        const size_t reply_length = sizeof(reply) - 1;
+        int result = -1;
+
+        /* 将错误回复写入当前响应缓冲区。 */
+        if (reply_length <= (size_t)reply_capacity) {
+            memcpy(reply_data, reply, reply_length);
+            result = (int)reply_length;
+        }
+
+        /* 提前返回前，释放已经解析出的命令字段。 */
+        for (size_t i = 0; i < field_count; i++) {
+            kvs_free(tokens[i]);
+        }
+
+        return result;
+    }
+
         if (source == KVS_COMMAND_SOURCE_CLIENT &&
         strcmp(tokens[0], "SAVE") == 0) {
         static const char ok[] = "+OK\r\n";
@@ -1218,7 +1242,8 @@ void dest_kvengine(void){
  * Engine 的销毁、初始化和恢复仍由 kvstore 模块负责。
  */
 static int kvs_install_replication_snapshot(
-    const char *snapshot_path)
+    const char *snapshot_path,
+    long long aof_offset)
 {
     if(snapshot_path==NULL || snapshot_path[0]=='\0'){
         return -1;
@@ -1238,12 +1263,9 @@ static int kvs_install_replication_snapshot(
      * 逐行读取 Snapshot，并通过 RECOVERY 来源执行 SET/HSET 等命令。
      * 恢复命令不会被当成普通客户端写入。
      */
-    long long snapshot_offset=kvs_snapshot_load(
-        snapshot_path,
-        kvs_recovery_fields_protocol
-    );
+    int load_result = kvs_snapshot_store_load(snapshot_path);
 
-    if(snapshot_offset<0){
+    if (load_result != 0) {
 
         dest_kvengine();
 
@@ -1257,7 +1279,7 @@ static int kvs_install_replication_snapshot(
         return -1;
     }
 
-    if(kvs_aof_reset_to_offset(snapshot_offset)<0){
+    if(kvs_aof_reset_to_offset(aof_offset)<0){
         /*
          * AOF 无法对齐时，不能继续提供刚加载的数据，
          * 否则当前内存与重启后的恢复结果可能不一致。
@@ -1295,8 +1317,13 @@ static int kvs_server_run(kvs_config_t config)
         fprintf(stderr, "failed to initialize KV engines\n");
         return EXIT_FAILURE;
     }
-
-    if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
+    if (config.role == KVS_ROLE_REPLICA) {
+        if (kvs_aof_open("appendonly.aof") < 0) {
+            fprintf(stderr, "failed to open replica AOF\n");
+            dest_kvengine();
+            return EXIT_FAILURE;
+        }
+    }else if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
         int load_result = kvs_snapshot_store_load("snapshot.bin");
 
         if (load_result < 0) {

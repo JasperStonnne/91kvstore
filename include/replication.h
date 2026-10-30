@@ -21,7 +21,10 @@ typedef struct {
     long long acknowledged_offset;        // Replica 已确认处理完成的位置
 } kvs_replica_connection_t;
 
-typedef int (*kvs_snapshot_install_handler)(const char *snapshot_path);
+typedef int (*kvs_snapshot_install_handler)(
+    const char *snapshot_path,
+    long long aof_offset
+);
 typedef int (*kvs_replication_command_handler)(
     const kvs_slice_t *fields,
     size_t field_count,
@@ -49,6 +52,8 @@ int kvs_replication_init(
     kvs_replication_command_handler command_handler
 );
 void kvs_replication_destroy(void);
+/* Replica 已进入 ONLINE 返回 1，否则返回 0。 */
+int kvs_replication_is_online(void);
 void kvs_replication_on_replica_disconnected(int connection_fd);
 
 #endif

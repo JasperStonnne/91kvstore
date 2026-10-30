@@ -12,8 +12,9 @@ void *kvs_malloc(size_t size) { return malloc(size); }
 void kvs_free(void *ptr) { free(ptr); }
 
 /* 验证接收的文件字节；这里不测试引擎加载。 */
-static int verify_snapshot(const char *path)
+static int verify_snapshot(const char *path,long long aof_offset)
 {
+    assert(aof_offset==0);
     static const char expected[] = "AOF_OFFSET 0\n";
     char actual[sizeof(expected)];
 

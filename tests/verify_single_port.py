@@ -78,7 +78,7 @@ class Fixture:
 
     def start(self, role, upstream=None):
         directory = self.root / role
-        directory.mkdir()
+        directory.mkdir(exist_ok=True)
         port = self.primary_port if role == "primary" else self.replica_port
         config = (
             f"role={role}\nbind_ip=127.0.0.1\nservice_port={port}\n"
@@ -136,6 +136,24 @@ class Fixture:
         expected = f"0100007F:{self.primary_port:04X}"
         require(listeners == [expected],
                 f"unexpected Primary LISTEN sockets: {listeners}; expected {expected}")
+
+    def stop(self, process):
+        owned = [
+            item for item in self.processes
+            if item[0] is process
+        ]
+        require(len(owned) == 1,
+                "cannot stop a process not owned by this fixture")
+
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+        self.processes.remove(owned[0])
 
     def close(self):
         # Replica first; never kill processes that this fixture did not start.
@@ -301,6 +319,25 @@ def catchup_case(fixture):
         require(gate.metadata is not None, "missing Snapshot metadata")
         snapshot_offset, snapshot_size = gate.metadata
         require(snapshot_size >= len(payload) * 512, "Snapshot fixture is unexpectedly small")
+        # 此时快照被暂停，Replica 尚未收到全量数据。
+        probe = Client(fixture.replica_port)
+        try:
+            require(probe.command("PING") == b"PONG",
+                    "Replica PING failed during synchronization")
+
+            probe.sock.sendall(frame("HGET", "seed_0"))
+            reply = probe.file.readline()
+
+            require(
+                reply == b"-LOADING replica synchronization in progress\r\n",
+                f"Replica should reject reads before ONLINE: {reply!r}"
+            )
+        finally:
+            probe.close()
+
+        print("[PASS] Replica allows PING and rejects reads before ONLINE",
+              flush=True)
+
         require(writer.command("HSET", "catchup_probe", "written while Snapshot held") == b"OK",
                 "write during Snapshot failed")
         for i in range(16):
@@ -335,6 +372,75 @@ def catchup_case(fixture):
             gate.close()
 
 
+def restart_case(fixture):
+    primary = fixture.start("primary")
+    fixture.assert_listener(primary)
+    writer = Client(fixture.primary_port)
+    gate = None
+
+    try:
+        require(writer.command("HSET", "restart_base", "before") == b"OK",
+                "initial write failed")
+
+        replica = fixture.start("replica", fixture.primary_port)
+        fixture.online()
+
+        # 停止 Replica，保留它原来的工作目录。
+        fixture.stop(replica)
+
+        # 故意破坏测试目录中的旧文件，验证启动时不会恢复它们。
+        (fixture.root / "replica" / "snapshot.db").write_bytes(
+            b"invalid old snapshot\n")
+        (fixture.root / "replica" / "appendonly.aof").write_bytes(
+            b"invalid old AOF\n")
+
+        require(writer.command("HSET", "restart_base", "after") == b"OK",
+                "update while Replica stopped failed")
+        require(writer.command("HSET", "restart_new", "new-value") == b"OK",
+                "new write while Replica stopped failed")
+
+        # 重启 Replica，并暂停这次新全量的传输。
+        gate = SnapshotGate(fixture.primary_port)
+        if fixture.replica_port == gate.port:
+            fixture.replica_port = free_port()
+
+        fixture.start("replica", gate.port)
+        require(gate.header_ready.wait(timeout=30),
+                "restarted Replica did not request FULLRESYNC")
+        gate.check()
+        require(gate.metadata is not None,
+                "missing fresh Snapshot metadata")
+
+        client = Client(fixture.replica_port)
+        try:
+            require(client.command("PING") == b"PONG",
+                    "restarted Replica PING failed")
+
+            client.sock.sendall(frame("HGET", "restart_base"))
+            reply = client.file.readline()
+            require(
+                reply == b"-LOADING replica synchronization in progress\r\n",
+                f"restarted Replica served reads before ONLINE: {reply!r}"
+            )
+
+            gate.release.set()
+            fixture.online()
+            gate.check()
+
+            require(client.command("HGET", "restart_base") == b"after",
+                    "restarted Replica did not load current Primary data")
+            require(client.command("HGET", "restart_new") == b"new-value",
+                    "restarted Replica is missing new Primary data")
+        finally:
+            client.close()
+
+        print("[PASS] Replica restart ignores old files and requests fresh full sync",
+              flush=True)
+    finally:
+        writer.close()
+        if gate is not None:
+            gate.close()
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path, help="Linux repository path")
@@ -346,7 +452,11 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="91kv-single-port-acceptance-"))
     success = False
     try:
-        for name, case in (("empty", empty_case), ("catchup", catchup_case)):
+        for name, case in (
+            ("empty", empty_case),
+            ("catchup", catchup_case),
+            ("restart", restart_case),
+        ):
             case_dir = root / name
             case_dir.mkdir()
             fixture = Fixture(case_dir, binary)
@@ -355,7 +465,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] acceptance scenarios: 2 passed; owned server processes stopped", flush=True)
+        print("[PASS] acceptance scenarios: 3 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

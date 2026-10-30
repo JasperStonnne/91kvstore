@@ -3,6 +3,7 @@
 #include "server.h"
 #include "log.h"
 #include <stdio.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <sys/random.h>
 #include <errno.h>
@@ -430,7 +431,8 @@ static int kvs_replication_upstream_network_protocol(
              */
             if(replication_manager.snapshot_install_handler==NULL ||
                replication_manager.snapshot_install_handler(
-                   KVS_REPLICATION_REPLICA_SNAPSHOT_PATH) < 0){
+                   KVS_REPLICATION_REPLICA_SNAPSHOT_PATH,
+                   replication_manager.replication_offset) < 0){
                 return -1;
             }
 
@@ -792,13 +794,31 @@ static int kvs_replication_frame_protocol(
             return -1;
         }
 
-        kvs_snapshot_metadata_t snapshot_metadata;
+        kvs_snapshot_metadata_t snapshot_metadata = {
+            .aof_offset = kvs_aof_get_offset(),
+            .file_size = -1
+        };
 
-        if(kvs_snapshot_save(
-                KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH,
-                &snapshot_metadata) < 0){
+        if (snapshot_metadata.aof_offset < 0) {
             return -1;
         }
+
+        if (kvs_snapshot_store_save(
+                KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH) < 0) {
+            return -1;
+        }
+
+        struct stat snapshot_stat;
+        if (stat(KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH,
+                 &snapshot_stat) < 0 ||
+            !S_ISREG(snapshot_stat.st_mode) ||
+            snapshot_stat.st_size <= 0) {
+            return -1;
+        }
+
+        snapshot_metadata.file_size =
+            (long long)snapshot_stat.st_size;
+
         kvs_snapshot_reader_close(
             &replication_manager.snapshot_reader
         ); // 清理上一次可能残留的读取任务
@@ -1017,6 +1037,14 @@ void kvs_replication_on_replica_disconnected(int connection_fd)
     replication_manager.snapshot_connection_fd = -1;
     replication_manager.snapshot_file_size = -1;
     replication_manager.state = KVS_REPLICATION_STATE_DISCONNECTED;
+}
+
+int kvs_replication_is_online(void)
+{
+    return replication_manager.initialized &&
+           replication_manager.role == KVS_ROLE_REPLICA &&
+           replication_manager.primary_connection_fd >= 0 &&
+           replication_manager.state == KVS_REPLICATION_STATE_ONLINE;
 }
 
 void kvs_replication_destroy(void)
