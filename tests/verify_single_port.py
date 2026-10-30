@@ -441,6 +441,54 @@ def restart_case(fixture):
         if gate is not None:
             gate.close()
 
+def primary_restart_case(fixture):
+    primary = fixture.start("primary")
+    fixture.assert_listener(primary)
+
+    writer = Client(fixture.primary_port)
+    try:
+        require(writer.command("HSET", "base", "before") == b"OK",
+                "initial Primary write failed")
+        require(writer.command("HSET", "stable", "kept") == b"OK",
+                "stable key write failed")
+
+        require(writer.command("SAVE") == b"OK",
+                "Primary SAVE failed")
+        require((fixture.root / "primary" / "snapshot.db").is_file(),
+                "Primary SAVE did not create snapshot")
+
+        # 这两条变更发生在 SAVE 之后，必须通过 AOF 恢复。
+        require(writer.command("HMOD", "base", "after") == b"OK",
+                "post-SAVE modification failed")
+        require(writer.command("HSET", "new", "added") == b"OK",
+                "post-SAVE insertion failed")
+    finally:
+        writer.close()
+
+    aof_path = fixture.root / "primary" / "appendonly.aof"
+    original_aof = aof_path.read_bytes()
+
+    fixture.stop(primary)
+    primary = fixture.start("primary")
+    fixture.assert_listener(primary)
+
+    reader = Client(fixture.primary_port)
+    try:
+        require(reader.command("HGET", "base") == b"after",
+                "post-SAVE modification was not recovered")
+        require(reader.command("HGET", "stable") == b"kept",
+                "Snapshot data was not recovered")
+        require(reader.command("HGET", "new") == b"added",
+                "post-SAVE insertion was not recovered")
+    finally:
+        reader.close()
+
+    require(aof_path.read_bytes() == original_aof,
+            "Primary recovery unexpectedly modified AOF")
+
+    print("[PASS] Primary restart restores binary Snapshot and later AOF",
+          flush=True)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path, help="Linux repository path")
@@ -456,6 +504,7 @@ def main():
             ("empty", empty_case),
             ("catchup", catchup_case),
             ("restart", restart_case),
+            ("primary_restart", primary_restart_case),
         ):
             case_dir = root / name
             case_dir.mkdir()
@@ -465,7 +514,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] acceptance scenarios: 3 passed; owned server processes stopped", flush=True)
+        print("[PASS] acceptance scenarios: 4 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

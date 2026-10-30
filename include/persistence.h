@@ -4,6 +4,27 @@
 int kvs_aof_open(const char *path);
 int kvs_aof_append(char **tokens, int count);
 int kvs_aof_close(void);
+int kvs_snapshot_store_save(const char *path);
+int kvs_snapshot_store_load(const char *path);
+
+/* 快照可选的检查点元数据，由上层提供和解释。 */
+typedef struct {
+    int has_offset;       /* 1：携带 O；0：不携带 O */
+    long long offset;     /* has_offset 为 1 时有效 */
+} kvs_snapshot_checkpoint_t;
+
+/* 保存快照及可选检查点；checkpoint 为 NULL 时不携带 O。 */
+int kvs_snapshot_store_save_with_checkpoint(
+    const char *path,
+    const kvs_snapshot_checkpoint_t *checkpoint
+);
+
+/* 加载快照，同时读回检查点信息。 */
+int kvs_snapshot_store_load_with_checkpoint(
+    const char *path,
+    kvs_snapshot_checkpoint_t *checkpoint
+);
+
 /*
  * 将本地 AOF 文件长度和写入位置调整到指定复制 offset。
  * Replica 安装全量 Snapshot 后使用。
@@ -15,13 +36,7 @@ typedef int (*aof_replay_handler)(
     char *response,
     int response_capacity
 );
-typedef int (*snapshot_replay_handler)(
-    const kvs_slice_t *fields,
-    size_t field_count,
-    char *response,
-    int response_capacity
 
-);
 int kvs_aof_replay(const char *path,long long offset,aof_replay_handler handler);
 typedef struct {
     int fd;                  // 专门用于读取 AOF 的文件描述符
@@ -51,9 +66,9 @@ int kvs_snapshot_writer_write(kvs_snapshot_writer_t *writer,const char *data,int
 int kvs_snapshot_writer_commit(kvs_snapshot_writer_t *writer,const char *temp_path,const char *final_path);
 void kvs_snapshot_writer_abort(kvs_snapshot_writer_t *writer,const char *temp_path);
 
-int kvs_snapshot_save(const char *path,kvs_snapshot_metadata_t *metadata);
+
 long long kvs_aof_get_offset(void);
-long long kvs_snapshot_load(const char* path,snapshot_replay_handler handler);
+
 
 /*
  * 独立二进制 Snapshot，不依赖 AOF。
@@ -77,7 +92,6 @@ typedef enum {
     KVS_SNAPSHOT_ENGINE_SKIPLIST = 4
 } kvs_snapshot_engine_t;
 
-int kvs_snapshot_store_save(const char *path);
-int kvs_snapshot_store_load(const char *path);
+
 
 #endif

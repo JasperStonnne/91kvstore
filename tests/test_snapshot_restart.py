@@ -175,9 +175,10 @@ def main():
             original[-4:], "big"
         )
 
-        # 文件头占20字节，其中第12～19字节保存记录总数。
-        record_count = int.from_bytes(original[12:20], "big")
-        position = 20
+        # 新保存的 v2 文件头为32字节，记录数位于第16～23字节。
+        assert int.from_bytes(original[8:12], "big") == 2
+        record_count = int.from_bytes(original[16:24], "big")
+        position = 32
 
         # 为快照中的每条记录分别构造一个重复记录文件。
         for index in range(record_count):
@@ -197,9 +198,9 @@ def main():
 
             # 更新头部记录数，保留原记录，并在末尾追加重复记录。
             payload = (
-                original[:12]
+                original[:16]
                 + (record_count + 1).to_bytes(8, "big")
-                + original[20:-4]
+                + original[24:-4]
                 + duplicate_record
             )
 

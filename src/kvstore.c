@@ -112,7 +112,18 @@ static int kvs_save_current_snapshot(void)
     }
 
     if (kvs_persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID) {
-        return kvs_snapshot_save("snapshot.db", NULL);
+        long long offset = kvs_aof_get_offset();
+        if (offset < 0) {
+            return -1;
+        }
+
+        kvs_snapshot_checkpoint_t checkpoint = {
+            .has_offset = 1,
+            .offset = offset
+        };
+
+        return kvs_snapshot_store_save_with_checkpoint(
+            "snapshot.db", &checkpoint);
     }
 
     errno = ENOTSUP;
@@ -1263,10 +1274,14 @@ static int kvs_install_replication_snapshot(
      * 逐行读取 Snapshot，并通过 RECOVERY 来源执行 SET/HSET 等命令。
      * 恢复命令不会被当成普通客户端写入。
      */
-    int load_result = kvs_snapshot_store_load(snapshot_path);
+    kvs_snapshot_checkpoint_t checkpoint = {0};
 
-    if (load_result != 0) {
+    int load_result = kvs_snapshot_store_load_with_checkpoint(
+        snapshot_path, &checkpoint);
 
+    if (load_result != 0 ||
+        !checkpoint.has_offset ||
+        checkpoint.offset != aof_offset) {
         dest_kvengine();
 
         if (init_kvengine() < 0) {
@@ -1350,15 +1365,21 @@ static int kvs_server_run(kvs_config_t config)
             return 1;
         }
     } else {
-        long long offset = kvs_snapshot_load(
-            "snapshot.db", kvs_recovery_fields_protocol
-        );
+        kvs_snapshot_checkpoint_t checkpoint = {0};
 
-        if (offset < 0) {
-            fprintf(stderr, "failed to load snapshot\n");
+        int load_result =
+            kvs_snapshot_store_load_with_checkpoint(
+                "snapshot.db", &checkpoint);
+
+        if (load_result < 0 ||
+            (load_result == 0 && !checkpoint.has_offset)) {
+            fprintf(stderr, "failed to load snapshot with checkpoint\n");
             dest_kvengine();
-            return 1;
+            return EXIT_FAILURE;
         }
+
+        long long offset =
+            load_result == 1 ? 0 : checkpoint.offset;
 
         if (kvs_aof_replay(
                 "appendonly.aof",

@@ -37,7 +37,6 @@ OBJS := \
 	$(BUILD_DIR)/kvs_hash.o \
 	$(BUILD_DIR)/kvs_skiplist.o \
 	$(BUILD_DIR)/aof.o \
-	$(BUILD_DIR)/snapshot.o \
 	$(BUILD_DIR)/snapshot_io.o \
 	$(BUILD_DIR)/snapshot_store.o \
 	$(BUILD_DIR)/mapped_file.o \
@@ -128,12 +127,6 @@ $(BUILD_DIR)/aof.o: \
 	$(INCLUDE_DIR)/kvs_allocator.h \
     $(INCLUDE_DIR)/mapped_file.h \
     $(INCLUDE_DIR)/uring_io.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/snapshot.o: \
-	$(PERSISTENCE_DIR)/snapshot.c \
-	$(INCLUDE_DIR)/persistence.h \
-	$(INCLUDE_DIR)/kvstore.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/snapshot_io.o: \

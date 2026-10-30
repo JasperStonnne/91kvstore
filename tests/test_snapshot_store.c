@@ -174,6 +174,143 @@ static void test_save_failure_preserves_old_snapshot(const char *path)
     puts("snapshot write failure preserves old snapshot");
 }
 
+static void test_checkpoint_roundtrip(const char *path)
+{
+    assert(kvs_hash_set(
+        &global_hash, "checkpoint_probe", "preserved") == 0);
+
+    const long long offsets[] = {
+        0,
+        (1LL << 40) + 123
+    };
+
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        kvs_snapshot_checkpoint_t written = {
+            .has_offset = 1,
+            .offset = offsets[i]
+        };
+
+        assert(kvs_snapshot_store_save_with_checkpoint(
+            path, &written) == 0);
+
+        destroy_engines();
+        create_engines();
+
+        kvs_snapshot_checkpoint_t loaded = {
+            .has_offset = -1,
+            .offset = -1
+        };
+
+        assert(kvs_snapshot_store_load_with_checkpoint(
+            path, &loaded) == 0);
+
+        assert(loaded.has_offset == 1);
+        assert(loaded.offset == written.offset);
+        expect_value(
+            kvs_hash_get(&global_hash, "checkpoint_probe"),
+            "preserved");
+    }
+
+    /* 普通保存不携带 O，不能残留上一次的检查点。 */
+    assert(kvs_snapshot_store_save(path) == 0);
+    destroy_engines();
+    create_engines();
+
+    kvs_snapshot_checkpoint_t loaded = {
+        .has_offset = -1,
+        .offset = -1
+    };
+
+    assert(kvs_snapshot_store_load_with_checkpoint(
+        path, &loaded) == 0);
+    assert(loaded.has_offset == 0);
+    assert(loaded.offset == 0);
+    expect_value(
+        kvs_hash_get(&global_hash, "checkpoint_probe"),
+        "preserved");
+
+    puts("snapshot checkpoint roundtrip tests passed");
+}
+
+static void test_checkpoint_corruption(const char *path)
+{
+    kvs_snapshot_checkpoint_t written = {
+        .has_offset = 1,
+        .offset = 123
+    };
+    assert(kvs_snapshot_store_save_with_checkpoint(
+        path, &written) == 0);
+
+    int fd = open(path, O_RDWR);
+    assert(fd >= 0);
+
+    /* v2 的 O 位于第 24～31 字节，修改最低字节。 */
+    unsigned char original;
+    assert(pread(fd, &original, 1, 31) == 1);
+
+    unsigned char damaged = original ^ 1u;
+    assert(pwrite(fd, &damaged, 1, 31) == 1);
+
+    destroy_engines();
+    create_engines();
+
+    kvs_snapshot_checkpoint_t loaded = {
+        .has_offset = -1,
+        .offset = -1
+    };
+
+    assert(kvs_snapshot_store_load_with_checkpoint(
+        path, &loaded) == -1);
+    expect_empty();
+    assert(loaded.has_offset == -1);
+    assert(loaded.offset == -1);
+
+    /* 恢复原字节后，应能正常加载并读回 O。 */
+    assert(pwrite(fd, &original, 1, 31) == 1);
+    assert(close(fd) == 0);
+
+    assert(kvs_snapshot_store_load_with_checkpoint(
+        path, &loaded) == 0);
+    assert(loaded.has_offset == 1);
+    assert(loaded.offset == 123);
+
+    puts("snapshot checkpoint corruption test passed");
+}
+
+static void test_v1_compatibility(const char *path)
+{
+    /* 固定 v1 文件：Hash 引擎中的 name=v1，包含原格式 CRC。 */
+    static const unsigned char fixture[] = {
+        0x39, 0x31, 0x4b, 0x56, 0x53, 0x4e, 0x41, 0x50,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00, 0x02, 0x6e, 0x61, 0x6d,
+        0x65, 0x76, 0x31, 0x49, 0x26, 0xcd, 0x56
+    };
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert(fd >= 0);
+    assert(write(fd, fixture, sizeof(fixture)) ==
+           (ssize_t)sizeof(fixture));
+    assert(close(fd) == 0);
+
+    kvs_snapshot_checkpoint_t checkpoint = {
+        .has_offset = -1,
+        .offset = -1
+    };
+
+    assert(kvs_snapshot_store_load_with_checkpoint(
+        path, &checkpoint) == 0);
+    expect_value(kvs_hash_get(&global_hash, "name"), "v1");
+    assert(checkpoint.has_offset == 0);
+    assert(checkpoint.offset == 0);
+
+    destroy_engines();
+    create_engines();
+
+    puts("snapshot v1 compatibility test passed");
+}
+
 int main(void)
 {
     assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
@@ -195,6 +332,7 @@ int main(void)
     /* 不存在的文件与损坏文件是不同情况。 */
     assert(kvs_snapshot_store_load(path) == 1);
     expect_empty();
+    test_v1_compatibility(path);
 
     /* 空数据也必须能保存和恢复。 */
     /* 空数据也必须能保存和恢复。 */
@@ -242,7 +380,9 @@ int main(void)
     expect_value(kvs_skiplist_get(&global_skiplist, "name"), "Skiplist");
 
     assert(kvs_rbtree_get(&global_rbtree, "deleted") == NULL);
+    test_checkpoint_roundtrip(path);
     test_rejects_corruption(path);
+    test_checkpoint_corruption(path);
     destroy_engines();
 
     assert(unlink(path) == 0);

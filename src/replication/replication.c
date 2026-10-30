@@ -803,8 +803,14 @@ static int kvs_replication_frame_protocol(
             return -1;
         }
 
-        if (kvs_snapshot_store_save(
-                KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH) < 0) {
+        kvs_snapshot_checkpoint_t checkpoint = {
+            .has_offset = 1,
+            .offset = snapshot_metadata.aof_offset
+        };
+
+        if (kvs_snapshot_store_save_with_checkpoint(
+                KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH,
+                &checkpoint) < 0) {
             return -1;
         }
 

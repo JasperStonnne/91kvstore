@@ -17,10 +17,18 @@
 #define SNAPSHOT_MAGIC "91KVSNAP"
 #define SNAPSHOT_MAGIC_SIZE 8u
 
-#define SNAPSHOT_VERSION 1u
+#define SNAPSHOT_VERSION_V1 1u
+#define SNAPSHOT_VERSION_V2 2u
 
-/* 文件头：标识 8 + 版本 4 + 记录总数 8。 */
-#define SNAPSHOT_HEADER_SIZE 20u
+/* v1：标识 8 + 版本 4 + 记录数 8。 */
+#define SNAPSHOT_HEADER_V1_SIZE 20u
+
+/* v2：标识 8 + 版本 4 + 标志 4 + 记录数 8 + offset 8。 */
+#define SNAPSHOT_HEADER_V2_SIZE 32u
+
+/* 标志位：该快照是否携带有效 offset。 */
+#define SNAPSHOT_FLAG_HAS_OFFSET 1u
+
 
 /* 记录头：存储类型 1 + key 长度 4 + value 长度 4。 */
 #define SNAPSHOT_RECORD_HEADER_SIZE 9u
@@ -58,6 +66,9 @@ typedef struct {
 
     /* 下一批数据应写到文件的哪个字节位置。 */
     off_t next_file_offset;
+
+    /* 本次保存需要写入文件头的可选检查点。 */
+    kvs_snapshot_checkpoint_t checkpoint;
 } snapshot_writer_t;
 
 /* foreach 回调共用的信息。 */
@@ -75,6 +86,7 @@ typedef struct {
     const unsigned char *data; /* 映射内容的起点。 */
     size_t length;            /* 可以读取的总字节数。 */
     size_t offset;            /* 下一次从哪个字节开始读。 */
+    kvs_snapshot_checkpoint_t checkpoint;/* 从文件头解析出的检查点，完整校验通过后才可使用。 */
 } snapshot_read_cursor_t;
 
 /* 检查范围，返回映射中这一段的地址，不复制数据。 */
@@ -495,13 +507,35 @@ static int snapshot_write_header(
     uint64_t record_count,
     uint32_t *crc)
 {
-    unsigned char header[SNAPSHOT_HEADER_SIZE];
+    if (writer == NULL || crc == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const kvs_snapshot_checkpoint_t *checkpoint =
+        &writer->checkpoint;
+
+    if ((checkpoint->has_offset != 0 &&
+         checkpoint->has_offset != 1) ||
+        (checkpoint->has_offset && checkpoint->offset < 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint32_t flags = checkpoint->has_offset
+        ? SNAPSHOT_FLAG_HAS_OFFSET : 0;
+
+    uint64_t offset = checkpoint->has_offset
+        ? (uint64_t)checkpoint->offset : 0;
+
+    unsigned char header[SNAPSHOT_HEADER_V2_SIZE] = {0};
 
     memcpy(header, SNAPSHOT_MAGIC, SNAPSHOT_MAGIC_SIZE);
-    encode_u32_be(header + 8, SNAPSHOT_VERSION);
-    encode_u64_be(header + 12, record_count);
+    encode_u32_be(header + 8, SNAPSHOT_VERSION_V2);
+    encode_u32_be(header + 12, flags);
+    encode_u64_be(header + 16, record_count);
+    encode_u64_be(header + 24, offset);
 
-    /* 字节先交给缓冲区管理。 */
     if (snapshot_writer_append(
             writer, header, sizeof(header)) < 0) {
         return -1;
@@ -678,39 +712,75 @@ static int snapshot_read_header(
     uint64_t *record_count,
     uint32_t *crc)
 {
-    if (record_count == NULL || crc == NULL) {
+    if (cursor == NULL || record_count == NULL || crc == NULL) {
         errno = EINVAL;
         return -1;
     }
 
-    /* 接收文件头所在的地址，不创建文件头副本。 */
-    const unsigned char *header = NULL;
+    /* 两个版本的前 12 字节相同：标识 8 + 版本 4。 */
+    const unsigned char *prefix = NULL;
+    if (snapshot_cursor_take(cursor, &prefix, 12u) < 0) {
+        return -1;
+    }
 
-    /* 确认有完整的20字节，并让 header 指向它们。 */
+    if (memcmp(prefix, SNAPSHOT_MAGIC, SNAPSHOT_MAGIC_SIZE) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint32_t version = decode_u32_be(prefix + 8);
+    size_t header_size;
+
+    if (version == SNAPSHOT_VERSION_V1) {
+        header_size = SNAPSHOT_HEADER_V1_SIZE;
+    } else if (version == SNAPSHOT_VERSION_V2) {
+        header_size = SNAPSHOT_HEADER_V2_SIZE;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* 根据版本，读取文件头剩余部分。 */
+    const unsigned char *body = NULL;
     if (snapshot_cursor_take(
-            cursor, &header, SNAPSHOT_HEADER_SIZE) < 0) {
+            cursor, &body, header_size - 12u) < 0) {
         return -1;
     }
 
-    if (memcmp(header, SNAPSHOT_MAGIC, SNAPSHOT_MAGIC_SIZE) != 0) {
-        errno = EINVAL;
-        return -1;
+    kvs_snapshot_checkpoint_t checkpoint = {0};
+
+    if (version == SNAPSHOT_VERSION_V1) {
+        /* v1 只有记录数，不携带检查点。 */
+        *record_count = decode_u64_be(body);
+    } else {
+        uint32_t flags = decode_u32_be(body);
+        uint64_t offset = decode_u64_be(body + 12);
+
+        if ((flags & ~SNAPSHOT_FLAG_HAS_OFFSET) != 0 ||
+            offset > (uint64_t)INT64_MAX) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        checkpoint.has_offset =
+            (flags & SNAPSHOT_FLAG_HAS_OFFSET) != 0;
+        checkpoint.offset = (long long)offset;
+
+        if (!checkpoint.has_offset && offset != 0) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        *record_count = decode_u64_be(body + 4);
     }
 
-    uint32_t version = decode_u32_be(header + 8);
-    if (version != SNAPSHOT_VERSION) {
-        errno = EINVAL;
-        return -1;
-    }
+    /* 文件头的全部字段都参与 CRC，包括检查点。 */
+    *crc = snapshot_crc32_update(*crc, prefix, 12u);
+    *crc = snapshot_crc32_update(*crc, body, header_size - 12u);
 
-    /* 仍按照原来的文件格式解析和计算CRC。 */
-    *record_count = decode_u64_be(header + 12);
-    *crc = snapshot_crc32_update(
-        *crc, header, SNAPSHOT_HEADER_SIZE);
-
+    cursor->checkpoint = checkpoint;
     return 0;
 }
-
 /* 直接检查映射中的字段，不复制字段内容。 */
 static int snapshot_check_field(
     snapshot_read_cursor_t *cursor,
@@ -786,7 +856,7 @@ static int snapshot_validate(snapshot_read_cursor_t *cursor)
 {
     /* 最小文件也需要20字节文件头和4字节CRC。 */
     if (cursor == NULL ||
-        cursor->length < SNAPSHOT_HEADER_SIZE + SNAPSHOT_CHECKSUM_SIZE) {
+        cursor->length < SNAPSHOT_HEADER_V1_SIZE + SNAPSHOT_CHECKSUM_SIZE) {
         errno = EINVAL;
         return -1;
     }
@@ -801,12 +871,17 @@ static int snapshot_validate(snapshot_read_cursor_t *cursor)
         return -1;
     }
 
-    /* 扣除文件头和CRC，剩下的是记录区。 */
-    uint64_t payload_size = (uint64_t)(
-        cursor->length
-        - SNAPSHOT_HEADER_SIZE
-        - SNAPSHOT_CHECKSUM_SIZE
-    );
+    /* 文件头已解析，offset 此时是实际文件头长度。 */
+    size_t remaining = cursor->length - cursor->offset;
+
+    if (remaining < SNAPSHOT_CHECKSUM_SIZE) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* 剩余部分扣除 CRC，才是记录区。 */
+    uint64_t payload_size =
+        (uint64_t)(remaining - SNAPSHOT_CHECKSUM_SIZE);
 
     /* 每条记录至少需要9字节，记录数不能超过这个上限。 */
     if (record_count > payload_size / SNAPSHOT_RECORD_HEADER_SIZE) {
@@ -987,7 +1062,9 @@ static int snapshot_load_record(snapshot_read_cursor_t *cursor)
  * rename 之前失败保留旧文件。
  * rename 之后若同步失败，返回失败，但正式文件可能已被替换。
  */
-int kvs_snapshot_store_save(const char *path)
+int kvs_snapshot_store_save_with_checkpoint(
+    const char *path,
+    const kvs_snapshot_checkpoint_t *checkpoint)
 {
     if (path == NULL || path[0] == '\0') {
         errno = EINVAL;
@@ -1025,6 +1102,10 @@ int kvs_snapshot_store_save(const char *path)
 
     /* 本次 SAVE 共用一个 writer，初始时不持有资源。 */
     snapshot_writer_t writer = {0};
+
+    if (checkpoint != NULL) {
+        writer.checkpoint = *checkpoint;
+    }
 
     /* 1. 在正式文件旁边创建唯一临时文件。 */
     file_fd = mkstemp(temp_path);
@@ -1106,12 +1187,19 @@ done:
     return result;
 }
 
+int kvs_snapshot_store_save(const char *path)
+{
+    return kvs_snapshot_store_save_with_checkpoint(path, NULL);
+}
+
 /*
  * 调用前，四种引擎必须已初始化且为空。
  * 返回 0：成功；1：文件不存在；-1：失败。
  * 失败后，调用方必须清空可能已部分恢复的数据。
  */
-int kvs_snapshot_store_load(const char *path)
+int kvs_snapshot_store_load_with_checkpoint(
+    const char *path,
+    kvs_snapshot_checkpoint_t *checkpoint)
 {
     if (path == NULL || path[0] == '\0') {
         errno = EINVAL;
@@ -1167,6 +1255,14 @@ done:
         saved_errno = errno;
     }
 
+    if (result == 0 && checkpoint != NULL) {
+        *checkpoint = cursor.checkpoint;
+    }
+
     errno = saved_errno;
     return result;
+}
+int kvs_snapshot_store_load(const char *path)
+{
+    return kvs_snapshot_store_load_with_checkpoint(path, NULL);
 }
