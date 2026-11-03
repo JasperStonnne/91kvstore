@@ -24,6 +24,7 @@ static int installed;
 static int applied;
 static int recv_before_send;
 static int early_disconnect;
+static int partial_disconnect;
 static int oversized_chunk;
 static int starts;
 
@@ -88,7 +89,8 @@ int kvs_rdma_connection_poll_event(kvs_rdma_connection_t *connection,
         event->type = KVS_RDMA_EVENT_ESTABLISHED;
         return 1;
     }
-    if (transport.ack_sent || (early_disconnect && transport.ready_sent)) {
+    if (transport.ack_sent || (early_disconnect && transport.ready_sent) ||
+        (partial_disconnect && transport.delivered)) {
         event->type = KVS_RDMA_EVENT_DISCONNECTED;
         return 1;
     }
@@ -124,7 +126,8 @@ int kvs_rdma_connection_poll_completion(kvs_rdma_connection_t *connection,
         transport.delivered = 1;
         completion->type = KVS_RDMA_COMPLETION_RECV;
         completion->data = snapshot;
-        completion->length = sizeof(snapshot) - 1 + (oversized_chunk ? 1 : 0);
+        completion->length = partial_disconnect ? (sizeof(snapshot) - 1) / 2 :
+            sizeof(snapshot) - 1 + (oversized_chunk ? 1 : 0);
         return 1;
     }
     if (!transport.ready_completed) {
@@ -224,8 +227,9 @@ static void teardown(void)
 
 static void test_session(int reordered, int disconnect_early, int oversize)
 {
+    partial_disconnect = disconnect_early == 2;
     recv_before_send = reordered;
-    early_disconnect = disconnect_early;
+    early_disconnect = disconnect_early == 1;
     oversized_chunk = oversize;
     kvs_connector_config_t connector = setup();
     char input[512];
@@ -258,9 +262,22 @@ static void test_session(int reordered, int disconnect_early, int oversize)
     if (disconnect_early || oversize) {
         assert(result < 0 && result != KVS_STREAM_WAIT);
         assert(installed == 0 && !transport.ack_sent);
+        assert(!kvs_replication_is_online());
+        if (partial_disconnect) {
+            FILE *file = fopen("snapshot.db.replication.tmp", "rb");
+            assert(file != NULL);
+            assert(fseek(file, 0, SEEK_END) == 0);
+            assert(ftell(file) == (long)(sizeof(snapshot) - 1) / 2);
+            assert(fclose(file) == 0);
+            assert(access("snapshot.db", F_OK) < 0 && errno == ENOENT);
+            /* 外层网络关闭回调负责取消本轮，必须删掉未完成的临时快照。 */
+            connector.close_handler(123);
+            assert(access("snapshot.db.replication.tmp", F_OK) < 0 && errno == ENOENT);
+        }
         teardown();
-        puts(disconnect_early ? "[PASS] premature RDMA disconnect rejected" :
-                               "[PASS] oversized RDMA Snapshot chunk rejected");
+        puts(partial_disconnect ? "[PASS] half-transferred Snapshot disconnect: not installed, not ONLINE, temp removed" :
+             disconnect_early ? "[PASS] premature RDMA disconnect rejected" :
+                                "[PASS] oversized RDMA Snapshot chunk rejected");
         return;
     }
     assert(result == 0 && installed == 1 && transport.disconnected);
@@ -293,6 +310,7 @@ int main(void)
     test_session(0, 0, 0);
     test_session(1, 0, 0);
     test_session(0, 1, 0);
+    test_session(0, 2, 0);
     test_session(0, 0, 1);
     assert(fchdir(original_directory) == 0);
     assert(close(original_directory) == 0 && rmdir(directory) == 0);

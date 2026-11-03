@@ -118,6 +118,8 @@ int kvs_rdma_connection_receive_next(
 
 /*
  * 启动主动连接，*connection 必须初始为 NULL。
+ * timeout_ms 同时限定整个主动建连过程（含地址/路由解析及等待 ESTABLISHED）。
+ * 上层须持续 poll_event；到期返回 -1/ETIMEDOUT，成功建连后取消该期限。
  * 返回 0 表示地址解析请求提交成功，尚未建立连接。
  * 返回失败时也可能已创建对象，调用方需调用 close 清理。
  */

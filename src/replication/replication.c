@@ -19,7 +19,7 @@
 #define KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH "snapshot.db.replication.tmp"
 // Replica 完整接收后安装成正式的本地 Snapshot
 #define KVS_REPLICATION_REPLICA_SNAPSHOT_PATH "snapshot.db"
-/* RDMA 地址、路由解析操作使用的超时时间。 */
+/* Replica 主动 RDMA 建连的整体超时，包含地址、路由解析。 */
 #define KVS_REPLICATION_RDMA_RESOLVE_TIMEOUT_MS 3000
 /* 每个方向的 RDMA 缓冲区容量：1 MiB。 */
 #define KVS_REPLICATION_RDMA_BUFFER_CAPACITY (1024U * 1024U)
@@ -194,6 +194,9 @@ static void kvs_replication_on_primary_disconnected(
     replication_manager.primary_connection_fd = -1;     // 当前已经没有上游连接
     replication_manager.state =
         KVS_REPLICATION_STATE_DISCONNECTED;              // 等待后续重新连接
+    kvs_log_message(
+        KVS_LOG_INFO,
+        "replication: Replica control connection closed; synchronization cancelled\n");
 }
 
 static int kvs_replication_upstream_frame_protocol(
@@ -305,6 +308,12 @@ static int kvs_replication_upstream_frame_protocol(
                 replication_manager.primary_host,
                 replication_manager.primary_rdma_port,
                 KVS_REPLICATION_RDMA_RESOLVE_TIMEOUT_MS) < 0) {
+            kvs_log_message(
+                KVS_LOG_ERROR,
+                "replication: failed to start RDMA connection host=%s port=%u: %s\n",
+                replication_manager.primary_host,
+                (unsigned int)replication_manager.primary_rdma_port,
+                strerror(errno));
             return -1;
         }
         replication_manager.state=KVS_REPLICATION_STATE_FULL_SYNC;
@@ -670,7 +679,9 @@ if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
             if (result < 0) {
                 kvs_log_message(
                     KVS_LOG_ERROR,
-                    "replication: Replica RDMA CM poll failed: %s\n",
+                    "replication: Replica RDMA CM poll failed host=%s port=%u: %s\n",
+                    replication_manager.primary_host,
+                    (unsigned int)replication_manager.primary_rdma_port,
                     strerror(errno));
                 return -1;
             }
@@ -684,6 +695,13 @@ if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
                 if (replication_manager.state != KVS_REPLICATION_STATE_CATCH_UP ||
                     finished->snapshot_bytes != replication_manager.snapshot_file_size ||
                     finished->acknowledged_bytes != finished->snapshot_bytes) {
+                    kvs_log_message(
+                        KVS_LOG_ERROR,
+                        "replication: Replica RDMA disconnected before full-sync completion "
+                        "received=%lld expected=%lld ack=%lld\n",
+                        finished->snapshot_bytes,
+                        replication_manager.snapshot_file_size,
+                        finished->acknowledged_bytes);
                     return -1;
                 }
 
@@ -973,7 +991,8 @@ int kvs_replication_stream(
             if (result < 0) {
                 kvs_log_message(
                     KVS_LOG_ERROR,
-                    "replication: Primary RDMA CM poll failed: %s\n",
+                    "replication: Primary RDMA CM poll failed port=%u: %s\n",
+                    (unsigned int)replication_manager.rdma_port,
                     strerror(errno));
 
                 if (event.connection != NULL &&
@@ -993,6 +1012,13 @@ int kvs_replication_stream(
                         finished->send_pending ||
                         finished->snapshot_bytes != replication_manager.snapshot_file_size ||
                         finished->acknowledged_bytes != finished->snapshot_bytes) {
+                        kvs_log_message(
+                            KVS_LOG_ERROR,
+                            "replication: Primary RDMA disconnected before full-sync completion "
+                            "submitted=%lld expected=%lld ack=%lld\n",
+                            finished->snapshot_bytes,
+                            replication_manager.snapshot_file_size,
+                            finished->acknowledged_bytes);
                         return -1;
                     }
 

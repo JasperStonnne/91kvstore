@@ -11,6 +11,19 @@
 
 > 本项目用于学习和实验，不建议用于生产环境。它接受 RESP 风格的长度前缀**请求**，但目前不是完整的 Redis/RESP2 实现，不能保证与 `redis-cli` 兼容。
 
+## RDMA 现状
+
+- 已有数据的全量快照只走 RDMA；握手、控制通知和 AOF 追赶/ONLINE 增量仍走 TCP。
+- 无自动重连或断点续传；失败后需重新启动 Replica，从当前 Primary 重新全量，不接着半份快照传输。
+- 开发机使用 Soft-iWARP（`siw0`），目前只验功能，不代表物理 RDMA 网卡性能。
+- 构建需安装 `librdmacm-dev libibverbs-dev`；验收还需 `rdmacm-utils ibverbs-utils iproute2`。
+- Primary 配置 `role=primary`、iWARP IPv4 的 `bind_ip`、`service_port` 和必填 `rdma_port`。
+- Replica 配置 `role=replica`、自身 `service_port`、Primary 的 IPv4 和 TCP `primary_port`。
+- `rdma_port` 必须不同于 Primary 的 `service_port`，Replica 从通知获取该端口。
+- 两端在独立工作目录运行 `/仓库绝对路径/bin/kvstore /配置绝对路径/server.conf`，配置样例见 `config/`。
+- 本机复现：`RDMA_TEST_IP=172.16.145.135 make test`（替换为自己的 iWARP IPv4）。
+- 架构、完整启动配置、失败场景和双机命令见 [RDMA 验收说明](tests/README_RDMA.md)。
+
 ## 一分钟体验
 
 ### 1. 构建并启动
@@ -19,7 +32,8 @@
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential git liburing-dev netcat-openbsd
+sudo apt install -y build-essential git liburing-dev netcat-openbsd \
+    librdmacm-dev libibverbs-dev rdmacm-utils ibverbs-utils iproute2
 ```
 
 ```bash
@@ -197,32 +211,17 @@ CONNECTING
 HANDSHAKE       PING / PONG / PSYNC
     │
     ▼
-FULL_SYNC       发送并安装 Snapshot
+FULL_SYNC       RDMA 发送并安装二进制 Snapshot
     │
     ▼
-CATCH_UP        从 Snapshot 的 AOF offset 补齐增量
+CATCH_UP        TCP 从 Snapshot 的边界 O 补齐 AOF 增量
     │
     ▼
 ONLINE          持续读取新的 AOF 数据
 ```
 
-分别在两个终端、两个不同工作目录中运行，避免共用 AOF 和 Snapshot：
-
-```bash
-# Primary：19000 为客户端端口，19100 为复制端口
-mkdir -p /tmp/91kv-primary
-cd /tmp/91kv-primary
-/absolute/path/to/91kvstore/bin/kvstore primary 19000 19100
-```
-
-```bash
-# Replica：19001 为自身客户端端口，连接 Primary 的 19100
-mkdir -p /tmp/91kv-replica
-cd /tmp/91kv-replica
-/absolute/path/to/91kvstore/bin/kvstore replica 19001 127.0.0.1 19100
-```
-
-将示例中的 `/absolute/path/to/91kvstore` 换成实际仓库路径。
+当前通过配置文件启动，在两个独立工作目录运行 Primary 与 Replica。
+具体配置和启动步骤见上面的「RDMA 现状」及 `tests/README_RDMA.md`。
 
 ## 网络后端
 
@@ -316,7 +315,7 @@ make test-array-memory
 - 不完整兼容 Redis 命令语义和 RESP2 回复；`redis-cli` 不是当前受保证的客户端
 - key/value 不支持嵌入 `\0`；行命令也不支持字段中包含空格
 - Replica 尚无断线自动重连、复制 backlog 或部分重同步
-- 当前主要面向单 Replica 场景；尚无 ACK、心跳和自动故障转移
+- 当前主要面向单 Replica 场景；已有 RDMA 快照累计 ACK，尚无增量 ACK、心跳和自动故障转移
 - Snapshot、AOF 的同步文件操作可能阻塞事件处理
 - 尚未提供认证、访问控制或 TLS
 

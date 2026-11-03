@@ -149,6 +149,14 @@ class Fixture:
             config += f"rdma_port={self.rdma_port}\n"
         if role == "replica":
             config += f"primary_host={TEST_HOST}\nprimary_port={upstream}\n"
+        process, log_path = self.launch(directory, config)
+        self.wait(lambda: f"listen port : {port}" in log_path.read_text(errors="replace"),
+                  f"{role} did not start")
+        return process
+
+    def launch(self, directory, config):
+        """只启动并登记所有权；失败用例可以等待退出，不要求出现监听日志。"""
+        directory.mkdir(exist_ok=True)
         path = directory / "server.conf"
         path.write_text(config)
         log_path = directory / "server.log"
@@ -160,9 +168,7 @@ class Fixture:
             stdin=subprocess.DEVNULL,
         )
         self.processes.append((process, log_path))
-        self.wait(lambda: f"listen port : {port}" in log_path.read_text(errors="replace"),
-                  f"{role} did not start")
-        return process
+        return process, log_path
 
     def wait(self, predicate, description, timeout=90):
         deadline = time.monotonic() + timeout
@@ -240,8 +246,11 @@ class SnapshotGate:
     暂停该通知，可确定性地在 O 之后写入增量，再放行真实 RDMA 全量。
     不靠 sleep 或网速猜测同步时机，避免快照很小时测试偶发失效。
     """
-    def __init__(self, primary_port):
+    def __init__(self, primary_port, advertised_rdma_port=None):
         self.primary_port = primary_port
+        # 仅失败测试覆盖通知端口，模拟配置/发布错误；不接触实际 RDMA 数据。
+        self.advertised_rdma_port = advertised_rdma_port
+        self.full_sync_id = None
         self.listener = socket.socket()
         self.listener.bind((TEST_HOST, 0))
         self.listener.listen(1)
@@ -292,7 +301,11 @@ class SnapshotGate:
                     re.fullmatch(rb"[0-9a-f]{40}", parts[5]) is not None,
                     f"invalid replication/full-sync ID: {header!r}")
             require(0 < int(parts[4]) <= 65535, "invalid RDMA port")
+            self.full_sync_id = parts[5]
             self.metadata = (int(parts[2]), int(parts[3]))
+            if self.advertised_rdma_port is not None:
+                parts[4] = str(self.advertised_rdma_port).encode()
+                header = b" ".join(parts) + b"\r\n"
             require(self.metadata[0] >= 0 and self.metadata[1] > 0,
                     "invalid Snapshot offset or size")
             # 必须先暂停通知；若先发通知，Replica 会绕过 TCP 代理开始 RDMA。
@@ -627,6 +640,174 @@ def restart_case(fixture):
         if gate is not None:
             gate.close()
 
+def interrupted_restart_case(fixture):
+    """真实 RDMA 已写入首块后终止副本；从同一目录重启必须重新全量。"""
+    fixture.start("primary")
+    writer = Client(fixture.primary_port)
+    gate = None
+    try:
+        # 16 MiB 跨多个块，日志轮询能在首块与最终安装之间确定中断点。
+        payload = b"r" * (64 * 1024)
+        for first in range(0, 256, 8):
+            writer.sock.sendall(b"".join(
+                frame("HSET", f"interrupted_{i}", payload)
+                for i in range(first, first + 8)
+            ))
+            require(all(writer.reply() == b"OK" for _ in range(8)), "seeding failed")
+        gate = SnapshotGate(fixture.primary_port)
+        if fixture.replica_port == gate.port:
+            fixture.replica_port = free_port()
+        replica = fixture.start("replica", gate.port)
+        require(gate.header_ready.wait(10), "interrupted-sync notification missing")
+        gate.check()
+        first_id = gate.full_sync_id
+        _, expected_size = gate.metadata
+        gate.release.set()
+        replica_log = fixture.root / "replica/server.log"
+        fixture.wait(lambda: "Replica wrote Snapshot chunk" in
+                     replica_log.read_text(errors="replace"),
+                     "Replica never received first RDMA chunk", timeout=10)
+        fixture.stop(replica)
+        first_log = replica_log.read_text(errors="replace")
+        require("Snapshot installed" not in first_log and "enter ONLINE" not in first_log,
+                "test interrupted too late: Snapshot was already installed")
+        temporary = fixture.root / "replica/snapshot.db.replication.tmp"
+        require(temporary.is_file() and 0 < temporary.stat().st_size < expected_size,
+                "test did not leave a partially transferred Snapshot")
+        require(not (fixture.root / "replica/snapshot.db").exists(),
+                "partial Snapshot must not become the installed Snapshot")
+        (fixture.root / "replica/interrupted-server.log").write_text(first_log)
+        # 代理持有 TCP 上游，必须先关闭代理，再等待 Primary 清理这一轮。
+        gate.close()
+        gate = None
+        primary_log = fixture.root / "primary/server.log"
+        fixture.wait(lambda: "Replica control connection released" in
+                     primary_log.read_text(errors="replace"),
+                     "Primary did not cancel interrupted sync", timeout=10)
+        require(writer.command("HMOD", "interrupted_0", "latest") == b"OK",
+                "Primary update while Replica stopped failed")
+        require(writer.command("HSET", "interrupted_new", "new-value") == b"OK",
+                "Primary insertion while Replica stopped failed")
+        gate = SnapshotGate(fixture.primary_port)
+        if fixture.replica_port == gate.port:
+            fixture.replica_port = free_port()
+        fixture.start("replica", gate.port)
+        require(gate.header_ready.wait(10), "restarted Replica did not request full sync")
+        gate.check()
+        require(gate.full_sync_id != first_id, "restart reused the old full-sync ID")
+        gate.release.set()
+        fixture.online()
+        assert_rdma_snapshot(fixture)
+        reader = Client(fixture.replica_port)
+        try:
+            for i in range(256):
+                expected = b"latest" if i == 0 else payload
+                require(reader.command("HGET", f"interrupted_{i}") == expected,
+                        f"restarted Snapshot key {i} differs")
+            require(reader.command("HGET", "interrupted_new") == b"new-value",
+                    "fresh Snapshot omitted offline writes")
+        finally:
+            reader.close()
+        require(not temporary.exists(), "successful restart left partial Snapshot file")
+        print("[PASS] mid-transfer Replica stop leaves no installed Snapshot; restart performs fresh RDMA full sync",
+              flush=True)
+    finally:
+        writer.close()
+        if gate is not None:
+            gate.close()
+
+
+def listener_failure_case(fixture):
+    """实际 RDMA 端口已占用时，另一 Primary 必须明确报错并快速退出。"""
+    fixture.start("primary")
+    config = (
+        f"role=primary\nbind_ip={TEST_HOST}\nservice_port={fixture.replica_port}\n"
+        f"rdma_port={fixture.rdma_port}\n"
+        "allocator=pool\nlog_level=info\npersistence_mode=legacy_hybrid\n"
+    )
+    process, log_path = fixture.launch(fixture.root / "invalid-primary", config)
+    try:
+        status = process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Primary hung on an occupied RDMA port") from None
+    require(status != 0, "Primary unexpectedly accepted occupied RDMA port")
+    log = log_path.read_text(errors="replace")
+    require(f"failed to start RDMA listener {TEST_HOST}:{fixture.rdma_port}:" in log,
+            f"startup failure lacks RDMA endpoint diagnostic: {log}")
+    require("listen port :" not in log, "Primary served clients without RDMA listener")
+    fixture.stop(process)
+    print("[PASS] occupied RDMA port: Primary exits within 10s with endpoint diagnostic", flush=True)
+
+
+def check_failed_handshake(fixture, silent_peer):
+    """分别检查连接拒绝，以及 TCP 连通但不回应 RDMA 的建连超时。"""
+    gate = None
+    replica = None
+    primary_log = fixture.root / "primary/server.log"
+    released_before = primary_log.read_text(errors="replace").count(
+        "Replica control connection released")
+    # 普通 TCP 监听者不处理 RDMA 握手：TCP 可连通，但不会有 CM ESTABLISHED。
+    # 用它确定性验证生产建连截止时间，而非只等待内核给出连接拒绝。
+    with socket.socket() as unused:
+        unused.bind((TEST_HOST, 0))
+        if silent_peer:
+            unused.listen(1)
+        wrong_port = unused.getsockname()[1]
+        if fixture.replica_port == wrong_port:
+            fixture.replica_port = free_port()
+        try:
+            gate = SnapshotGate(fixture.primary_port, advertised_rdma_port=wrong_port)
+            if fixture.replica_port == gate.port:
+                fixture.replica_port = free_port()
+            replica = fixture.start("replica", gate.port)
+            require(gate.header_ready.wait(10), "bad-port notification missing")
+            gate.check()
+            gate.release.set()
+            log_path = fixture.root / "replica/server.log"
+            fixture.wait(lambda: "Replica RDMA CM poll failed" in
+                         log_path.read_text(errors="replace"),
+                         "Replica hung waiting for invalid RDMA endpoint", timeout=10)
+            fixture.wait(lambda: "synchronization cancelled" in
+                         log_path.read_text(errors="replace"),
+                         "Replica failed to leave unsuccessful handshake", timeout=10)
+            log = log_path.read_text(errors="replace")
+            require(f"host={TEST_HOST} port={wrong_port}:" in log,
+                    "RDMA handshake diagnostic omits the failed endpoint")
+            expected_error = "Connection timed out" if silent_peer else "Connection refused"
+            require(expected_error in log,
+                    f"RDMA handshake diagnostic lacks expected error: {expected_error}")
+            require("enter ONLINE" not in log and "Snapshot installed" not in log,
+                    "failed RDMA handshake advanced replication state")
+            require(not (fixture.root / "replica/snapshot.db.replication.tmp").exists(),
+                    "failed handshake leaked a temporary Snapshot")
+            reader = Client(fixture.replica_port)
+            try:
+                require(reader.command("PING") == b"PONG", "failed handshake blocked PING")
+                reader.sock.sendall(frame("HGET", "missing"))
+                require(reader.file.readline() == b"-LOADING replica synchronization in progress\r\n",
+                        "failed handshake allowed data reads")
+            finally:
+                reader.close()
+            mode = "silent peer timeout" if silent_peer else "connection refused"
+            print(f"[PASS] invalid RDMA port ({mode}): bounded failure, endpoint log, no ONLINE, PING usable",
+                  flush=True)
+        finally:
+            if gate is not None:
+                gate.close()
+            if replica is not None:
+                fixture.stop(replica)
+    fixture.wait(lambda: primary_log.read_text(errors="replace").count(
+                 "Replica control connection released") > released_before,
+                 "Primary did not release the failed handshake", timeout=10)
+
+
+def handshake_failure_case(fixture):
+    """错误通知端口的即时拒绝和静默握手都必须退出同步，不得挂住事件循环。"""
+    fixture.start("primary")
+    check_failed_handshake(fixture, silent_peer=False)
+    check_failed_handshake(fixture, silent_peer=True)
+
+
 def primary_restart_case(fixture):
     """Primary 本地恢复仍使用 snapshot + checkpoint O 后的 AOF，独立于传输。"""
     primary = fixture.start("primary")
@@ -696,6 +877,9 @@ def main():
             ("catchup", catchup_case),
             ("restart", restart_case),
             ("primary_restart", primary_restart_case),
+            ("interrupted_restart", interrupted_restart_case),
+            ("listener_failure", listener_failure_case),
+            ("handshake_failure", handshake_failure_case),
         ):
             case_dir = root / name
             case_dir.mkdir()
@@ -705,7 +889,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] RDMA acceptance scenarios: 5 passed; owned server processes stopped", flush=True)
+        print("[PASS] RDMA acceptance scenarios: 8 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

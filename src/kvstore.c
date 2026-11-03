@@ -1271,8 +1271,8 @@ static int kvs_install_replication_snapshot(
     }
 
     /*
-     * 逐行读取 Snapshot，并通过 RECOVERY 来源执行 SET/HSET 等命令。
-     * 恢复命令不会被当成普通客户端写入。
+     * 校验并加载二进制 Snapshot，同时核对其中保存的 AOF 边界 O。
+     * 加载操作不作为普通客户端写命令重复追加 AOF。
      */
     kvs_snapshot_checkpoint_t checkpoint = {0};
 
@@ -1419,8 +1419,8 @@ kvs_close_current_persistence();
     if (config.role == KVS_ROLE_PRIMARY) {
         if (kvs_replication_start_rdma_listener(
                 config.bind_ip, config.rdma_port) < 0) {
-        fprintf(stderr, "failed to start RDMA listener: %s\n",
-        strerror(errno));
+        fprintf(stderr, "failed to start RDMA listener %s:%u: %s\n",
+                config.bind_ip, (unsigned int)config.rdma_port, strerror(errno));
         kvs_replication_destroy();
         kvs_close_current_persistence();
         dest_kvengine();

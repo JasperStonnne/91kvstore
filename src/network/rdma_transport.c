@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <time.h>
 #include "rdma_transport.h"
 
 /* 一组独立的 RDMA 收发缓冲区及其内存注册信息。 */
@@ -25,7 +26,7 @@ typedef struct {
 
 
 /*
- * Primary 的 RDMA 监听资源。}
+ * Primary 的 RDMA 监听资源。
 
  * event_channel 接收 CM 连接管理事件。
  * listen_id 用于绑定地址和端口、监听连接请求。
@@ -42,6 +43,8 @@ struct kvs_rdma_connection {
     struct rdma_event_channel *owned_cm_channel;
     /* 地址和路由解析使用的超时，单位毫秒。 */
     int resolve_timeout_ms;
+    /* 主动建连的单调时钟截止时间；ESTABLISHED 后清零，不限制数据传输时间。 */
+    int64_t connect_deadline_ms;
     /* 已取出但尚未确认的 CM 事件，由该对象持有。 */
     struct rdma_cm_event *pending_cm_event;
     struct ibv_pd *pd;
@@ -892,6 +895,7 @@ static int kvs_rdma_handle_connection_event(
         return rdma_connect(connection->cm_id, &parameters);
         }
     case RDMA_CM_EVENT_ESTABLISHED:
+        connection->connect_deadline_ms = 0;
         type = KVS_RDMA_EVENT_ESTABLISHED;
         break;
 
@@ -1164,6 +1168,11 @@ int kvs_rdma_connection_start(
         return -1;
     }
 
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+        return -1;
+    }
+
     kvs_rdma_connection_t *current = calloc(1, sizeof(*current));
     if (current == NULL) {
         return -1;
@@ -1171,6 +1180,8 @@ int kvs_rdma_connection_start(
 
     *connection = current;
     current->resolve_timeout_ms = timeout_ms;
+    current->connect_deadline_ms =
+        (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000 + timeout_ms;
 
     current->owned_cm_channel = rdma_create_event_channel();
     if (current->owned_cm_channel == NULL) {
@@ -1221,6 +1232,19 @@ int kvs_rdma_connection_poll_event(
         event->connection = connection;
         errno = EBUSY;
         return -1;
+    }
+
+    /* rdma_connect 没有本项目的超时参数；无 CM 事件时也必须检查截止时间。 */
+    if (connection->connect_deadline_ms != 0) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+            return -1;
+        }
+        int64_t now_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+        if (now_ms >= connection->connect_deadline_ms) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
     }
 
     int result = kvs_rdma_poll_cm_event(

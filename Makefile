@@ -23,7 +23,9 @@ CPPFLAGS := \
 
 CFLAGS := -std=gnu11 -Wall -Wextra -g
 
-LDFLAGS := -L$(NTYCO_DIR)
+# NtyCo 的 read/write/connect hook 仅用于本程序，不能截获 librdmacm 的设备操作。
+# ELF 下隐藏静态库的动态符号导出，防止终端设备写错误陷入协程等待。
+LDFLAGS := -L$(NTYCO_DIR) -Wl,--exclude-libs,libntyco.a
 RDMA_LIBS := -lrdmacm -libverbs
 LDLIBS := -lntyco -lpthread -ldl $(RDMA_LIBS)
 
