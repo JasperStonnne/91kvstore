@@ -51,6 +51,10 @@ int kvs_replication_init(
     kvs_snapshot_install_handler snapshot_install_handler,
     kvs_replication_command_handler command_handler
 );
+/* Primary 初始化复制模块后调用；失败后由 destroy 清理。 */
+int kvs_replication_start_rdma_listener(
+    const char *bind_ip,
+    unsigned short port);
 void kvs_replication_destroy(void);
 /* Replica 已进入 ONLINE 返回 1，否则返回 0。 */
 int kvs_replication_is_online(void);

@@ -13,7 +13,7 @@
 
 /*
  * standalone 只支持 snapshot 和 aof。
- * primary/replica 暂时保留 legacy_hybrid，等待后续迁移。
+ * primary/replica 的 legacy_hybrid 配置表示二进制快照 + 检查点 O + AOF。
  */
 typedef enum {
     KVS_PERSISTENCE_LEGACY_HYBRID = 0,
@@ -29,11 +29,13 @@ typedef struct {
     kvs_role_t role;
     char bind_ip[KVS_CONFIG_IPV4_CAPACITY];
     unsigned short service_port;
+    /* Primary 必填：独立的 RDMA 全量同步监听端口。 */
+    unsigned short rdma_port;
 
-    /* Primary 本机用于监听 Replica 的第二个端口。 */
+    /* 已废弃：仅用于识别并拒绝旧配置，不再监听此端口。 */
     unsigned short replication_port;
 
-    /* Replica 要连接的 Primary 地址和复制端口。 */
+    /* Replica 连接的 Primary 地址与 TCP service_port（控制消息和 AOF 增量）。 */
     char primary_host[KVS_CONFIG_PRIMARY_HOST_CAPACITY];
     unsigned short primary_port;
 

@@ -24,7 +24,8 @@ CPPFLAGS := \
 CFLAGS := -std=gnu11 -Wall -Wextra -g
 
 LDFLAGS := -L$(NTYCO_DIR)
-LDLIBS := -lntyco -lpthread -ldl
+RDMA_LIBS := -lrdmacm -libverbs
+LDLIBS := -lntyco -lpthread -ldl $(RDMA_LIBS)
 
 OBJS := \
 	$(BUILD_DIR)/kvstore.o \
@@ -32,6 +33,7 @@ OBJS := \
 	$(BUILD_DIR)/log.o \
 	$(BUILD_DIR)/codec.o \
 	$(BUILD_DIR)/ntyco.o \
+	$(BUILD_DIR)/rdma_transport.o \
 	$(BUILD_DIR)/kvs_array.o \
 	$(BUILD_DIR)/kvs_rbtree.o \
 	$(BUILD_DIR)/kvs_hash.o \
@@ -72,6 +74,7 @@ $(BUILD_DIR)/kvstore.o: \
 	$(SRC_DIR)/kvstore.c \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/replication.h \
+	$(INCLUDE_DIR)/rdma_transport.h \
 	$(INCLUDE_DIR)/protocol.h \
 	$(INCLUDE_DIR)/config.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
@@ -97,6 +100,11 @@ $(BUILD_DIR)/ntyco.o: \
 	$(NETWORK_DIR)/ntyco.c \
 	$(INCLUDE_DIR)/server.h \
 	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/rdma_transport.o: \
+	$(NETWORK_DIR)/rdma_transport.c \
+	$(INCLUDE_DIR)/rdma_transport.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kvs_array.o: \
@@ -439,12 +447,13 @@ $(BIN_DIR)/test_connection_protocol: \
 		$(SRC_DIR)/protocol/codec.c \
 		-o $@
 
-.PHONY: test-single-port
+# 同一台机器的 ACTIVE iWARP 网卡上跑真实 RDMA；没有设备时明确失败。
+.PHONY: test-rdma
 
-test-single-port: $(BIN_DIR)/kvstore
-	python3 -B $(TEST_DIR)/verify_single_port.py .
+test-rdma: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_rdma_replication.py .
 
-test-integration: test-single-port
+test-integration: test-rdma
 
 .PHONY: test-replication-boundary
 
@@ -453,12 +462,12 @@ test-replication-boundary: $(BIN_DIR)/test_replication_boundary
 
 $(BIN_DIR)/test_replication_boundary: \
 	$(TEST_DIR)/test_replication_boundary.c \
-	$(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/ntyco.o,$(OBJS)) \
+	$(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/ntyco.o $(BUILD_DIR)/rdma_transport.o,$(OBJS)) \
 	$(wildcard $(INCLUDE_DIR)/*.h) | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
 		$(TEST_DIR)/test_replication_boundary.c \
-		$(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/ntyco.o,$(OBJS)) \
-		-luring -lpthread -ldl -o $@
+		$(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/ntyco.o $(BUILD_DIR)/rdma_transport.o,$(OBJS)) \
+		-luring -lpthread -ldl $(RDMA_LIBS) -o $@
 include tests/demo.mk
 
 .PHONY: test-allocator

@@ -12,7 +12,7 @@ import uuid
 
 REQUIRED = ('primary_host', 'primary_port', 'replica_ssh', 'replica_repo',
             'replica_host', 'replica_port', 'artifacts', 'replica_artifacts')
-OPTIONAL = ('repo', 'mode', 'ssh_port', 'phase_timeout')
+OPTIONAL = ('repo', 'mode', 'ssh_port', 'phase_timeout', 'rdma_port')
 
 
 def build_command(config, script_directory, mode=None):
@@ -26,7 +26,7 @@ def build_command(config, script_directory, mode=None):
         if key not in config:
             continue
         value = config[key]
-        if key in ('primary_port', 'replica_port', 'ssh_port', 'phase_timeout'):
+        if key in ('primary_port', 'replica_port', 'ssh_port', 'phase_timeout', 'rdma_port'):
             if type(value) is not int or value < 1:
                 raise ValueError(f'{key} must be a positive integer')
             if key != 'phase_timeout' and value > 65535:
@@ -42,7 +42,7 @@ def build_command(config, script_directory, mode=None):
     run_id = 'demo_' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_') + uuid.uuid4().hex[:8]
     command = [sys.executable, '-B', str(orchestrator), '--mode', selected_mode,
                '--repo', config.get('repo', str(script_directory.parent)), '--run-id', run_id]
-    for key in REQUIRED + ('ssh_port', 'phase_timeout'):
+    for key in REQUIRED + ('ssh_port', 'phase_timeout', 'rdma_port'):
         if key in config:
             command.extend(['--' + key.replace('_', '-'), str(config[key])])
     return command

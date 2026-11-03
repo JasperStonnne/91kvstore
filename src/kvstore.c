@@ -1417,6 +1417,15 @@ kvs_close_current_persistence();
     int network_ret=-1;
 
     if (config.role == KVS_ROLE_PRIMARY) {
+        if (kvs_replication_start_rdma_listener(
+                config.bind_ip, config.rdma_port) < 0) {
+        fprintf(stderr, "failed to start RDMA listener: %s\n",
+        strerror(errno));
+        kvs_replication_destroy();
+        kvs_close_current_persistence();
+        dest_kvengine();
+        return EXIT_FAILURE;
+    }
 kvs_listener_config_t listener = {
     .port = config.service_port,
     .bind_ip = config.bind_ip,
@@ -1427,7 +1436,7 @@ kvs_listener_config_t listener = {
     .replication_close_handler =kvs_replication_on_replica_disconnected
 };
 
-/* Primary 只监听服务端口，接入后按连接协议分流。 */
+/* Service Port 处理客户端与复制控制，RDMA 监听独立管理。 */
     network_ret = ntyco_start_listeners(&listener, 1);
     } else if (config.role == KVS_ROLE_REPLICA) {
         /* Replica 监听客户端端口，同时需要连接上游 Primary。 */

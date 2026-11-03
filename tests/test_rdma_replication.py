@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Linux-only acceptance checks; run with the repository path as argument.
+"""Linux 上的真实 RDMA 全量同步验收（由 make test-rdma 调用）。
 
-Does not modify repository files. Uses a TCP relay in the catch-up case to
-hold Snapshot delivery while writing new commands to the Primary.
+Primary 与 Replica 在同一台机器的 iWARP 网卡地址上通信，不模拟 RDMA。
+TCP 仍负责握手、控制消息和 AOF 增量；快照内容必须通过 RDMA 发送。
+自动寻找 ACTIVE iWARP 网卡；也可用 RDMA_TEST_IP 指定其 IPv4 地址。
+设备缺失或同步失败会明确报错，不回退到 TCP 全量或将跳过记为通过。
 """
 import argparse
+import hashlib
+import ipaddress
+import json
 import os
 from pathlib import Path
 import re
@@ -22,9 +27,55 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+# main 在创建任何连接前设置该地址；所有测试连接共用同一张 iWARP 网卡。
+TEST_HOST = None
+RDMA_CHUNK_CAPACITY = 1024 * 1024
+
+
+def command_json(*args):
+    """仅查询系统网络信息；不创建或修改 RDMA 设备。"""
+    result = subprocess.run(args, check=True, capture_output=True, text=True,
+                            timeout=10)
+    return json.loads(result.stdout)
+
+
+def discover_rdma_host():
+    """选择可用的 iWARP IPv4，避免误用不能路由到 siw 的回环地址。"""
+    for tool in ("rdma", "ip", "ibv_devinfo"):
+        require(shutil.which(tool), f"真实 RDMA 测试需要命令: {tool}")
+
+    candidates = set()
+    for link in command_json("rdma", "-j", "link", "show"):
+        if link.get("state") != "ACTIVE" or not link.get("netdev"):
+            continue
+        device = link["ifname"]
+        info = subprocess.run(
+            ["ibv_devinfo", "-d", device], check=True,
+            capture_output=True, text=True, timeout=10,
+        )
+        if "iWARP" not in info.stdout:
+            continue
+        for interface in command_json("ip", "-j", "-4", "addr", "show",
+                                      "dev", link["netdev"]):
+            for address in interface.get("addr_info", []):
+                if address.get("family") == "inet" and address.get("scope") == "global":
+                    candidates.add(address["local"])
+
+    requested = os.environ.get("RDMA_TEST_IP")
+    if requested:
+        requested = str(ipaddress.IPv4Address(requested))
+        require(requested in candidates,
+                f"RDMA_TEST_IP={requested} 不属于 ACTIVE iWARP 网卡: {sorted(candidates)}")
+        return requested
+    require(len(candidates) == 1,
+            f"需要一个明确的 ACTIVE iWARP IPv4，发现 {sorted(candidates)}；"
+            "多地址时请设置 RDMA_TEST_IP")
+    return candidates.pop()
+
+
 def free_port():
     with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind((TEST_HOST, 0))
         return sock.getsockname()[1]
 
 
@@ -36,8 +87,9 @@ def frame(*fields):
 
 
 class Client:
+    """最小 RESP 客户端，直接核对服务器返回，不依赖额外 Python 包。"""
     def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.sock = socket.create_connection((TEST_HOST, port), timeout=10)
         self.file = self.sock.makefile("rb")
 
     def close(self):
@@ -49,6 +101,8 @@ class Client:
         require(line.endswith(b"\r\n"), "incomplete RESP response")
         if line.startswith(b"+"):
             return line[1:-2]
+        if line.startswith(b":"):
+            return int(line[1:-2])
         if line.startswith(b"$"):
             length = int(line[1:-2])
             if length == -1:
@@ -66,27 +120,35 @@ class Client:
 
 
 class Fixture:
+    """拥有每个场景的服务进程、临时配置与日志，退出时只回收自己的资源。"""
     def __init__(self, root, binary):
         self.root = root
         self.binary = binary
         self.processes = []
         self.logs = []
+        # CM 使用独立监听端口；TCP 服务端口仍同时接受客户端及复制控制连接。
         self.primary_port = free_port()
         self.replica_port = free_port()
         while self.replica_port == self.primary_port:
             self.replica_port = free_port()
+
+        self.rdma_port = free_port()
+        while self.rdma_port in (self.primary_port, self.replica_port):
+            self.rdma_port = free_port()
 
     def start(self, role, upstream=None):
         directory = self.root / role
         directory.mkdir(exist_ok=True)
         port = self.primary_port if role == "primary" else self.replica_port
         config = (
-            f"role={role}\nbind_ip=127.0.0.1\nservice_port={port}\n"
+            f"role={role}\nbind_ip={TEST_HOST}\nservice_port={port}\n"
             "allocator=pool\n"
             "log_level=info\npersistence_mode=legacy_hybrid\n"
         )
+        if role == "primary":
+            config += f"rdma_port={self.rdma_port}\n"
         if role == "replica":
-            config += f"primary_host=127.0.0.1\nprimary_port={upstream}\n"
+            config += f"primary_host={TEST_HOST}\nprimary_port={upstream}\n"
         path = directory / "server.conf"
         path.write_text(config)
         log_path = directory / "server.log"
@@ -133,7 +195,9 @@ class Fixture:
                 fields = line.split()
                 if fields[9] in inodes and fields[3] == "0A":
                     listeners.append(fields[1])
-        expected = f"0100007F:{self.primary_port:04X}"
+        # CM 的监听由内核 RDMA 子系统管理；这里检查进程持有的 TCP 服务 socket。
+        address_hex = socket.inet_aton(TEST_HOST)[::-1].hex().upper()
+        expected = f"{address_hex}:{self.primary_port:04X}"
         require(listeners == [expected],
                 f"unexpected Primary LISTEN sockets: {listeners}; expected {expected}")
 
@@ -170,11 +234,16 @@ class Fixture:
 
 
 class SnapshotGate:
-    """A test-only relay; Primary still owns exactly one listening socket."""
+    """只代理 TCP 控制和 AOF，不接触 RDMA 快照数据。
+
+    收到 FULLRESYNC_RDMA 时，Primary 已经生成快照并固定边界 O。
+    暂停该通知，可确定性地在 O 之后写入增量，再放行真实 RDMA 全量。
+    不靠 sleep 或网速猜测同步时机，避免快照很小时测试偶发失效。
+    """
     def __init__(self, primary_port):
         self.primary_port = primary_port
         self.listener = socket.socket()
-        self.listener.bind(("127.0.0.1", 0))
+        self.listener.bind((TEST_HOST, 0))
         self.listener.listen(1)
         self.listener.settimeout(30)
         self.port = self.listener.getsockname()[1]
@@ -184,6 +253,7 @@ class SnapshotGate:
         self.errors = []
         self.sockets = [self.listener]
         self.metadata = None
+        self.forwarded_bytes = 0
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -203,11 +273,8 @@ class SnapshotGate:
             self.sockets.append(downstream)
             upstream = socket.socket()
             self.sockets.append(upstream)
-            # Constrain receive buffering so the large Snapshot cannot finish
-            # sending while the gate is closed. This is not a server listener.
-            upstream.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
             upstream.settimeout(30)
-            upstream.connect(("127.0.0.1", self.primary_port))
+            upstream.connect((TEST_HOST, self.primary_port))
             ping = self.line(downstream)
             require(ping == b"PING\r\n", f"unexpected Replica handshake: {ping!r}")
             upstream.sendall(ping)
@@ -219,12 +286,19 @@ class SnapshotGate:
             upstream.sendall(psync)
             header = self.line(upstream)
             parts = header.split()
-            require(len(parts) == 4 and parts[0] == b"FULLRESYNC",
-                    f"unexpected full sync header: {header!r}")
+            require(len(parts) == 6 and parts[0] == b"FULLRESYNC_RDMA",
+                    f"expected RDMA full sync, got: {header!r}")
+            require(re.fullmatch(rb"[0-9a-f]{40}", parts[1]) is not None and
+                    re.fullmatch(rb"[0-9a-f]{40}", parts[5]) is not None,
+                    f"invalid replication/full-sync ID: {header!r}")
+            require(0 < int(parts[4]) <= 65535, "invalid RDMA port")
             self.metadata = (int(parts[2]), int(parts[3]))
-            downstream.sendall(header)
+            require(self.metadata[0] >= 0 and self.metadata[1] > 0,
+                    "invalid Snapshot offset or size")
+            # 必须先暂停通知；若先发通知，Replica 会绕过 TCP 代理开始 RDMA。
             self.header_ready.set()
             require(self.release.wait(timeout=30), "Snapshot gate was never released")
+            downstream.sendall(header)
             upstream.settimeout(0.5)
             while not self.stopped.is_set():
                 try:
@@ -233,6 +307,8 @@ class SnapshotGate:
                     continue
                 if not data:
                     break
+                # 只统计全量通知之后的 TCP 字节，稍后校验恰好是 AOF + ONLINE。
+                self.forwarded_bytes += len(data)
                 downstream.sendall(data)
         except Exception as exc:
             if not self.stopped.is_set():
@@ -255,11 +331,105 @@ class SnapshotGate:
         require(not self.thread.is_alive(), "relay thread did not stop")
 
 
+def assert_rdma_snapshot(fixture):
+    """结合传输日志和落盘文件验证真实 RDMA，而非只看最终 ONLINE 状态。"""
+    primary_log = (fixture.root / "primary/server.log").read_text(errors="replace")
+    replica_log = (fixture.root / "replica/server.log").read_text(errors="replace")
+    require("Primary verified RDMA READY" in primary_log, "missing RDMA READY")
+    # Replica 重启时 Primary 日志包含两轮传输，只验证当前这一轮。
+    session = primary_log.rsplit("Primary verified RDMA READY", 1)[1]
+    sent = [int(n) for n in re.findall(r"Primary submitted Snapshot chunk bytes=(\d+)", session)]
+    received = [int(n) for n in re.findall(r"Replica wrote Snapshot chunk bytes=(\d+)", replica_log)]
+    acknowledgements = [int(n) for n in re.findall(
+        r"Primary received Snapshot ACK bytes=(\d+)", session)]
+    source = (fixture.root / "primary/replication.snapshot").read_bytes()
+    installed = (fixture.root / "replica/snapshot.db").read_bytes()
+    require(sent and sent == received, f"RDMA chunk sequence differs: {sent} / {received}")
+    require(all(0 < n <= RDMA_CHUNK_CAPACITY for n in sent), "invalid RDMA chunk size")
+    cumulative = []
+    total = 0
+    for length in sent:
+        total += length
+        cumulative.append(total)
+    require(acknowledgements == cumulative,
+            f"cumulative ACK differs: {acknowledgements} / {cumulative}")
+    require(total == len(source) == len(installed), "Snapshot byte count differs")
+    require(hashlib.sha256(source).digest() == hashlib.sha256(installed).digest(),
+            "installed Snapshot differs from Primary Snapshot")
+    require(f"RDMA Snapshot fully acknowledged bytes={total}" in session,
+            "missing final Snapshot ACK")
+    require("Primary RDMA closed, start TCP catch-up" in session and
+            "Replica RDMA closed, resume TCP catch-up" in replica_log,
+            "RDMA did not close normally before TCP catch-up")
+    require(not (fixture.root / "replica/snapshot.db.replication.tmp").exists(),
+            "Snapshot temporary file was not committed")
+    print(f"[PASS] real RDMA Snapshot: {total} bytes, {len(sent)} chunks, cumulative ACK and SHA-256",
+          flush=True)
+    return total, sent
+
+
+def assert_tcp_catchup_only(fixture, gate):
+    """全量通知后，TCP 字节数只能等于 [O, ONLINE offset) 的 AOF 加 ONLINE 行。"""
+    log = (fixture.root / "replica/server.log").read_text(errors="replace")
+    offsets = re.findall(r"enter ONLINE offset=(\d+)", log)
+    require(offsets, "missing ONLINE offset")
+    online_offset = int(offsets[-1])
+    start, _ = gate.metadata
+    expected = online_offset - start + len(f"ONLINE {online_offset}\r\n".encode())
+    require(gate.forwarded_bytes == expected,
+            f"unexpected TCP payload: {gate.forwarded_bytes} bytes; AOF + ONLINE needs {expected}")
+
+
+def verify_online_mutations(fixture):
+    """全量完成后继续插入、修改、删除，验证增量通路没有停在 ONLINE。"""
+    writer = Client(fixture.primary_port)
+    reader = Client(fixture.replica_port)
+    try:
+        require(writer.command("SET", "online_probe", "first") == b"OK", "ONLINE SET failed")
+        fixture.wait(lambda: reader.command("GET", "online_probe") == b"first",
+                     "ONLINE insertion did not replicate")
+        require(writer.command("MOD", "online_probe", "second") == b"OK", "ONLINE MOD failed")
+        fixture.wait(lambda: reader.command("GET", "online_probe") == b"second",
+                     "ONLINE modification did not replicate")
+        require(writer.command("DEL", "online_probe") == 1, "ONLINE DEL failed")
+        fixture.wait(lambda: reader.command("GET", "online_probe") is None,
+                     "ONLINE deletion did not replicate")
+    finally:
+        reader.close()
+        writer.close()
+    print("[PASS] ONLINE AOF insertion, modification and deletion", flush=True)
+
+
+def exact_chunk_case(fixture):
+    """恰好 1 MiB 的快照：最终块不能多发，也不能等一个不存在的下一块。"""
+    fixture.start("primary")
+    writer = Client(fixture.primary_port)
+    # v2 头、检查点、单条记录和 CRC 共 53 字节（key 为 8 字节的 boundary）。
+    payload = b"z" * (RDMA_CHUNK_CAPACITY - 53)
+    try:
+        require(writer.command("SET", "boundary", payload) == b"OK", "boundary seed failed")
+    finally:
+        writer.close()
+    fixture.start("replica", fixture.primary_port)
+    fixture.online()
+    size, chunks = assert_rdma_snapshot(fixture)
+    require(size == RDMA_CHUNK_CAPACITY and chunks == [RDMA_CHUNK_CAPACITY],
+            f"exact-chunk fixture changed: size={size}, chunks={chunks}")
+    reader = Client(fixture.replica_port)
+    try:
+        require(reader.command("GET", "boundary") == payload, "boundary value differs")
+    finally:
+        reader.close()
+    print("[PASS] exact 1 MiB Snapshot completes without an extra chunk", flush=True)
+
+
 def empty_case(fixture):
+    """空数据集也要传完整二进制快照，再接受 ONLINE 增量和客户端流水线。"""
     primary = fixture.start("primary")
     fixture.assert_listener(primary)
     fixture.start("replica", fixture.primary_port)
     fixture.online()
+    assert_rdma_snapshot(fixture)
     client = Client(fixture.replica_port)
     try:
         require(client.command("HGET", "empty_probe") is None,
@@ -292,17 +462,19 @@ def empty_case(fixture):
     log = (fixture.root / "replica" / "server.log").read_text(errors="replace")
     require("enter FULL_SYNC" in log and "enter CATCH_UP" in log,
             "missing empty full-sync state transitions")
+    verify_online_mutations(fixture)
     print("[PASS] empty full sync, ONLINE increments, Primary pipeline ordering", flush=True)
 
 
 def catchup_case(fixture):
+    """固定 O → 暂停通知 → 写入增量 → RDMA 全量 → TCP AOF 追赶。"""
     primary = fixture.start("primary")
     fixture.assert_listener(primary)
     writer = Client(fixture.primary_port)
     gate = None
     try:
-        # 512 keys x 64 KiB = 32 MiB. This is a backpressure fixture,
-        # not the later 50k + 50k two-machine acceptance workload.
+        # 32 MiB 必须跨多个 RDMA 块，最后一块不足 1 MiB。
+        # 写入后的 17 条变更必须从快照边界 O 进入 AOF 追赶。
         payload = b"v" * (64 * 1024)
         for first in range(0, 512, 8):
             writer.sock.sendall(b"".join(
@@ -314,12 +486,12 @@ def catchup_case(fixture):
         if fixture.replica_port == gate.port:
             fixture.replica_port = free_port()
         fixture.start("replica", gate.port)
-        require(gate.header_ready.wait(timeout=30), "FULLRESYNC header not received")
+        require(gate.header_ready.wait(timeout=30), "FULLRESYNC_RDMA header not received")
         gate.check()
         require(gate.metadata is not None, "missing Snapshot metadata")
         snapshot_offset, snapshot_size = gate.metadata
         require(snapshot_size >= len(payload) * 512, "Snapshot fixture is unexpectedly small")
-        # 此时快照被暂停，Replica 尚未收到全量数据。
+        # 暂停的是 RDMA 启动通知，此时 Replica 尚未开始接收快照。
         probe = Client(fixture.replica_port)
         try:
             require(probe.command("PING") == b"PONG",
@@ -346,6 +518,10 @@ def catchup_case(fixture):
         gate.release.set()
         fixture.online()
         gate.check()
+        _, chunks = assert_rdma_snapshot(fixture)
+        require(len(chunks) > 1 and chunks[-1] < RDMA_CHUNK_CAPACITY,
+                "multi-chunk/tail-chunk coverage missing")
+        assert_tcp_catchup_only(fixture, gate)
         client = Client(fixture.replica_port)
         try:
             require(client.command("HGET", "catchup_probe") == b"written while Snapshot held",
@@ -373,6 +549,7 @@ def catchup_case(fixture):
 
 
 def restart_case(fixture):
+    """同一工作目录重启副本：忽略损坏旧文件，重新请求当前全量。"""
     primary = fixture.start("primary")
     fixture.assert_listener(primary)
     writer = Client(fixture.primary_port)
@@ -384,10 +561,17 @@ def restart_case(fixture):
 
         replica = fixture.start("replica", fixture.primary_port)
         fixture.online()
+        assert_rdma_snapshot(fixture)
 
         # 停止 Replica，保留它原来的工作目录。
         fixture.stop(replica)
-
+        # Replica 退出后，等待 Primary 清理旧控制连接，再启动新副本。
+        primary_log = fixture.root / "primary" / "server.log"
+        fixture.wait(
+            lambda: "replication: Replica control connection released" in
+                    primary_log.read_text(errors="replace"),
+            "Primary did not release old Replica control connection",
+        )
         # 故意破坏测试目录中的旧文件，验证启动时不会恢复它们。
         (fixture.root / "replica" / "snapshot.db").write_bytes(
             b"invalid old snapshot\n")
@@ -399,14 +583,14 @@ def restart_case(fixture):
         require(writer.command("HSET", "restart_new", "new-value") == b"OK",
                 "new write while Replica stopped failed")
 
-        # 重启 Replica，并暂停这次新全量的传输。
+        # 重启 Replica，并暂停这次全量的启动通知。
         gate = SnapshotGate(fixture.primary_port)
         if fixture.replica_port == gate.port:
             fixture.replica_port = free_port()
 
         fixture.start("replica", gate.port)
         require(gate.header_ready.wait(timeout=30),
-                "restarted Replica did not request FULLRESYNC")
+                "restarted Replica did not request FULLRESYNC_RDMA")
         gate.check()
         require(gate.metadata is not None,
                 "missing fresh Snapshot metadata")
@@ -426,6 +610,8 @@ def restart_case(fixture):
             gate.release.set()
             fixture.online()
             gate.check()
+            assert_rdma_snapshot(fixture)
+            assert_tcp_catchup_only(fixture, gate)
 
             require(client.command("HGET", "restart_base") == b"after",
                     "restarted Replica did not load current Primary data")
@@ -442,6 +628,7 @@ def restart_case(fixture):
             gate.close()
 
 def primary_restart_case(fixture):
+    """Primary 本地恢复仍使用 snapshot + checkpoint O 后的 AOF，独立于传输。"""
     primary = fixture.start("primary")
     fixture.assert_listener(primary)
 
@@ -490,6 +677,7 @@ def primary_restart_case(fixture):
           flush=True)
 
 def main():
+    global TEST_HOST
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path, help="Linux repository path")
     args = parser.parse_args()
@@ -497,11 +685,14 @@ def main():
     require(sys.platform.startswith("linux"), "run this script on Linux")
     require(binary.is_file() and os.access(binary, os.X_OK), f"build the server first: {binary}")
     require(shutil.which("stdbuf"), "stdbuf is required")
-    root = Path(tempfile.mkdtemp(prefix="91kv-single-port-acceptance-"))
+    TEST_HOST = discover_rdma_host()
+    print(f"[INFO] real RDMA acceptance on iWARP IPv4 {TEST_HOST}", flush=True)
+    root = Path(tempfile.mkdtemp(prefix="91kv-rdma-acceptance-"))
     success = False
     try:
         for name, case in (
             ("empty", empty_case),
+            ("exact_chunk", exact_chunk_case),
             ("catchup", catchup_case),
             ("restart", restart_case),
             ("primary_restart", primary_restart_case),
@@ -514,7 +705,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] acceptance scenarios: 4 passed; owned server processes stopped", flush=True)
+        print("[PASS] RDMA acceptance scenarios: 5 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

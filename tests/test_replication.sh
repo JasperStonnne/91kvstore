@@ -12,6 +12,27 @@ KVSTORE_BIN="$PROJECT_DIR/bin/kvstore"
 PRIMARY_PORT=${PRIMARY_PORT:-29000}
 REPLICA_PORT=${REPLICA_PORT:-29001}
 
+# 与 RDMA 验收共用设备发现规则；环境不满足时明确失败，不回退 TCP 全量。
+# 仅查询 ACTIVE iWARP 地址，并为本次测试选取独立的 CM 监听端口。
+rdma_settings=$(python3 -B - "$PROJECT_DIR/tests" <<'PY_RDMA'
+import os
+import socket
+import sys
+sys.path.insert(0, sys.argv[1])
+from test_rdma_replication import discover_rdma_host
+host = discover_rdma_host()
+requested = os.environ.get("RDMA_PORT")
+if requested is None:
+    with socket.socket() as probe:
+        probe.bind((host, 0))
+        port = probe.getsockname()[1]
+else:
+    port = int(requested)
+print(host, port)
+PY_RDMA
+)
+read -r TEST_HOST RDMA_PORT <<<"$rdma_settings"
+
 # 两个服务在不同目录运行，各自的持久化文件不会落在仓库里。
 TEST_DIR=$(mktemp -d /tmp/91kv-replication-test.XXXXXX)
 PRIMARY_DIR="$TEST_DIR/primary"
@@ -110,7 +131,7 @@ send_resp_frame()
     local frame=$2
 
     printf '%b' "$frame" |
-        timeout 3 nc -N 127.0.0.1 "$port" |
+        timeout 3 nc -N "$TEST_HOST" "$port" |
         tr -d '\r\n'
 }
 
@@ -125,7 +146,7 @@ send_resp_hset()
         printf '*3\r\n$4\r\nHSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n' \
             "${#key}" "$key" "${#value}" "$value"
     } |
-        timeout 3 nc -N 127.0.0.1 "$port" |
+        timeout 3 nc -N "$TEST_HOST" "$port" |
         tr -d '\r\n'
 }
 
@@ -139,7 +160,7 @@ send_resp_hget()
         printf '*2\r\n$4\r\nHGET\r\n$%d\r\n%s\r\n' \
             "${#key}" "$key"
     } |
-        timeout 3 nc -N 127.0.0.1 "$port" |
+        timeout 3 nc -N "$TEST_HOST" "$port" |
         tr -d '\r\n'
 }
 
@@ -184,7 +205,10 @@ fi
 
 # 启动服务前检查端口格式、范围和现有监听者。
 # 检查与实际启动之间仍可能有极短的竞争；下面的启动检查也会捕获失败。
-for port in "$PRIMARY_PORT" "$REPLICA_PORT"; do
+if [ "$RDMA_PORT" = "$PRIMARY_PORT" ] || [ "$RDMA_PORT" = "$REPLICA_PORT" ]; then
+    fail "RDMA port must differ from both service ports"
+fi
+for port in "$PRIMARY_PORT" "$REPLICA_PORT" "$RDMA_PORT"; do
     if [[ ! "$port" =~ ^[0-9]+$ ]] ||
        [ "$port" -lt 1 ] ||
        [ "$port" -gt 65535 ]; then
@@ -199,11 +223,12 @@ for port in "$PRIMARY_PORT" "$REPLICA_PORT"; do
 done
 
 # 配置文件也放在测试临时目录中，不写入仓库。
-# Primary 保持现有的双端口：客户端端口 + Replica 专用复制端口。
+# TCP 服务端口负责客户端/控制/AOF；独立 RDMA 端口负责快照全量。
 cat >"$PRIMARY_CONFIG" <<EOF
 role = primary
-bind_ip = 127.0.0.1
+bind_ip = $TEST_HOST
 service_port = $PRIMARY_PORT
+rdma_port = $RDMA_PORT
 log_level = info
 persistence_mode = legacy_hybrid
 EOF
@@ -219,11 +244,12 @@ wait_for_log "$PRIMARY_LOG" "listen port : $PRIMARY_PORT" "$PRIMARY_PID" ||
     fail "Primary service port did not start"
 echo "[PASS] Primary started"
 
-python3 - "$PRIMARY_PORT" <<'PY'
+python3 - "$PRIMARY_PORT" "$TEST_HOST" <<'PY'
 import socket
 import sys
 
 port = int(sys.argv[1])
+host = sys.argv[2]
 
 def receive_exact(conn, length):
     result = b""
@@ -234,11 +260,11 @@ def receive_exact(conn, length):
         result += chunk
     return result
 
-with socket.create_connection(("127.0.0.1", port), timeout=3) as replica:
+with socket.create_connection((host, port), timeout=3) as replica:
     replica.sendall(b"PI")
 
     # 复制握手未完成时，普通客户端仍应正常工作。
-    with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+    with socket.create_connection((host, port), timeout=3) as client:
         client.sendall(
             b"*3\r\n$4\r\nHSET\r\n"
             b"$11\r\nroute_probe\r\n$2\r\nok\r\n"
@@ -251,7 +277,7 @@ with socket.create_connection(("127.0.0.1", port), timeout=3) as replica:
 
 print("[PASS] fragmented replication handshake and concurrent client")
 for invalid in (b"PINK\r\n", b"PINGX\r\n", b"HELLO\r\n"):
-    with socket.create_connection(("127.0.0.1", port), timeout=3) as conn:
+    with socket.create_connection((host, port), timeout=3) as conn:
         conn.sendall(invalid)
         try:
             reply = conn.recv(1)
@@ -265,7 +291,7 @@ for invalid in (b"PINK\r\n", b"PINGX\r\n", b"HELLO\r\n"):
 print("[PASS] invalid connection prefixes rejected")
 import time
 
-with socket.create_connection(("127.0.0.1", port), timeout=7) as conn:
+with socket.create_connection((host, port), timeout=7) as conn:
     started = time.monotonic()
 
     # 不发送任何字节，等待 Primary 主动关闭。
@@ -283,7 +309,7 @@ with socket.create_connection(("127.0.0.1", port), timeout=7) as conn:
     )
 
 print("[PASS] silent connection identification timeout")
-with socket.create_connection(("127.0.0.1", port), timeout=7) as conn:
+with socket.create_connection((host, port), timeout=7) as conn:
     started = time.monotonic()
     conn.sendall(b"P")
 
@@ -307,7 +333,7 @@ with socket.create_connection(("127.0.0.1", port), timeout=7) as conn:
     )
 
 print("[PASS] partial handshake does not renew identification deadline")
-with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+with socket.create_connection((host, port), timeout=3) as client:
     # 首字节已确定客户端路径，但 RESP 命令尚不完整。
     client.sendall(b"*")
     time.sleep(6)
@@ -328,7 +354,7 @@ primary_listener_count=$(
 )
 
 if [ "$primary_listener_count" -ne 1 ]; then
-    fail "Primary must have exactly one listening socket; found $primary_listener_count"
+    fail "Primary must own exactly one TCP service listening socket; found $primary_listener_count"
 fi
 
 # Replica 启动前，写入带空格的数据；它应通过 Snapshot 全量同步。
@@ -354,12 +380,12 @@ fi
 echo "[PASS] 2048-byte value written to Primary"
 
 # Replica 的客户端监听端口属于自己；primary_host/primary_port
-# 指向它要连接的 Primary 复制端口。
+# 指向 Primary 的 TCP 服务端口；RDMA 端口由全量通知提供。
 cat >"$REPLICA_CONFIG" <<EOF
 role = replica
-bind_ip = 127.0.0.1
+bind_ip = $TEST_HOST
 service_port = $REPLICA_PORT
-primary_host = 127.0.0.1
+primary_host = $TEST_HOST
 primary_port = $PRIMARY_PORT
 log_level = info
 persistence_mode = legacy_hybrid
@@ -376,7 +402,12 @@ wait_for_log "$REPLICA_LOG" "listen port : $REPLICA_PORT" "$REPLICA_PID" ||
     fail "Replica service port did not start"
 wait_for_log "$REPLICA_LOG" "replication: enter ONLINE" "$REPLICA_PID" ||
     fail "Replica did not enter ONLINE"
-echo "[PASS] Replica entered ONLINE"
+# 必须有真实 RDMA 传输及正常关闭证据，不能只凭 ONLINE 判断全量路径。
+for marker in "Primary verified RDMA READY" "RDMA Snapshot fully acknowledged"               "Primary RDMA closed, start TCP catch-up"; do
+    grep -Fq "$marker" "$PRIMARY_LOG" || fail "missing RDMA evidence: $marker"
+done
+grep -Fq "Replica RDMA closed, resume TCP catch-up" "$REPLICA_LOG" ||     fail "Replica RDMA did not close normally"
+echo "[PASS] Replica entered ONLINE after real RDMA full sync"
 
 wait_for_value "$REPLICA_PORT" "fullsync_test" "before sync value"||
     fail "Snapshot did not preserve the value containing spaces"

@@ -49,6 +49,7 @@ typedef struct{
     int fd;                                        // NtyCo 创建的连接 socket
     kvs_connection_open_handler open_handler;      // 连接成功回调
     msg_handler message_handler;                   // 收到数据后的处理函数
+	kvs_connection_stream_handler stream_handler;
     kvs_connection_close_handler close_handler;    // 连接断开回调
 } ntyco_connector_context_t;
 
@@ -139,7 +140,7 @@ static int ntyco_connector_context_init(
     context->open_handler = config->open_handler;
     context->message_handler = config->message_handler;
     context->close_handler = config->close_handler;
-
+	context->stream_handler = config->stream_handler;
     return 0;
 }
 
@@ -376,8 +377,8 @@ void server_reader(void *arg) {
 			if(kvs_input_buffer_consume(&input,consumed_length)<0){
 				goto connection_closed;
 			}
-			if (output.length == 0) {
-					continue;
+			if (output.length == 0 && stream_handler == NULL) {
+				continue;
 			}
 
 			/*
@@ -550,7 +551,7 @@ static void ntyco_connector(void *arg)
 	ntyco_connection_context_t connection = {
 		.fd =fd,
 		.handler=context->message_handler,
-		.stream_handler=NULL, // Replica 上游连接当前只接收 Snapshot，不负责流式发送
+		.stream_handler = context->stream_handler,
 		.close_handler=context->close_handler,
         .heap_owned = 0
 	};

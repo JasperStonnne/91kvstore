@@ -17,6 +17,7 @@ enum config_field {
     FIELD_ROLE,
     FIELD_BIND_IP,
     FIELD_SERVICE_PORT,
+    FIELD_RDMA_PORT,
     FIELD_LOG_LEVEL,
     FIELD_PERSISTENCE_MODE,
     FIELD_REPLICATION_PORT,
@@ -30,6 +31,7 @@ static const char *const field_names[FIELD_COUNT] = {
     "role",
     "bind_ip",
     "service_port",
+    "rdma_port",
     "log_level",
     "persistence_mode",
     "replication_port",
@@ -190,6 +192,16 @@ static int parse_field(
         }
         return 0;
 
+    case FIELD_RDMA_PORT:
+    if (parse_port(value, &parsed->rdma_port) < 0) {
+        return config_error(
+            error, error_capacity, path, line_number,
+            "invalid rdma_port '%s'; expected 1-65535",
+            value
+        );
+    }
+    return 0;
+
     case FIELD_LOG_LEVEL:
         if (strcmp(value, "error") == 0) {
             parsed->log_level = KVS_LOG_ERROR;
@@ -315,6 +327,24 @@ static int validate_config(
         );
     }
 
+    if (seen[FIELD_RDMA_PORT]) {
+    if (parsed->role != KVS_ROLE_PRIMARY) {
+        return config_error(
+            error, error_capacity, path,
+            field_lines[FIELD_RDMA_PORT],
+            "rdma_port is only valid for role=primary"
+        );
+    }
+
+    if (parsed->rdma_port == parsed->service_port) {
+        return config_error(
+            error, error_capacity, path,
+            field_lines[FIELD_RDMA_PORT],
+            "rdma_port must differ from service_port"
+        );
+    }
+    }
+
     switch (parsed->role) {
     case KVS_ROLE_STANDALONE:
         if (seen[FIELD_REPLICATION_PORT]) {
@@ -414,7 +444,14 @@ static int validate_config(
             "persistence_mode=legacy_hybrid"
         );
     }
-
+    /* Primary 的全量同步必须使用 RDMA，需要显式指定监听端口。 */
+    if (parsed->role == KVS_ROLE_PRIMARY &&
+        !seen[FIELD_RDMA_PORT]) {
+        return config_error(
+            error, error_capacity, path, 0,
+            "role=primary requires rdma_port"
+        );
+    }
     return 0;
 }
 

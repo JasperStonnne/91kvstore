@@ -106,6 +106,40 @@ static void test_invalid_configs(void)
     };
 
     static const struct invalid_case cases[] = {
+    {
+    "standalone rejects rdma port",
+    "role=standalone\nservice_port=29000\n"
+    "persistence_mode=snapshot\nrdma_port=29747\n",
+    "rdma_port is only valid for role=primary"
+    },
+    {
+        "replica rejects rdma port",
+        "role=replica\nservice_port=29001\n"
+        "persistence_mode=legacy_hybrid\n"
+        "primary_host=127.0.0.1\nprimary_port=29000\n"
+        "rdma_port=29747\n",
+        "rdma_port is only valid for role=primary"
+    },
+        {
+        /* 不允许 Primary 缺少 RDMA 端口后走旧 TCP 全量路径。 */
+        "primary requires rdma port",
+        "role=primary\n"
+        "service_port=29000\n"
+        "persistence_mode=legacy_hybrid\n",
+        "role=primary requires rdma_port"
+    },
+    {
+        "primary rejects equal rdma port",
+        "role=primary\nservice_port=29000\n"
+        "persistence_mode=legacy_hybrid\nrdma_port=29000\n",
+        "rdma_port must differ from service_port"
+    },
+    {
+        "primary rejects zero rdma port",
+        "role=primary\nservice_port=29000\n"
+        "persistence_mode=legacy_hybrid\nrdma_port=0\n",
+        "invalid rdma_port"
+    },
         {
             "standalone rejects legacy hybrid",
             "role=standalone\n"
@@ -308,6 +342,7 @@ static void test_valid_primary_and_replica(void)
         "role = primary\n"
         "bind_ip = 127.0.0.1\n"
         "service_port = 29000\n"
+        "rdma_port = 29747\n"
         "log_level = error\n"
         "persistence_mode=legacy_hybrid\n"
     );
@@ -315,6 +350,7 @@ static void test_valid_primary_and_replica(void)
     assert(primary.role == KVS_ROLE_PRIMARY);
     assert(strcmp(primary.bind_ip, "127.0.0.1") == 0);
     assert(primary.service_port == 29000);
+    assert(primary.rdma_port == 29747);
     assert(primary.log_level == KVS_LOG_ERROR);
     assert(primary.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
     kvs_config_t replica = load_valid(

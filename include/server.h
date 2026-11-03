@@ -43,6 +43,7 @@ typedef struct {
     unsigned short port;                           // 要连接的目标端口
     kvs_connection_open_handler open_handler;      // 连接成功后调用
     msg_handler message_handler;                   // 收到对方数据后调用
+    kvs_connection_stream_handler stream_handler; /* 处理完消息后调用；返回 WAIT 时，稍后再次调用。NULL 表示不使用。 */
     kvs_connection_close_handler close_handler;    // 连接断开后调用
 } kvs_connector_config_t;
 

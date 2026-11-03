@@ -51,9 +51,9 @@ def identity(pid):
 def metadata(repo):
     def git(*args):
         return subprocess.check_output(['git', '-C', str(repo), *args], text=True)
-    files = git('ls-files', 'src', 'include').splitlines()
+    files = git('ls-files', '--cached', '--others', '--exclude-standard', 'src', 'include').splitlines()
     hashes = {p: hashlib.sha256((repo/p).read_bytes()).hexdigest()
-              for p in files if p.endswith(('.c', '.h'))}
+              for p in files if p.endswith(('.c', '.h')) and (repo/p).is_file()}
     return dict(head=git('rev-parse', 'HEAD').strip(),
                 status=git('status', '--short'), diff=git('diff', 'HEAD'),
                 source_hashes=hashes, submodules=git('submodule', 'status'),
@@ -85,6 +85,9 @@ if action == 'init':
     config = root/'server.conf'
     content = (f"role={arg['role']}\nbind_ip={arg['host']}\nservice_port={arg['port']}\n"
                'log_level=info\npersistence_mode=legacy_hybrid\n')
+    if arg['role'] == 'primary':
+        with socket.socket() as probe: probe.bind((arg['host'], arg['rdma_port']))
+        content += f"rdma_port={arg['rdma_port']}\n"
     if arg['role'] == 'replica':
         content += f"primary_host={arg['upstream_host']}\nprimary_port={arg['upstream_port']}\n"
     config.write_text(content)
@@ -236,7 +239,6 @@ class Gate:
             self.sockets.append(downstream)
             upstream = socket.socket()
             self.sockets.append(upstream)
-            upstream.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             upstream.settimeout(30)
             upstream.connect((self.host, self.upstream_port))
             require(self.line(downstream) == b'PING\r\n', 'unexpected Replica PING')
@@ -247,12 +249,18 @@ class Gate:
             upstream.sendall(b'PSYNC ? -1\r\n')
             header = self.line(upstream)
             parts = header.split()
-            require(len(parts) == 4 and parts[0] == b'FULLRESYNC', 'invalid FULLRESYNC')
+            require(len(parts) == 6 and parts[0] == b'FULLRESYNC_RDMA',
+                    'expected RDMA full-sync notification')
+            require(0 < int(parts[4]) <= 65535 and
+                    re.fullmatch(rb'[0-9a-f]{40}', parts[1]) is not None and
+                    re.fullmatch(rb'[0-9a-f]{40}', parts[5]) is not None,
+                    'invalid RDMA port or synchronization ID')
             self.metadata = dict(offset=int(parts[2]), size=int(parts[3]))
-            downstream.sendall(header)
+            # O 已固定；先暂停通知，避免 Replica 绕过 TCP 代理开始 RDMA。
             self.event('snapshot_held', **self.metadata)
             self.ready.set()
             require(self.release.wait(120), 'Snapshot gate release timed out')
+            downstream.sendall(header)
             upstream.settimeout(.5)
             while not self.stopped.is_set():
                 try:
@@ -303,6 +311,7 @@ class Suite:
         data = dict(repo=str(a.repo) if role == 'primary' else a.replica_repo,
                     role=role, host=a.primary_host if role == 'primary' else a.replica_host,
                     port=a.primary_port if role == 'primary' else a.replica_port,
+                    rdma_port=a.rdma_port,
                     parent=str(self.root) if role == 'primary' else a.replica_artifacts,
                     upstream_host=a.primary_host, upstream_port=upstream_port)
         call = local_call if role == 'primary' else self.remote.call
@@ -540,6 +549,8 @@ def main():
     parser.add_argument('--repo', required=True, type=Path)
     parser.add_argument('--primary-host', required=True)
     parser.add_argument('--primary-port', required=True, type=int)
+    parser.add_argument('--rdma-port', type=int, default=29747,
+                        help='Primary RDMA full-sync listener port (default: 29747)')
     parser.add_argument('--replica-ssh', required=True, help='SSH alias or user@host')
     parser.add_argument('--ssh-port', type=int, default=22)
     parser.add_argument('--replica-repo', required=True)
@@ -556,7 +567,8 @@ def main():
         socket.inet_pton(socket.AF_INET, host)
         require(not host.startswith('127.') and host != '0.0.0.0', 'use reachable VM IPv4 addresses')
     require(not args.replica_ssh.startswith('-'), 'invalid SSH target')
-    require(all(1 <= p <= 65535 for p in (args.primary_port, args.replica_port, args.ssh_port)), 'invalid port')
+    require(all(1 <= p <= 65535 for p in (args.primary_port, args.replica_port, args.ssh_port, args.rdma_port)), 'invalid port')
+    require(args.rdma_port != args.primary_port, 'RDMA port must differ from Primary service port')
     require(args.phase_timeout > 0, 'phase-timeout must be positive')
     require(args.run_id.isascii() and args.run_id.replace('_', '').isalnum(), 'invalid run-id')
     args.repo = args.repo.resolve()
