@@ -2,7 +2,7 @@
 #define KVS_PERSISTENCE_H
 #include "protocol.h"
 int kvs_aof_open(const char *path);
-int kvs_aof_append(char **tokens, int count);
+int kvs_aof_append(char **tokens, int count, int emit_event);
 int kvs_aof_close(void);
 int kvs_snapshot_store_save(const char *path);
 int kvs_snapshot_store_load(const char *path);

@@ -8,6 +8,9 @@
 #include "protocol.h"
 #include "config.h"
 #include "log.h"
+#ifdef KVS_EBPF_STARTUP_EXPERIMENT
+#include "ebpf_capture.h"
+#endif
 #include <string.h>
 #include<errno.h>
 #include<limits.h>
@@ -497,7 +500,10 @@ int kvs_filter_protocol(
         kvs_is_write_command(cmd) &&
         source != KVS_COMMAND_SOURCE_RECOVERY &&
         kvs_persistence_mode != KVS_PERSISTENCE_SNAPSHOT) {
-        int aof_ret=kvs_aof_append(tokens,count);
+        int emit_event =
+            kvs_server_role == KVS_ROLE_PRIMARY &&
+            source == KVS_COMMAND_SOURCE_CLIENT;
+        int aof_ret = kvs_aof_append(tokens, count, emit_event);
         if(aof_ret<0){
             fprintf(stderr,"failed to append AOF\n");
             exit(EXIT_FAILURE);
@@ -1426,6 +1432,19 @@ kvs_close_current_persistence();
         dest_kvengine();
         return EXIT_FAILURE;
     }
+#ifdef KVS_EBPF_STARTUP_EXPERIMENT
+    if (kvs_ebpf_start(getenv("KVS_EBPF_OBJECT")) < 0) {
+        kvs_log_message(
+            KVS_LOG_ERROR,
+            "ebpf: startup capture unavailable: %s; ONLINE source=AOF\n",
+            strerror(errno));
+    } else {
+        kvs_log_message(
+            KVS_LOG_INFO,
+            "ebpf: startup attach successful; ONLINE source=eBPF; "
+            "AOF catch-up and compensation enabled\n");
+    }
+#endif
 kvs_listener_config_t listener = {
     .port = config.service_port,
     .bind_ip = config.bind_ip,
@@ -1467,6 +1486,10 @@ kvs_listener_config_t listener = {
         };
         network_ret = ntyco_start_listeners(&listener, 1);
     }
+
+#ifdef KVS_EBPF_STARTUP_EXPERIMENT
+    kvs_ebpf_stop();
+#endif
 
     if(network_ret<0){
         fprintf(stderr,"failed to start network service\n");

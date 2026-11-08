@@ -24,6 +24,15 @@
 - 本机复现：`RDMA_TEST_IP=172.16.145.135 make test`（替换为自己的 iWARP IPv4）。
 - 架构、完整启动配置、失败场景和双机命令见 [RDMA 验收说明](tests/README_RDMA.md)。
 
+## eBPF ONLINE 增量
+
+可选构建使用 make ebpf-startup，生成 bin/kvstore-ebpf 和 BPF 对象。
+三路分工为 RDMA 传全量、TCP + AOF 追赶和补缺口、eBPF 提供正常 ONLINE 的完整命令。
+跨机发送仍由用户态通过现有 TCP 完成。事件附带 AOF offset，超限或丢失有明确计数和补偿。
+BPF 加载或消费失败会明确记录降级到 AOF；普通构建继续使用 AOF ONLINE。
+无逐条增量 ACK，不宣称端到端 exactly-once。
+构建、v1 事件格式、失败策略和故障验收见 [eBPF 验收说明](tests/README_EBPF.md)。
+
 ## 一分钟体验
 
 ### 1. 构建并启动

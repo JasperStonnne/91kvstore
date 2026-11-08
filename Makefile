@@ -509,3 +509,86 @@ $(BIN_DIR)/test_buffer_allocator: \
 		$(NETWORK_DIR)/buffer.c \
 		$(MEMORY_DIR)/kvs_allocator.c \
 		-o $@
+
+# eBPF ONLINE 实验构建；普通 all/test 构建使用原有 bin/kvstore。
+BPF_CLANG ?= clang
+BPF_ARCH ?= $(shell uname -m | sed 's/aarch64/arm64/;s/x86_64/x86/')
+
+.PHONY: ebpf-startup test-ebpf-online test-ebpf-replication
+ebpf-startup: $(BIN_DIR)/kvstore-ebpf
+
+$(BUILD_DIR)/ebpf_capture.bpf.o: \
+    $(REPLICATION_DIR)/ebpf_capture.bpf.c \
+    $(INCLUDE_DIR)/ebpf_event.h | $(BUILD_DIR)
+	$(BPF_CLANG) -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -O2 -g \
+	    -Wall -Wextra -Werror -I$(INCLUDE_DIR) -I/usr/include/$(shell $(CC) -dumpmachine) \
+	    -c $< -o $@
+
+$(BUILD_DIR)/kvstore_ebpf.o: \
+    $(SRC_DIR)/kvstore.c \
+    $(INCLUDE_DIR)/ebpf_capture.h \
+    $(INCLUDE_DIR)/ebpf_event.h \
+    $(INCLUDE_DIR)/kvstore.h \
+    $(INCLUDE_DIR)/kvs_allocator.h \
+    $(INCLUDE_DIR)/persistence.h \
+    $(INCLUDE_DIR)/replication.h \
+    $(INCLUDE_DIR)/server.h \
+    $(INCLUDE_DIR)/protocol.h \
+    $(INCLUDE_DIR)/config.h \
+    $(INCLUDE_DIR)/log.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DKVS_EBPF_STARTUP_EXPERIMENT -c $< -o $@
+
+$(BUILD_DIR)/replication_ebpf.o: \
+    $(REPLICATION_DIR)/replication.c \
+    $(INCLUDE_DIR)/ebpf_capture.h \
+    $(INCLUDE_DIR)/ebpf_event.h \
+    $(INCLUDE_DIR)/replication.h \
+    $(INCLUDE_DIR)/persistence.h \
+    $(INCLUDE_DIR)/server.h \
+    $(INCLUDE_DIR)/rdma_transport.h \
+    $(INCLUDE_DIR)/log.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DKVS_EBPF_STARTUP_EXPERIMENT -c $< -o $@
+
+$(BUILD_DIR)/ebpf_capture.o: \
+    $(REPLICATION_DIR)/ebpf_capture.c \
+    $(INCLUDE_DIR)/ebpf_capture.h \
+    $(INCLUDE_DIR)/ebpf_event.h \
+    $(INCLUDE_DIR)/log.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -c $< -o $@
+
+$(BIN_DIR)/kvstore-ebpf: \
+    $(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/replication.o,$(OBJS)) \
+    $(BUILD_DIR)/kvstore_ebpf.o \
+    $(BUILD_DIR)/replication_ebpf.o \
+    $(BUILD_DIR)/ebpf_capture.o \
+    $(BUILD_DIR)/ebpf_capture.bpf.o \
+    $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
+	$(CC) $(filter-out $(BUILD_DIR)/kvstore.o $(BUILD_DIR)/replication.o,$(OBJS)) \
+	    $(BUILD_DIR)/kvstore_ebpf.o $(BUILD_DIR)/replication_ebpf.o \
+	    $(BUILD_DIR)/ebpf_capture.o $(LDFLAGS) $(LDLIBS) -luring -lbpf -o $@
+
+$(BIN_DIR)/test_ebpf_online: \
+    $(TEST_DIR)/test_ebpf_online.c \
+    $(REPLICATION_DIR)/replication.c \
+    $(SRC_DIR)/log/log.c \
+    $(INCLUDE_DIR)/ebpf_capture.h \
+    $(INCLUDE_DIR)/ebpf_event.h \
+    $(INCLUDE_DIR)/replication.h \
+    $(INCLUDE_DIR)/persistence.h \
+    $(INCLUDE_DIR)/server.h \
+    $(INCLUDE_DIR)/rdma_transport.h \
+    $(INCLUDE_DIR)/log.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -DKVS_EBPF_STARTUP_EXPERIMENT \
+	    -ffunction-sections -fdata-sections -fsanitize=address,undefined \
+	    -fno-omit-frame-pointer $(TEST_DIR)/test_ebpf_online.c \
+	    $(SRC_DIR)/log/log.c -Wl,--gc-sections -o $@
+
+test-ebpf-online: $(BIN_DIR)/test_ebpf_online
+	./$(BIN_DIR)/test_ebpf_online
+
+# 普通单测不加载 BPF；真实专项必须具备 BPF 权限和 ACTIVE iWARP 设备。
+test-unit: test-ebpf-online
+
+test-ebpf-replication: $(BIN_DIR)/kvstore-ebpf
+	KVS_EBPF_OBJECT=$(abspath $(BUILD_DIR)/ebpf_capture.bpf.o) \
+	    python3 -B $(TEST_DIR)/test_ebpf_replication.py .
