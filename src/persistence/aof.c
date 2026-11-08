@@ -294,7 +294,20 @@ void kvs_aof_reader_close(kvs_aof_reader_t *reader)
     reader->offset=0;
     reader->remaining=0;
 }
-int kvs_aof_append(char **tokens, int count)
+
+/* AOF 提交成功时调用，供 eBPF 采集完整命令及其 offset。 */
+__attribute__((noinline))
+void kvs_aof_committed(
+    const char *payload,
+    size_t length,
+    long long start,
+    long long end)
+{
+    __asm__ volatile("" : :
+        "r"(payload), "r"(length), "r"(start), "r"(end));
+}
+
+int kvs_aof_append(char **tokens, int count, int emit_event)
 {
     if (aof_writer.fd < 0 ||
         !aof_writer.io.initialized ||
@@ -362,23 +375,34 @@ int kvs_aof_append(char **tokens, int count)
         1
     );
 
-    /* 写请求已经结束，才能释放它借用的内存。 */
-    int saved_errno = errno;
-    kvs_free(encoded);
-    errno = saved_errno;
-
     if (write_result < 0) {
+        int saved_errno = errno;
+        kvs_free(encoded);
+        errno = saved_errno;
         return -1;
     }
 
     /* 4. 保留每条命令同步成功后才返回成功的规则。 */
     if (kvs_uring_io_sync(
             &aof_writer.io, aof_writer.fd) < 0) {
+        int saved_errno = errno;
+        kvs_free(encoded);
+        errno = saved_errno;
         return -1;
     }
 
     /* 5. 写入和同步都成功，更新下一条命令的写入位置。 */
     aof_writer.offset = next_offset;
+
+    if (emit_event) {
+        kvs_aof_committed(
+            encoded, encoded_length, request.offset, next_offset);
+    }
+
+    /* 完整命令保留到提交成功后，再释放缓冲区。 */
+    int saved_errno = errno;
+    kvs_free(encoded);
+    errno = saved_errno;
     return 0;
 }
 int kvs_aof_replay(

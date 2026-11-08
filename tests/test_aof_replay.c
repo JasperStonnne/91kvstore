@@ -109,13 +109,13 @@ static void test_append(void)
     kvs_pool_stats_t stats;
 
     /* 写请求结束后，encoded 应当已经释放。 */
-    assert(kvs_aof_append(first, 3) == 0);
+    assert(kvs_aof_append(first, 3, 0) == 0);
     assert(kvs_allocator_pool_stats(&stats) == 0);
     assert(stats.live_objects == 0);
 
     /* 申请失败不应追加命令，也不应推进写入位置。 */
     fail_alloc = 1;
-    int result = kvs_aof_append(failed, 3);
+    int result = kvs_aof_append(failed, 3, 0);
     fail_alloc = 0;
 
     assert(result < 0);
@@ -123,7 +123,7 @@ static void test_append(void)
     assert(stats.live_objects == 0);
 
     /* 失败之后仍能正常追加下一条命令。 */
-    assert(kvs_aof_append(second, 3) == 0);
+    assert(kvs_aof_append(second, 3, 0) == 0);
     assert(kvs_allocator_pool_stats(&stats) == 0);
     assert(stats.live_objects == 0);
 

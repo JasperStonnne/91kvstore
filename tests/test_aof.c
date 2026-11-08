@@ -11,7 +11,7 @@ int main(void)
         return 1;
     }
 
-    if (kvs_aof_append(tokens, 3) < 0) {
+    if (kvs_aof_append(tokens, 3, 0) < 0) {
         printf("append failed\n");
         kvs_aof_close();
         return 1;

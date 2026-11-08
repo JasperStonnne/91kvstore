@@ -246,7 +246,8 @@ class SnapshotGate:
     暂停该通知，可确定性地在 O 之后写入增量，再放行真实 RDMA 全量。
     不靠 sleep 或网速猜测同步时机，避免快照很小时测试偶发失效。
     """
-    def __init__(self, primary_port, advertised_rdma_port=None):
+    def __init__(self, primary_port, advertised_rdma_port=None,
+                 connection_timeout=30):
         self.primary_port = primary_port
         # 仅失败测试覆盖通知端口，模拟配置/发布错误；不接触实际 RDMA 数据。
         self.advertised_rdma_port = advertised_rdma_port
@@ -254,7 +255,7 @@ class SnapshotGate:
         self.listener = socket.socket()
         self.listener.bind((TEST_HOST, 0))
         self.listener.listen(1)
-        self.listener.settimeout(30)
+        self.listener.settimeout(connection_timeout)
         self.port = self.listener.getsockname()[1]
         self.header_ready = threading.Event()
         self.release = threading.Event()
