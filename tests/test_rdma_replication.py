@@ -126,6 +126,8 @@ class Fixture:
         self.binary = binary
         self.processes = []
         self.logs = []
+        # 逐块字节与 ACK 断言需要 DEBUG；正式默认 INFO 不输出这些细节。
+        self.log_level = "debug"
         # CM 使用独立监听端口；TCP 服务端口仍同时接受客户端及复制控制连接。
         self.primary_port = free_port()
         self.replica_port = free_port()
@@ -143,7 +145,7 @@ class Fixture:
         config = (
             f"role={role}\nbind_ip={TEST_HOST}\nservice_port={port}\n"
             "allocator=pool\n"
-            "log_level=info\npersistence_mode=legacy_hybrid\n"
+            f"log_level={self.log_level}\npersistence_mode=legacy_hybrid\n"
         )
         if role == "primary":
             config += f"rdma_port={self.rdma_port}\n"
@@ -898,6 +900,33 @@ def primary_restart_case(fixture):
     print("[PASS] Primary restart restores binary Snapshot and later AOF",
           flush=True)
 
+
+def info_logging_case(fixture):
+    """INFO 保留复制状态，隐藏逐块数据、ACK 和逐事件细节。"""
+    fixture.log_level = "info"
+    fixture.start("primary")
+    writer = Client(fixture.primary_port)
+    try:
+        require(writer.command("HSET", "info_probe", "before") == b"OK", "INFO seed failed")
+    finally:
+        writer.close()
+    fixture.start("replica", fixture.primary_port)
+    fixture.online()
+    verify_online_mutations(fixture)
+    for role in ("primary", "replica"):
+        log = (fixture.root / role / "server.log").read_text(errors="replace")
+        require("enter ONLINE" in log, f"{role}: INFO state transition missing")
+        for detail in ("submitted Snapshot chunk", "Snapshot chunk send completed",
+                       "wrote Snapshot chunk", "received Snapshot ACK",
+                       "submitted Snapshot ACK", "eBPF payload range="):
+            require(detail not in log, f"{role}: DEBUG detail leaked at INFO: {detail}")
+    reader = Client(fixture.replica_port)
+    try:
+        require(reader.command("HGET", "info_probe") == b"before", "INFO Snapshot data missing")
+    finally:
+        reader.close()
+    print("[PASS] INFO retains state transitions and hides per-chunk/ACK detail", flush=True)
+
 def main():
     global TEST_HOST
     parser = argparse.ArgumentParser(description=__doc__)
@@ -913,6 +942,7 @@ def main():
     success = False
     try:
         for name, case in (
+            ("info_logging", info_logging_case),
             ("empty", empty_case),
             ("exact_chunk", exact_chunk_case),
             ("catchup", catchup_case),
@@ -932,7 +962,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] RDMA acceptance scenarios: 10 passed; owned server processes stopped", flush=True)
+        print("[PASS] RDMA acceptance scenarios: 11 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

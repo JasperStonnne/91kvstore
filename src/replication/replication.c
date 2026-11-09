@@ -966,7 +966,7 @@ if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
         sync->acknowledged_bytes = sync->snapshot_bytes;
 
         kvs_log_message(
-            KVS_LOG_INFO,
+            KVS_LOG_DEBUG,
             "replication: Replica submitted Snapshot ACK bytes=%lld\n",
             sync->acknowledged_bytes);
     }
@@ -1028,7 +1028,7 @@ if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
     }
 
     kvs_log_message(
-        KVS_LOG_INFO,
+        KVS_LOG_DEBUG,
         "replication: Replica wrote Snapshot chunk "
         "bytes=%d remaining=%lld\n",
         written,
@@ -1131,7 +1131,7 @@ static int kvs_replication_rdma_send_snapshot_chunk(
     sync->snapshot_bytes += bytes;
 
     kvs_log_message(
-        KVS_LOG_INFO,
+        KVS_LOG_DEBUG,
         "replication: Primary submitted Snapshot chunk "
         "bytes=%d remaining=%lld\n",
         bytes,
@@ -1293,7 +1293,7 @@ int kvs_replication_stream(
     if (completion.type == KVS_RDMA_COMPLETION_SEND) {
         sync->send_pending = 0;
     kvs_log_message(
-        KVS_LOG_INFO,
+        KVS_LOG_DEBUG,
         "replication: Primary Snapshot chunk send completed\n");
 
     return KVS_STREAM_WAIT;
@@ -1333,7 +1333,7 @@ int kvs_replication_stream(
         sync->acknowledged_bytes = sync->snapshot_bytes;
 
         kvs_log_message(
-            KVS_LOG_INFO,
+            KVS_LOG_DEBUG,
             "replication: Primary received Snapshot ACK bytes=%lld\n",
             sync->acknowledged_bytes);
 

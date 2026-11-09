@@ -645,3 +645,24 @@ fuzz-protocol:
 
 test-sanitizers:
 	python3 -B $(TEST_DIR)/run_sanitizers.py
+
+# 会议验收分层：普通 make test 保持功能/边界回归；大数据与可选客户端显式运行。
+PERSISTENCE_STOP_METHOD ?= kill
+.PHONY: test-functional-bulk test-persistence-100k test-clients test-clients-strict test-acceptance
+
+test-functional-bulk: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_functional_bulk.py
+
+test-persistence-100k: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_persistence_100k.py --stop-method $(PERSISTENCE_STOP_METHOD)
+
+test-clients: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_client_compatibility.py
+
+# 严格会议对照入口：默认 benchmark PING 不支持时明确非零退出。
+test-clients-strict: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_client_compatibility.py --require-default-ping
+
+test-acceptance:
+	$(MAKE) --no-print-directory test-functional-bulk
+	$(MAKE) --no-print-directory test-persistence-100k
