@@ -301,12 +301,69 @@ static void test_session(int reordered, int disconnect_early, int oversize)
                      "[PASS] RDMA full-sync control, TCP rejection and ONLINE boundary");
 }
 
+static void test_control_boundaries(void)
+{
+    recv_before_send = early_disconnect = partial_disconnect = oversized_chunk = 0;
+    static const char *headers[] = {
+        "FULLRESYNC_RDMA short 0 21 29747 abcdef0123456789abcdef0123456789abcdef01\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 -1 21 29747 abcdef0123456789abcdef0123456789abcdef01\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 0 29747 abcdef0123456789abcdef0123456789abcdef01\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 0 abcdef0123456789abcdef0123456789abcdef01\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 65536 abcdef0123456789abcdef0123456789abcdef01\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 short\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 extra\r\n"
+    };
+    for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
+        kvs_connector_config_t connector = setup();
+        char input[256];
+        strcpy(input, headers[i]);
+        int consumed = 0;
+        assert(feed(&connector, input, (int)strlen(input), &consumed) < 0);
+        assert(starts == 0 && installed == 0 && applied == 0);
+        assert(!kvs_replication_is_online());
+        teardown();
+    }
+    static const char *controls[] = {
+        "ONLINE -1\r\n", "ONLINE 1\r\n", "ONLINE abc\r\n", "ONLINE 0 extra\r\n"
+    };
+    for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
+        kvs_connector_config_t connector = setup();
+        char input[256], output[256];
+        int consumed = 0;
+        int length = snprintf(input, sizeof(input),
+            "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 %zu 29747 %s\r\n",
+            sizeof(snapshot) - 1, sync_id);
+        for (int prefix = 1; prefix < length; prefix++) {
+            assert(feed(&connector, input, prefix, &consumed) == 0);
+            assert(consumed == 0 && starts == 0);
+        }
+        assert(feed(&connector, input, length, &consumed) == 0);
+        int result = KVS_STREAM_WAIT;
+        for (int attempt = 0; attempt < 12 && result == KVS_STREAM_WAIT; attempt++)
+            result = connector.stream_handler(123, output, sizeof(output));
+        assert(result == 0 && installed == 1 && !kvs_replication_is_online());
+
+        static const char online[] = "ONLINE 0\r\n";
+        for (size_t prefix = 1; prefix < sizeof(online) - 1; prefix++) {
+            memcpy(input, online, sizeof(online));
+            assert(feed(&connector, input, (int)prefix, &consumed) == 0);
+            assert(consumed == 0 && !kvs_replication_is_online());
+        }
+        strcpy(input, controls[i]);
+        assert(feed(&connector, input, (int)strlen(input), &consumed) < 0);
+        assert(applied == 0 && !kvs_replication_is_online());
+        teardown();
+    }
+    puts("[PASS] fixed full-sync headers, all control prefixes and invalid ONLINE boundaries");
+}
+
 int main(void)
 {
     char directory[] = "/tmp/91kv-boundary.XXXXXX";
     int original_directory = open(".", O_RDONLY | O_DIRECTORY);
     assert(original_directory >= 0 && mkdtemp(directory) != NULL);
     assert(chdir(directory) == 0);
+    test_control_boundaries();
     test_session(0, 0, 0);
     test_session(1, 0, 0);
     test_session(0, 1, 0);

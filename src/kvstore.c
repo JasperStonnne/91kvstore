@@ -15,6 +15,7 @@
 #include<errno.h>
 #include<limits.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 /* 只限制客户端的一条 RESP 命令；不改变 AOF/Snapshot/复制解析。 */
 #define KVS_MAX_CLIENT_COMMAND_BYTES (1024u * 1024u)
@@ -1382,6 +1383,32 @@ static int kvs_server_run(kvs_config_t config)
             fprintf(stderr, "failed to load snapshot with checkpoint\n");
             dest_kvengine();
             return EXIT_FAILURE;
+        }
+
+        /*
+         * Hybrid 恢复已有快照时，必须保留配套 AOF。
+         * 否则无法判断快照之后的已确认写入是否丢失，不能创建空日志继续启动。
+         * 首次启动没有快照（load_result == 1），仍允许随后创建新 AOF。
+         */
+        if (load_result == 0) {
+            struct stat aof_info;
+            if (stat("appendonly.aof", &aof_info) < 0) {
+                fprintf(stderr,
+                        "failed to recover hybrid: snapshot.db requires "
+                        "appendonly.aof: %s\n", strerror(errno));
+                dest_kvengine();
+                return EXIT_FAILURE;
+            }
+
+            /* 检查点可以恰好位于末尾，但不能超过实际日志长度。 */
+            if (checkpoint.offset > (long long)aof_info.st_size) {
+                fprintf(stderr,
+                        "failed to recover hybrid: snapshot offset=%lld "
+                        "exceeds AOF size=%lld\n",
+                        checkpoint.offset, (long long)aof_info.st_size);
+                dest_kvengine();
+                return EXIT_FAILURE;
+            }
         }
 
         long long offset =

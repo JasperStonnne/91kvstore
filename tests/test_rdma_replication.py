@@ -322,12 +322,16 @@ class SnapshotGate:
                 if not data:
                     break
                 # 只统计全量通知之后的 TCP 字节，稍后校验恰好是 AOF + ONLINE。
-                self.forwarded_bytes += len(data)
-                downstream.sendall(data)
+                self.forward(data, downstream)
         except Exception as exc:
             if not self.stopped.is_set():
                 self.errors.append(str(exc))
                 self.header_ready.set()
+
+    def forward(self, data, downstream):
+        """默认原样转发；故障测试子类可按精确字节边界截断。"""
+        self.forwarded_bytes += len(data)
+        downstream.sendall(data)
 
     def check(self):
         require(not self.errors, f"relay failed: {self.errors}")
@@ -809,6 +813,42 @@ def handshake_failure_case(fixture):
     check_failed_handshake(fixture, silent_peer=True)
 
 
+def primary_aof_write_failure_case(fixture):
+    """复用文件大小限制注入，验证有快照也不能忽略 AOF 残缺尾部。"""
+    script = fixture.binary.parent.parent / "tests/test_aof_write_failure.py"
+    completed = subprocess.run(
+        [sys.executable, "-B", str(script), "--binary", str(fixture.binary),
+         "--primary-hybrid"],
+        env=dict(os.environ, RDMA_TEST_IP=TEST_HOST),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    (fixture.root / "fault-runner.log").write_bytes(completed.stdout)
+    print(completed.stdout.decode(errors="replace"), end="", flush=True)
+    require(completed.returncode == 0,
+            f"Primary AOF write-failure regression exited {completed.returncode}")
+    print("[PASS] Primary hybrid partial AOF write: no false success or snapshot-only startup",
+          flush=True)
+
+
+def primary_aof_sync_failure_case(fixture):
+    """测试专用同步错误：无假成功，但完整命令仍可能在重启时恢复。"""
+    repo = fixture.binary.parent.parent
+    fault_binary = repo / "bin/test_kvstore_sync_fault"
+    require(fault_binary.is_file(),
+            f"build sync-fault test binary first: make test-rdma ({fault_binary})")
+    completed = subprocess.run(
+        [sys.executable, "-B", str(repo / "tests/test_aof_sync_failure.py"),
+         "--binary", str(fixture.binary), "--fault-binary", str(fault_binary),
+         "--primary-hybrid"],
+        env=dict(os.environ, RDMA_TEST_IP=TEST_HOST),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    (fixture.root / "sync-fault-runner.log").write_bytes(completed.stdout)
+    print(completed.stdout.decode(errors="replace"), end="", flush=True)
+    require(completed.returncode == 0,
+            f"Primary AOF sync-failure regression exited {completed.returncode}")
+    print("[PASS] Primary hybrid sync error: no false success; full suffix recovered",
+          flush=True)
+
+
 def primary_restart_case(fixture):
     """Primary 本地恢复仍使用 snapshot + checkpoint O 后的 AOF，独立于传输。"""
     primary = fixture.start("primary")
@@ -878,6 +918,8 @@ def main():
             ("catchup", catchup_case),
             ("restart", restart_case),
             ("primary_restart", primary_restart_case),
+            ("primary_aof_write_failure", primary_aof_write_failure_case),
+            ("primary_aof_sync_failure", primary_aof_sync_failure_case),
             ("interrupted_restart", interrupted_restart_case),
             ("listener_failure", listener_failure_case),
             ("handshake_failure", handshake_failure_case),
@@ -890,7 +932,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] RDMA acceptance scenarios: 8 passed; owned server processes stopped", flush=True)
+        print("[PASS] RDMA acceptance scenarios: 10 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)
