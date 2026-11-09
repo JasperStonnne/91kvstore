@@ -92,6 +92,51 @@ static void expect_replay(
     assert(memcmp(seen_values, expected_values, expected_count) == 0);
 }
 
+static void expect_file_unchanged(const char *path, const char *data, size_t length)
+{
+    FILE *file = fopen(path, "rb");
+    char *actual = malloc(length + 1);
+    assert(file != NULL && actual != NULL);
+    assert(fread(actual, 1, length + 1, file) == length);
+    assert(memcmp(actual, data, length) == 0);
+    assert(fclose(file) == 0);
+    free(actual);
+}
+
+/* 每一个截断位置都必须明确区分完整记录边界与不完整记录。 */
+static void test_fixed_recovery_boundaries(const char *path)
+{
+    size_t first = sizeof(FIRST_COMMAND) - 1;
+    for (size_t length = 0; length < sizeof(valid_log) - 1; length++) {
+        write_fixture(path, valid_log, length);
+        int expected = length == 0 || length == first ? 0 : -1;
+        expect_replay(path, 0, expected, length >= first ? "1" : "");
+        expect_file_unchanged(path, valid_log, length);
+    }
+    static const char *tails[] = {
+        "*0\r\n", "*4\r\n", "*-1\r\n",
+        "*3\r\n$-1\r\n", "*3\r\n$184467440737095516160\r\n",
+        "*3\r\n$4\r\nHSET\rX"
+    };
+    for (size_t i = 0; i < sizeof(tails) / sizeof(tails[0]); i++) {
+        size_t length = first + strlen(tails[i]);
+        char *input = malloc(length);
+        assert(input != NULL);
+        memcpy(input, FIRST_COMMAND, first);
+        memcpy(input + first, tails[i], strlen(tails[i]));
+        write_fixture(path, input, length);
+        expect_replay(path, 0, -1, "1");
+        expect_file_unchanged(path, input, length);
+        free(input);
+    }
+    /* AOF 允许重复的合法写入，恢复按记录顺序执行，不自动去重。 */
+    static const char repeated[] = FIRST_COMMAND FIRST_COMMAND;
+    write_fixture(path, repeated, sizeof(repeated) - 1);
+    expect_replay(path, 0, 0, "11");
+    expect_file_unchanged(path, repeated, sizeof(repeated) - 1);
+    puts("[PASS] AOF all truncation positions, invalid tails and ordered repeated records");
+}
+
 static void test_append(void)
 {
     /* 独立临时文件，不使用服务已有的 AOF。 */
@@ -192,6 +237,8 @@ int main(void)
     assert(unlink(path) == 0);
     expect_replay(path, 0, 0, "");
     puts("[PASS] AOF empty and missing files");
+    test_fixed_recovery_boundaries(path);
+    assert(unlink(path) == 0);
 
     puts("AOF replay tests passed");
     /* 所有测试对象释放后，才销毁 allocator。 */

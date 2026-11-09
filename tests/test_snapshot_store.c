@@ -311,6 +311,58 @@ static void test_v1_compatibility(const char *path)
     puts("snapshot v1 compatibility test passed");
 }
 
+static unsigned int fixture_crc(const unsigned char *data, size_t length)
+{
+    unsigned int crc = 0xffffffffu;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (unsigned int bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ ((crc & 1u) ? 0xedb88320u : 0);
+    }
+    return crc ^ 0xffffffffu;
+}
+
+static void expect_snapshot_rejected_unchanged(const char *path,
+                                              const unsigned char *data, size_t length)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    assert(fd >= 0 && write(fd, data, length) == (ssize_t)length);
+    assert(kvs_snapshot_store_load(path) == -1);
+    expect_empty();
+    unsigned char actual[64];
+    assert(length < sizeof(actual));
+    assert(pread(fd, actual, sizeof(actual), 0) == (ssize_t)length);
+    assert(memcmp(actual, data, length) == 0);
+    assert(close(fd) == 0);
+}
+
+static void test_fixed_snapshot_boundaries(const char *path)
+{
+    /* 与已有兼容测试相同的完整 v1 快照：Hash name=v1。 */
+    static const unsigned char fixture[] = {
+        0x39,0x31,0x4b,0x56,0x53,0x4e,0x41,0x50,
+        0,0,0,1, 0,0,0,0,0,0,0,1, 3, 0,0,0,4, 0,0,0,2,
+        'n','a','m','e','v','1', 0x49,0x26,0xcd,0x56
+    };
+    destroy_engines();
+    create_engines();
+    for (size_t length = 0; length < sizeof(fixture); length++)
+        expect_snapshot_rejected_unchanged(path, fixture, length);
+
+    /* 重算正确 CRC，让结构检查负责拒绝，而非仅依赖校验和。 */
+    const size_t positions[] = {8, 12, 20, 21, 25};
+    for (size_t i = 0; i < sizeof(positions) / sizeof(positions[0]); i++) {
+        unsigned char altered[sizeof(fixture)];
+        memcpy(altered, fixture, sizeof(fixture));
+        altered[positions[i]] = 0xff;
+        unsigned int crc = fixture_crc(altered, sizeof(altered) - 4);
+        for (size_t byte = 0; byte < 4; byte++)
+            altered[sizeof(altered) - 4 + byte] = (unsigned char)(crc >> (24 - byte * 8));
+        expect_snapshot_rejected_unchanged(path, altered, sizeof(altered));
+    }
+    puts("snapshot all truncation positions and CRC-valid structural boundaries passed");
+}
+
 int main(void)
 {
     assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
@@ -383,6 +435,7 @@ int main(void)
     test_checkpoint_roundtrip(path);
     test_rejects_corruption(path);
     test_checkpoint_corruption(path);
+    test_fixed_snapshot_boundaries(path);
     destroy_engines();
 
     assert(unlink(path) == 0);

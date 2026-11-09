@@ -314,7 +314,51 @@ test-integration: $(BIN_DIR)/kvstore
 		printf '[FAIL] replication integration (exit %s)\n%s\n' "$$status" "$$output" >&2; \
 		exit "$$status"; \
 	fi
-	@printf 'Integration test groups: 5 passed\n'
+	@$(MAKE) --no-print-directory test-hybrid-recovery
+	@$(MAKE) --no-print-directory test-aof-write-failure
+	@$(MAKE) --no-print-directory test-aof-sync-failure
+	@$(MAKE) --no-print-directory test-snapshot-save-failure
+	@$(MAKE) --no-print-directory test-snapshot-crash
+	@$(MAKE) --no-print-directory test-replication-faults
+	@printf 'Integration test groups: 11 passed\n'
+
+.PHONY: test-hybrid-recovery
+test-hybrid-recovery: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_hybrid_recovery.py
+
+.PHONY: test-aof-write-failure
+test-aof-write-failure: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_aof_write_failure.py
+
+# 只有测试程序链接同步故障包装器；正式 kvstore 不包含该开关。
+$(BIN_DIR)/test_kvstore_sync_fault: $(OBJS) $(TEST_DIR)/aof_sync_fault.c \
+        $(INCLUDE_DIR)/uring_io.h $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(TEST_DIR)/aof_sync_fault.c $(OBJS) \
+	    $(LDFLAGS) -Wl,--wrap=kvs_uring_io_sync $(LDLIBS) -luring -o $@
+
+.PHONY: test-aof-sync-failure
+test-aof-sync-failure: $(BIN_DIR)/kvstore $(BIN_DIR)/test_kvstore_sync_fault
+	python3 -B $(TEST_DIR)/test_aof_sync_failure.py
+
+# 独立的 Snapshot 测试程序；正式程序不链接故障包装器。
+$(BIN_DIR)/test_kvstore_snapshot_fault: $(OBJS) $(TEST_DIR)/snapshot_save_fault.c \
+        $(INCLUDE_DIR)/uring_io.h $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(TEST_DIR)/snapshot_save_fault.c $(OBJS) \
+	    $(LDFLAGS) -Wl,--wrap=kvs_uring_io_write_batch -Wl,--wrap=kvs_uring_io_sync -Wl,--wrap=rename -Wl,--wrap=fsync $(LDLIBS) -luring -o $@
+
+.PHONY: test-snapshot-save-failure
+test-snapshot-save-failure: $(BIN_DIR)/kvstore $(BIN_DIR)/test_kvstore_snapshot_fault
+	python3 -B $(TEST_DIR)/test_snapshot_save_failure.py --case file-sync
+	python3 -B $(TEST_DIR)/test_snapshot_save_failure.py --case rename
+	python3 -B $(TEST_DIR)/test_snapshot_save_failure.py --case dir-sync
+
+.PHONY: test-snapshot-crash
+test-snapshot-crash: $(BIN_DIR)/kvstore $(BIN_DIR)/test_kvstore_snapshot_fault
+	python3 -B $(TEST_DIR)/test_snapshot_crash.py
+
+.PHONY: test-replication-faults
+test-replication-faults: $(BIN_DIR)/kvstore
+	python3 -B $(TEST_DIR)/test_replication_faults.py .
 
 test:
 	@$(MAKE) --no-print-directory test-unit
@@ -452,7 +496,7 @@ $(BIN_DIR)/test_connection_protocol: \
 # 同一台机器的 ACTIVE iWARP 网卡上跑真实 RDMA；没有设备时明确失败。
 .PHONY: test-rdma
 
-test-rdma: $(BIN_DIR)/kvstore
+test-rdma: $(BIN_DIR)/kvstore $(BIN_DIR)/test_kvstore_sync_fault
 	python3 -B $(TEST_DIR)/test_rdma_replication.py .
 
 test-integration: test-rdma
@@ -592,3 +636,12 @@ test-unit: test-ebpf-online
 test-ebpf-replication: $(BIN_DIR)/kvstore-ebpf
 	KVS_EBPF_OBJECT=$(abspath $(BUILD_DIR)/ebpf_capture.bpf.o) \
 	    python3 -B $(TEST_DIR)/test_ebpf_replication.py .
+
+# 可选诊断：独立临时目录，不改变普通构建或 make test 的工具链要求。
+FUZZ_RUNS ?= 50000
+.PHONY: fuzz-protocol test-sanitizers
+fuzz-protocol:
+	python3 -B $(TEST_DIR)/run_protocol_fuzz.py --runs $(FUZZ_RUNS)
+
+test-sanitizers:
+	python3 -B $(TEST_DIR)/run_sanitizers.py
