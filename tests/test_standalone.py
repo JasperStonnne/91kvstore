@@ -367,13 +367,14 @@ def test_other_log_level(test_dir, level):
         debug_message = "client accepted fd="
 
         if level == "error":
-            if listener_message in output or debug_message in output:
+            if output.strip():
                 raise TestFailure(
                     f"log_level=error printed INFO or DEBUG; log: {log_path}"
                 )
             print("[PASS] log_level=error hides INFO/DEBUG; commands still work")
         elif level == "debug":
-            if listener_message not in output or debug_message not in output:
+            if (listener_message not in output or debug_message not in output
+                    or "allocator initialized:" not in output):
                 raise TestFailure(
                     f"log_level=debug missing INFO or DEBUG; log: {log_path}"
                 )
@@ -818,6 +819,17 @@ def main():
             raise TestFailure("log_level=info unexpectedly printed DEBUG message")
         print("[PASS] log_level=info hides DEBUG")
         test_basic_commands(port)
+        # INFO 只能保留初始化和监听信息，普通请求不能产生逐命令输出。
+        lines = log_path.read_text(errors="replace").splitlines()
+        unexpected = [line for line in lines if line and not (
+            line.startswith("--- start attempt ") or
+            line.startswith("allocator initialized: ") or
+            line == expected_log)]
+        if unexpected:
+            raise TestFailure(f"unexpected INFO request output: {unexpected!r}")
+        if "allocator initialized:" not in "\n".join(lines):
+            raise TestFailure("INFO allocator initialization log missing")
+        print("[PASS] INFO startup logs retained; requests produce no extra output")
         test_bind_ip(port)
         test_pipelining(port)
         test_mixed_pipeline(port)

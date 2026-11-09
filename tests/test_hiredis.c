@@ -55,12 +55,16 @@ int main(int argc, char **argv)
     if (check_reply(context, "SET", redisCommand(
                         context, "SET %s %b", key, value, sizeof(value) - 1),
                     REDIS_REPLY_STATUS, "OK", 0) < 0) goto done;
-    if (check_reply(context, "duplicate SET",
-                    redisCommand(context, "SET %s other", key),
-                    REDIS_REPLY_ERROR, "ERR key already exists", 0) < 0) goto done;
     if (check_reply(context, "GET with spaces and CRLF",
                     redisCommand(context, "GET %s", key),
                     REDIS_REPLY_STRING, value, 0) < 0) goto done;
+    /* 与主线 standalone 用例的覆盖写契约一致；不改变服务器命令语义。 */
+    if (check_reply(context, "duplicate SET overwrites",
+                    redisCommand(context, "SET %s other", key),
+                    REDIS_REPLY_STATUS, "OK", 0) < 0) goto done;
+    if (check_reply(context, "GET overwritten value",
+                    redisCommand(context, "GET %s", key),
+                    REDIS_REPLY_STRING, "other", 0) < 0) goto done;
     if (check_reply(context, "DEL", redisCommand(context, "DEL %s", key),
                     REDIS_REPLY_INTEGER, NULL, 1) < 0) goto done;
     if (check_reply(context, "missing GET",

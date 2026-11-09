@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Snapshot / AOF 各 100000 条的独立持久化验收。"""
 
+import argparse
+import json
+import signal
 import hashlib
 import socket
 import subprocess
@@ -97,7 +100,14 @@ def wait_ready(process, port, timeout=300):
     raise TimeoutError(f"服务在 {timeout} 秒内未就绪")
 
 
-def stop_checked(process):
+def stop_checked(process, method="term"):
+    # SIGKILL 只模拟进程异常退出，不代表断电；调用前已收到所有写入/SAVE 成功回复。
+    if method == "kill":
+        process.kill()
+        process.wait(timeout=10)
+        require(process.returncode == -signal.SIGKILL,
+                f"SIGKILL exit mismatch: {process.returncode}")
+        return process.returncode
     process.terminate()
     try:
         process.wait(timeout=10)
@@ -107,6 +117,7 @@ def stop_checked(process):
         process.returncode in (0, -15),
         f"停服退出码异常：{process.returncode}",
     )
+    return process.returncode
 
 
 def file_digest(path):
@@ -117,9 +128,12 @@ def file_digest(path):
     return digest.hexdigest()
 
 
-def run_mode(mode):
+def run_mode(mode, stop_method="term"):
     directory = Path(tempfile.mkdtemp(prefix=f"91kv-{mode}-100k-"))
     port = choose_port()
+    result = {"mode": mode, "stop_method": stop_method, "success": False,
+              "expected_records": TOTAL, "written": 0, "verified": 0,
+              "scope": "process exit recovery; not power-loss verification"}
     process = None
     print(f"\n[{mode}] 文件和日志：{directory}", flush=True)
 
@@ -147,6 +161,7 @@ def run_mode(mode):
                     reply = client.command(prefix + b"SET", key, value)
                     require(reply == b"OK", f"{name} 写入失败：{key!r}")
                     written += 1
+                    result["written"] = written
                     if written % 10000 == 0:
                         print(f"[{mode}] 已写入 {written}/{TOTAL}", flush=True)
                 print(f"[{mode}] {name} 写入 {count} 条成功", flush=True)
@@ -160,7 +175,8 @@ def run_mode(mode):
                 save_seconds = time.monotonic() - started
 
         # AOF 分支没有发送 SAVE。
-        stop_checked(process)
+        result["initial_exit_code"] = stop_checked(process, stop_method)
+        result["boundary"] = "successful SAVE reply" if mode == "snapshot" else "all SET replies successful"
         process = None
 
         filename = "snapshot.bin" if mode == "snapshot" else "commands.aof"
@@ -193,6 +209,7 @@ def run_mode(mode):
                         f"expected={expected!r}, actual={actual!r}",
                     )
                     verified += 1
+                    result["verified"] = verified
                     if verified % 10000 == 0:
                         print(f"[{mode}] 已核对 {verified}/{TOTAL}", flush=True)
                 print(f"[{mode}] {name} 逐条核对 {count} 条成功", flush=True)
@@ -215,19 +232,29 @@ def run_mode(mode):
         )
         if save_seconds is not None:
             print(f"  SAVE 耗时={save_seconds:.3f}s", flush=True)
+        result.update(success=True, sha256=before_digest,
+                      file_bytes=data_path.stat().st_size)
         return True
 
     except Exception as exc:
+        result["error"] = repr(exc)
         print(f"[FAIL] {mode}: {exc!r}", flush=True)
         print(f"文件及 server.log 保留在：{directory}", flush=True)
         return False
     finally:
         # 仅用于失败后的清理；不能把强制清理当成验收成功。
         stop_server(process)
+        (directory / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"[INFO] structured result: {directory / 'result.json'}", flush=True)
 
 
 def main():
-    results = [run_mode(mode) for mode in ("snapshot", "aof")]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stop-method", choices=("term", "kill"), default="term",
+                        help="kill: SIGKILL after acknowledged writes/SAVE; never a power-loss test")
+    args = parser.parse_args()
+    results = [run_mode(mode, args.stop_method) for mode in ("snapshot", "aof")]
     passed = sum(results)
     print(f"\n100000 条持久化验收：{passed}/2 模式通过", flush=True)
     return 0 if all(results) else 1

@@ -1327,9 +1327,6 @@ static int kvs_install_replication_snapshot(
 static int kvs_server_run(kvs_config_t config)
 {
 
-        /* 配置解析成功后，运行日志采用配置文件指定的级别。 */
-    kvs_log_set_level(config.log_level);
-
 
        /* 初始化引擎，并按配置选择持久化恢复路径。 */
     kvs_server_role = config.role;
@@ -1549,6 +1546,9 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* 配置解析成功后先设置日志级别，allocator 初始化日志也必须遵守配置。 */
+    kvs_log_set_level(config.log_level);
+
 /* 在创建引擎之前初始化配置指定的分配后端。 */
     if (kvs_allocator_init(config.allocator_backend) != 0) {
         fprintf(stderr, "failed to initialize allocator backend=%d\n",
@@ -1560,7 +1560,7 @@ int main(int argc, char *argv[])
         config.allocator_backend == KVS_ALLOCATOR_SYSTEM
         ? "system" : "pool";
 
-    fprintf(stderr, "allocator initialized: %s\n", name);
+    kvs_log_message(KVS_LOG_INFO, "allocator initialized: %s\n", name);
 
     int result = kvs_server_run(config);
 
