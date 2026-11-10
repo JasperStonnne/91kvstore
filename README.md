@@ -9,7 +9,7 @@
 
 91kvstore 是一个用于学习数据库系统的键值存储项目。它不只实现单个数据结构，而是将 **TCP 字节流 → 命令解析 → 存储引擎 → 持久化 → 主从复制** 接成一条可运行、可测试的链路。
 
-> 本项目用于学习和实验，不建议用于生产环境。它接受 RESP 风格的长度前缀**请求**，已验证 `redis-cli`、hiredis 与 redis-benchmark 的明确支持场景；它不是完整 Redis 实现，默认 `redis-benchmark -t ping` 仍未支持。详见[测试方案](docs/performance/phase13/TESTING.md)。
+> 本项目用于学习和实验，不建议用于生产环境。它接受 RESP 风格的长度前缀**请求**，已验证 `redis-cli`、hiredis 与 redis-benchmark 的明确支持场景；它不是完整 Redis 实现，默认 `redis-benchmark -t ping` 仍未支持。详见[测试方案](docs/performance/TESTING.md)。
 
 ## 一分钟体验
 
@@ -61,7 +61,7 @@ sudo env KVS_EBPF_OBJECT="$REPO/build/ebpf_capture.bpf.o" \
   "$REPO/bin/kvstore-ebpf" "$RUN_DIR/primary.conf"
 ```
 
-本实验环境用 sudo 加载本项目 BPF；非 root capability 组合未验证，不要求修改 sysctl。仅 Primary 分支加载 BPF，Replica 可用同一二进制普通权限启动。日志必须显示 `ONLINE source=eBPF`，AOF 降级不能算 eBPF 验收通过。[完整构建、启动和复现说明](docs/performance/phase13/REPRODUCING.md)。
+本实验环境用 sudo 加载本项目 BPF；非 root capability 组合未验证，不要求修改 sysctl。仅 Primary 分支加载 BPF，Replica 可用同一二进制普通权限启动。日志必须显示 `ONLINE source=eBPF`，AOF 降级不能算 eBPF 验收通过。[完整构建、启动和复现说明](docs/performance/REPRODUCING.md)。
 
 ### 2. 写入与读取
 
@@ -140,17 +140,19 @@ NtyCo 网络层负责连接、收发和缓冲区；长度前缀解析集中在�
 
 ### 命令
 
-命令前缀选择存储引擎。`SET` 创建新键；要修改已有值，使用对应的 `MOD`。
+命令前缀选择存储引擎。当前四个引擎的 `SET/RSET/HSET/SSET` 均为**键不存在则新增，已存在则覆盖 value**；`MOD/RMOD/HMOD/SMOD` **仅修改已有键**，未命中时不创建。
 
 | 操作 | Array | Red-Black Tree | Hash Table | Skip List |
 | --- | --- | --- | --- | --- |
-| 创建 | `SET` | `RSET` | `HSET` | `SSET` |
+| 新增或覆盖 | `SET` | `RSET` | `HSET` | `SSET` |
 | 读取 | `GET` | `RGET` | `HGET` | `SGET` |
-| 修改 | `MOD` | `RMOD` | `HMOD` | `SMOD` |
+| 仅修改已有键 | `MOD` | `RMOD` | `HMOD` | `SMOD` |
 | 删除 | `DEL` | `RDEL` | `HDEL` | `SDEL` |
 | 判断存在 | `EXIST` | `REXIST` | `HEXIST` | `SEXIST` |
 
-创建、修改：`命令 key value`。读取、删除、判断存在：`命令 key`。`SAVE` 手动保存 Snapshot。
+新增/覆盖、修改：`命令 key value`。读取、删除、判断存在：`命令 key`。`SAVE` 手动保存 Snapshot。
+
+对 RESP 请求，重复 SET 成功返回 `+OK` 并覆盖旧值；MOD 未命中返回 `-ERR key not found`，不插入新键。插入测试使用不同 key，更新测试固定使用 MOD，这是负载分组约定，不是 SET 只能新增的协议限制。[实现与既有用例核对](docs/performance/REPORT.md#命令语义与测量约定)。
 
 ### 两种请求格式
 
@@ -173,7 +175,7 @@ $11\r\nhello world\r\n
 
 解析器面对的是 TCP 字节流：一次 `recv` 可能只收到半条命令，也可能收到多条命令。它只在命令完整时交给执行层，并返回本次消费的字节数；未消费的字节继续留在连接的输入缓冲区。
 
-**兼容性边界：** 已验证的子集包括 `redis-cli`、hiredis 的基本命令/特殊字符场景及 redis-benchmark 显式 RESP `PING`、`HGET`。默认 `-t ping` 的 inline 场景仍不兼容，不能标全兼容。`SET/HSET` 创建新键，更新须用对应 `MOD`，不套用 Redis 覆盖写语义。key/value 不支持嵌入 `\0`。详见[测试方案与可行性](docs/performance/phase13/TESTING.md)。
+**兼容性边界：** 已验证的子集包括 `redis-cli`、hiredis 的基本命令/特殊字符场景及 redis-benchmark 显式 RESP `PING`、`HGET`。默认 `-t ping` 的 inline 场景仍不兼容，不能标全兼容。四种 SET 命令均可新增或覆盖，MOD 只修改已有键。本项目 `HSET key value` 选择 Hash 引擎，不等同于 Redis 的哈希字段操作；支持这些场景不表示支持 Redis 全部语义。key/value 不支持嵌入 `\0`。详见[测试方案与可行性](docs/performance/TESTING.md)。
 
 ## 持久化
 
@@ -187,7 +189,7 @@ $11\r\nhello world\r\n
 
 当前 Snapshot 是带版本、记录长度和校验的**二进制格式**，不是旧的 `AOF_OFFSET` 文本首行。SAVE 路径为临时文件 → io_uring 写入/文件同步 → rename → 父目录同步。rename 后目录同步失败时可能“返回错误但文件已替换”，不承诺自动回滚。AOF 错误不回复成功并停止；残缺日志拒绝恢复，不自动跳过或修剪。失败回复也不承诺相关命令绝不在重启后出现。
 
-单机 AOF/SAVE 的文件写入使用 io_uring，恢复使用 mmap；**Replica 接收临时快照仍使用 `write/fsync`**，不能写成所有落盘路径都已使用 io_uring。成功写入内存、AOF 同步、客户端回复与 Replica 应用是不同时间点。SIGKILL 恢复只验证进程异常退出，不等于断电或真实磁盘故障测试。[失败契约与现有测试](docs/performance/phase13/TESTING.md)。
+单机 AOF/SAVE 的文件写入使用 io_uring，恢复使用 mmap；**Replica 接收临时快照仍使用 `write/fsync`**，不能写成所有落盘路径都已使用 io_uring。成功写入内存、AOF 同步、客户端回复与 Replica 应用是不同时间点。SIGKILL 恢复只验证进程异常退出，不等于断电或真实磁盘故障测试。[失败契约与现有测试](docs/performance/TESTING.md)。
 
 ## Primary-Replica 复制
 
@@ -209,7 +211,7 @@ CATCH_UP        TCP 从 Snapshot 的边界 O 补齐 AOF 增量
 ONLINE          普通版 AOF；eBPF 版事件 payload + AOF 补偿
 ```
 
-当前通过配置文件启动，在两个独立工作目录运行 Primary 与 Replica。具体配置和启动步骤见下文及[复现说明](docs/performance/phase13/REPRODUCING.md)。
+当前通过配置文件启动，在两个独立工作目录运行 Primary 与 Replica。具体配置和启动步骤见下文及[复现说明](docs/performance/REPRODUCING.md)。
 
 ### RDMA 现状
 
@@ -251,9 +253,9 @@ BPF 加载或消费失败会明确记录降级到 AOF；普通构建继续使用
 | `pool`（默认） | 请求1–4096字节按规格放入64KiB slab；更大请求独立 `mmap`，释放时 `munmap`，不回退 libc | 包括变长 key/value、节点、容器及通过该入口申请的网络缓冲等；不接管第三方直接分配 |
 | `jemalloc`（benchmark模式） | 脚本选择 `allocator=system` 并用 `LD_PRELOAD` 替换动态堆分配 | 统一入口的 `malloc/free` 及进程中其他可被替换的同类动态调用；不是配置中的第三个后端，也不接管直接 `mmap` |
 
-详见[四引擎分配与释放路径核对](docs/performance/phase13/REPORT.md#分配覆盖范围只读源码核对)。这三方案比较不是只替换固定大小节点。
+详见[四引擎分配与释放路径核对](docs/performance/REPORT.md#分配覆盖范围只读源码核对)。这三方案比较不是只替换固定大小节点。
 
-百万条三轮中，pool 四阶段合计耗时低于 system，但装满 RSS 更高（275.043 对 237.117 MiB），不能称为全面省内存。删除后 RSS 保留不等于泄漏。VmSize 是虚拟地址空间，另表列出，不混作物理内存。[结果和口径](docs/performance/phase13/REPORT.md)。
+百万条三轮中，pool 四阶段合计耗时低于 system，但装满 RSS 更高（275.043 对 237.117 MiB），不能称为全面省内存。删除后 RSS 保留不等于泄漏。VmSize 是虚拟地址空间，另表列出，不混作物理内存。[结果和口径](docs/performance/REPORT.md)。
 
 ## 测试
 
@@ -270,7 +272,7 @@ BPF 加载或消费失败会明确记录降级到 AOF；普通构建继续使用
 | `make test-ebpf-replication` | 真实 eBPF、RDMA、补偿专项 | 先普通用户构建，再以批准的 BPF 权限运行；需要 ACTIVE iWARP |
 | `tests/test_two_vm_100k.py` | 先5万、从机同步后再5万，两端各10万读回 | 双VM、同程序/依赖指纹；客户端本身不启动/清理服务，必须落实实例归属及超时 |
 
-详细的依赖、执行步骤、资源要求、正确性判据、历史通过范围及未验证项见[测试方案](docs/performance/phase13/TESTING.md)和[复现说明](docs/performance/phase13/REPRODUCING.md)。完整 `make test` 不含所有大数据、可选客户端或真实 BPF 专项；SKIP 不等于 PASS。新机器全套安装/构建未在本阶段重新验证。
+详细的依赖、执行步骤、资源要求、正确性判据、历史通过范围及未验证项见[测试方案](docs/performance/TESTING.md)和[复现说明](docs/performance/REPRODUCING.md)。完整 `make test` 不含所有大数据、可选客户端或真实 BPF 专项；SKIP 不等于 PASS。新机器全套安装/构建未在本阶段重新验证。
 
 ## 性能结果
 
@@ -284,17 +286,17 @@ BPF 加载或消费失败会明确记录降级到 AOF；普通构建继续使用
 | allocator system / pool / jemalloc | 202.766 / 182.998 / 179.696 秒 | 3.43 / 5.17 / 2.90% | 百万条四阶段合计，含生成、客户端、协议和网络 |
 | 双机 ONLINE 后第二批5万 | 4021.56 条/秒 | 1.32% | 现有串行 Python 客户端整阶段；无 AOF 对照，不能宣称 eBPF 加速 |
 
-![单机热点 HGET：三轮点及中位数，左图对数轴保留P64退化，右图为独立长轮次](docs/performance/phase13/figures/single-hget.svg)
+![单机热点 HGET：三轮点及中位数，左图对数轴保留P64退化，右图为独立长轮次](docs/performance/figures/single-hget.svg)
 
 P64 中位仅1546.94次/秒，未隐藏。诊断只观察到等待线索，**未证明 delayed ACK 或 NtyCo 是根因**；没有生成或虚构火焰图。
 
-![百万条 allocator 起始、装满和删除后的RSS；三轮中位数及原始点](docs/performance/phase13/figures/allocator-rss.svg)
+![百万条 allocator 起始、装满和删除后的RSS；三轮中位数及原始点](docs/performance/figures/allocator-rss.svg)
 
 双机正式三轮两端各10万条逐条匹配、快照 SHA 相同，既有日志补偿均为0；热身有3段/837字节补偿且最终一致。末轮客户端和数据验证通过，但外部收尾检查误判正常退出，Primary 编排退出1、Replica编排退出0，**不能写整个流程全绿**。
 
 纯 RDMA 吞吐、精确初始化耗时、逐请求复制延迟、ONLINE 独立计数未测。没有逐条增量 ACK，不保证端到端 exactly-once。重启耗时止于**端口可连接**，全量恢复校验另计；软件 SIW 成绩不推导硬件 RDMA 性能。
 
-[总报告：四类结果、全部轮次和其余图表](docs/performance/phase13/REPORT.md) · [复现命令与边界](docs/performance/phase13/REPRODUCING.md) · [数值数据](docs/performance/phase13/data/measurements.json) · [原始证据哈希索引](docs/performance/phase13/data/evidence-index.json)
+[总报告：四类结果、全部轮次和其余图表](docs/performance/REPORT.md) · [复现命令与边界](docs/performance/REPRODUCING.md) · [数值数据](docs/performance/data/measurements.json) · [原始证据哈希索引](docs/performance/data/evidence-index.json)
 
 ## 项目结构
 

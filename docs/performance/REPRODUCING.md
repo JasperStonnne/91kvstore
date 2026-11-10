@@ -1,6 +1,6 @@
 # 构建与测量复现说明
 
-[首页](../../../README.md) · [总报告](REPORT.md) · [测试可行性](TESTING.md)
+[首页](../../README.md) · [总报告](REPORT.md) · [测试可行性](TESTING.md)
 
 所有命令仅作说明，本次文档整理没有运行负载、诊断、编译、安装或服务。重新测量需在另行授权的环境安排。以下使用变量与独立临时目录，不依赖个人路径或旧证据目录。
 
@@ -57,14 +57,14 @@ cd "$RUN_DIR"
 ```bash
 VALUE_A=$(printf '%128s' '' | tr ' ' a)
 VALUE_B=$(printf '%128s' '' | tr ' ' b)
-# 只创建一次，检查实际回复为OK；重复HSET不是覆盖更新。
+# 只创建一次，检查实际回复为OK；重复HSET会覆盖，不能算不同key的新增。
 [ "$(redis-cli -h 127.0.0.1 -p 48651 --raw HSET perf:hot "$VALUE_A")" = OK ]
 [ "$(redis-cli -h 127.0.0.1 -p 48651 --raw HGET perf:hot)" = "$VALUE_A" ]
 redis-benchmark -h 127.0.0.1 -p 48651 -c 1 -P 1  -n 128000 -d 128 HGET perf:hot
 redis-benchmark -h 127.0.0.1 -p 48651 -c 1 -P 16 -n 128000 -d 128 HGET perf:hot
 redis-benchmark -h 127.0.0.1 -p 48651 -c 1 -P 64 -n 128000 -d 128 HGET perf:hot
 redis-benchmark -h 127.0.0.1 -p 48651 -c 8 -P 1  -n 128000 -d 128 HGET perf:hot
-# HMOD组每轮前恢复a、读回；测后应为b，不能用重复SET测试更新。
+# 本更新组固定用HMOD：每轮前恢复a并读回，测后应为b；与SET覆盖负载分开。
 [ "$(redis-cli -h 127.0.0.1 -p 48651 --raw HMOD perf:hot "$VALUE_A")" = OK ]
 redis-benchmark -h 127.0.0.1 -p 48651 -c 1 -P 1 -n 128000 -d 128 HMOD perf:hot "$VALUE_B"
 [ "$(redis-cli -h 127.0.0.1 -p 48651 --raw HGET perf:hot)" = "$VALUE_B" ]
@@ -200,7 +200,7 @@ A root进程I/O字段为-1记未测，不提权补值；B跨VM时钟未核实，
 仓库已附5张静态SVG，GitHub显示无需Python。离线重画仅使用已提交数据：
 
 ```bash
-python3 docs/performance/phase13/plot_results.py
+python3 docs/performance/plot_results.py
 ```
 
 需要**已存在**的matplotlib（本次使用3.9.4），缺失不自动安装；脚本不执行测试、不访问VM、不调用sudo、不启动服务，只读 `data/measurements.json` 后生成SVG。`--preview-dir` 可将本地PNG校对副本写到指定目录，PNG不必入库。原始大归档/运行数据/个人路径不入Git，只保留轻量数值和哈希索引。

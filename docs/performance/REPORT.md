@@ -1,6 +1,6 @@
-# 第十三阶段总报告：性能测量与观察
+# 性能测量总报告
 
-[首页](../../../README.md) · [测试方案](TESTING.md) · [复现命令](REPRODUCING.md) · [数值](data/measurements.json) · [证据索引](data/evidence-index.json)
+[首页](../../README.md) · [测试方案](TESTING.md) · [复现命令](REPRODUCING.md) · [数值](data/measurements.json) · [证据索引](data/evidence-index.json)
 
 本阶段已停止负载、诊断和调优。本次只整理既有证据并离线制图，四类测量分开统计，不混算客户端、数据集、计时或耐久性承诺。图中的点是原始轮次，线或柱是中位数；不虚构误差线、分位数或火焰图。
 
@@ -28,7 +28,7 @@
 
 ## 1. 单机：本机128B热点
 
-客户端/服务端在VM-A回环，standalone/snapshot/pool/error。一个Hash key，128个ASCII字节；HGET固定热点，不代表百万条随机访问。HMOD先确认key存在，每轮恢复a后修改b，不重复HSET冒充覆盖。每组独立热身，正式交错顺序见复现说明。
+客户端/服务端在VM-A回环，standalone/snapshot/pool/error。一个Hash key，128个ASCII字节；HGET固定热点，不代表百万条随机访问。插入使用不同key，更新组先确认key存在，每轮以HMOD恢复a后修改b；这只定义测量负载，SET本身仍允许覆盖已有key。每组独立热身，正式交错顺序见复现说明。
 
 | 场景 | 每轮请求数 | 三轮工具完成 req/s | 中位数 | 波动 |
 | --- | ---: | --- | ---: | ---: |
@@ -46,6 +46,14 @@
 初始服务CPU中位：c1/P1约30.73%、c8/P1约97.86%、P64约0.47%单核；P16长轮约36.29%。短窗口CPU为近似，不与整机利用率混用。
 
 redis-benchmark7.0.15延迟按批次发送至首个read事件统计，不保证完整响应解析边界。P16/P64不除以深度当单请求延迟，不与P1的p99混比。各轮工具分位数仅原样保留在数据文件，不平均成合并请求p99；本报告无逐请求完成延迟。
+
+### 命令语义与测量约定
+
+当前四个引擎的 SET 都是新增或覆盖；MOD 只修改已有键。依据是 [Array SET](../../src/engines/kvs_array.c#L49)、[Hash SET](../../src/engines/kvs_hash.c#L148)、[RBTree SET](../../src/engines/kvs_rbtree.c#L512)、[Skiplist SET](../../src/engines/kvs_skiplist.c#L127) 的已有键分支，以及[客户端执行与回复](../../src/kvstore.c#L875)；没有增加“重复键拒绝”的前置限制。对 RESP 重复 SET，覆盖成功返回`+OK`；MOD 未命中返回`-ERR key not found`，不创建键。
+
+既有 [test_standalone.py](../../tests/test_standalone.py#L506) 明确断言：同一key第二次SET返回`+OK`，随后GET读到新值。这个用例直接覆盖Array的重复RESP SET；其余引擎的覆盖行为本次来自只读源码检查，没有新增或执行动态测试，不能写成本次新测试通过。
+
+“插入用唯一key、更新组用MOD”是性能测试的分组约定，不是协议不允许SET更新。重复key会把新增负载变为覆盖负载，不能将其计成不同key的插入吞吐；原有测量确实采用不同key和对应MOD分组，数值不变，也不重跑。
 
 ### 独立诊断，不进入成绩
 
@@ -82,24 +90,24 @@ redis-benchmark7.0.15延迟按批次发送至首个read事件统计，不保证�
 
 ### 分配覆盖范围（只读源码核对）
 
-统一入口与底层方式是两层：`kvs_malloc(size)` / `kvs_free(ptr)` 在 [kvstore.c](../../../src/kvstore.c#L40) 转交 `kvs_allocator_alloc/free`；后者才按当前后端选择分配/释放方式。不能把函数名 `kvs_malloc` 解读成“必定调用 libc malloc”，也不能按“key/value 长度可变”判断它不进池。
+统一入口与底层方式是两层：`kvs_malloc(size)` / `kvs_free(ptr)` 在 [kvstore.c](../../src/kvstore.c#L40) 转交 `kvs_allocator_alloc/free`；后者才按当前后端选择分配/释放方式。不能把函数名 `kvs_malloc` 解读成“必定调用 libc malloc”，也不能按“key/value 长度可变”判断它不进池。
 
 | 当前服务路径 | key/value | 其他动态对象及释放 |
 | --- | --- | --- |
-| [Array](../../../src/engines/kvs_array.c#L66) | `kvs_malloc(strlen+1)` 复制字符串；MOD先申请新value，再`kvs_free`旧值 | 数组表也经统一入口；DEL释放key/value，销毁还释放数组表 |
-| [Hash](../../../src/engines/kvs_hash.c#L63) | 当前`ENABLE_KEY_POINTER=1`分支分别通过统一入口申请key/value；MOD同样重新分配 | 节点与桶数组也经该入口；节点销毁先释放key/value再释放节点 |
-| [RBTree](../../../src/engines/kvs_rbtree.c#L529) | 当前字符key分支通过统一入口申请key/value；MOD先申请新值再释放旧值 | 节点与nil哨兵也经该入口；文件中直接malloc的旧main位于`#if 0`，不是服务路径 |
-| [Skiplist](../../../src/engines/kvs_skiplist.c#L32) | key/value均为`kvs_malloc(strlen+1)`；MOD先申请新值再释放旧值 | 节点、header及按层数分配的forward数组也经该入口，分别`kvs_free` |
+| [Array](../../src/engines/kvs_array.c#L66) | `kvs_malloc(strlen+1)` 复制字符串；MOD先申请新value，再`kvs_free`旧值 | 数组表也经统一入口；DEL释放key/value，销毁还释放数组表 |
+| [Hash](../../src/engines/kvs_hash.c#L63) | 当前`ENABLE_KEY_POINTER=1`分支分别通过统一入口申请key/value；MOD同样重新分配 | 节点与桶数组也经该入口；节点销毁先释放key/value再释放节点 |
+| [RBTree](../../src/engines/kvs_rbtree.c#L529) | 当前字符key分支通过统一入口申请key/value；MOD先申请新值再释放旧值 | 节点与nil哨兵也经该入口；文件中直接malloc的旧main位于`#if 0`，不是服务路径 |
+| [Skiplist](../../src/engines/kvs_skiplist.c#L32) | key/value均为`kvs_malloc(strlen+1)`；MOD先申请新值再释放旧值 | 节点、header及按层数分配的forward数组也经该入口，分别`kvs_free` |
 
-当前[头文件](../../../include/kvstore.h#L67)启用`ENABLE_KEY_CHAR=1`和`ENABLE_KEY_POINTER=1`；此处结论针对当前服务分支，不泛化到未启用的教学示例。
+当前[头文件](../../include/kvstore.h#L67)启用`ENABLE_KEY_CHAR=1`和`ENABLE_KEY_POINTER=1`；此处结论针对当前服务分支，不泛化到未启用的教学示例。
 
-- **system**：[分配器实现](../../../src/memory/kvs_allocator.c#L128)调用普通`malloc/free`。本批脚本清除预加载变量，验证绑定libc；因此此组是libc路径，不是由统一API名字推断。
+- **system**：[分配器实现](../../src/memory/kvs_allocator.c#L128)调用普通`malloc/free`。本批脚本清除预加载变量，验证绑定libc；因此此组是libc路径，不是由统一API名字推断。
 - **pool**：同一入口按请求字节数选择最小可容纳规格，规格16至4096字节；小对象来自64KiB的mmap slab，大于4096字节走独立mmap映射，不回退libc malloc。变长key/value和可变长度forward等只要经该入口，按大小同样处理。小对象释放归还空闲链表，slab留到销毁；大对象释放munmap。这是源码行为，不是从RSS曲线反推的泄漏结论。
-- **jemalloc**：[既有脚本](../../../tests/benchmark_memory.py#L239)把服务配置为`allocator=system`，再设置`LD_PRELOAD`指向jemalloc；初始化接口仍只有SYSTEM/POOL，配置不接受`allocator=jemalloc`。它替换可动态截获的普通堆分配，包含统一入口和第三方同类调用，但不拦截直接mmap。不能把pool覆盖的业务入口范围等同于进程所有分配。
+- **jemalloc**：[既有脚本](../../tests/benchmark_memory.py#L239)把服务配置为`allocator=system`，再设置`LD_PRELOAD`指向jemalloc；初始化接口仍只有SYSTEM/POOL，配置不接受`allocator=jemalloc`。它替换可动态截获的普通堆分配，包含统一入口和第三方同类调用，但不拦截直接mmap。不能把pool覆盖的业务入口范围等同于进程所有分配。
 
 作为大小示例，本批32B key加NUL申请33字节，在pool选48字节规格；128B value加NUL申请129字节，选192字节规格。它们确实进入pool小对象路径。规格内取整、slab管理信息和其他分配也占空间，不能据这两项直接重建全进程RSS。三方案测量并非“仅节点分配器”对比，数值无需重跑或更改。
 
-源码还确认[网络缓冲](../../../src/network/buffer.c#L37)等也调用统一入口；pool只控制这些调用者。NtyCo、libc及其他第三方直接进行的分配不自动由pool接管；jemalloc对第三方的范围仅限可被预加载替换的动态调用，不声称逐个验证了所有第三方分配点。
+源码还确认[网络缓冲](../../src/network/buffer.c#L37)等也调用统一入口；pool只控制这些调用者。NtyCo、libc及其他第三方直接进行的分配不自动由pool接管；jemalloc对第三方的范围仅限可被预加载替换的动态调用，不声称逐个验证了所有第三方分配点。
 
 原轮换：system/pool/jemalloc → pool/jemalloc/system → jemalloc/system/pool。合计包含生成数据、Python、协议、客户端和网络，不是纯allocator API时间。
 

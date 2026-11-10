@@ -1,6 +1,6 @@
 # 测试方案、可行性与边界
 
-[返回首页](../../../README.md) · [性能总报告](REPORT.md) · [复现说明](REPRODUCING.md)
+[返回首页](../../README.md) · [性能总报告](REPORT.md) · [复现说明](REPRODUCING.md)
 
 本页依据基线 `719836e9` 的 Makefile 和现有脚本静态核对。本次文档整理**未编译、运行测试或服务**。历史第十一/十二阶段的通过记录与第十三阶段测量分开；新机器重新执行仍须检查真实退出码及断言，不能把示例步骤当作新实测。
 
@@ -32,6 +32,12 @@
 | 双VM 5万+5万 | `tests/test_two_vm_100k.py`：write1→启动Replica→ONLINE→verify1→write2→两端verify all | accepted=50000；各端matched=100000，错误0；两端快照SHA；保留offset及日志 | 同一程序/依赖指纹，独立数据目录，A需BPF权限。第十三阶段热身+3轮数据通过，末轮编排非零详见总报告 |
 | allocator三方案 | `tests/benchmark_memory.py --backend all --entries 1000000 --rounds 3` | 配置与库绑定、四阶段各百万操作成功、三状态内存与守卫；分配范围见[源码核对](REPORT.md#分配覆盖范围只读源码核对) | 单机；需已有jemalloc库；9次测量共3600万次检查通过。不是allocator API微基准；system=libc，pool含key/value等统一入口分配，jemalloc=system加预加载 |
 | 可选诊断入口 | `make test-sanitizers`、`make fuzz-protocol` | 保留最小复现/退出码、非零失败；SKIP与未跑不作PASS | 会在隔离目录重编译，需相应编译器/runtime；本批文档任务不执行。历史ASan/UBSan 15单测及有界协议诊断有记录，不覆盖真实NtyCo/CM/CQ/BPF运行；文件/控制行未做独立覆盖引导验证 |
+
+## SET/MOD 的正确性依据
+
+当前四引擎SET均允许新增或覆盖；MOD仅更新已有键，未命中不创建。已有`test_standalone.py`断言重复RESP SET返回`+OK`并读回覆盖值，直接覆盖Array路径；另外三引擎本次只读检查了实现，没有运行新的重复键测试。详见[实现与证据](REPORT.md#命令语义与测量约定)。
+
+万条功能链以不同key检查插入，另用MOD检查修改；这不表示SET禁止覆盖。性能分组也以唯一新key测新增、固定MOD测更新，不能把重复SET的覆盖次数当作不同key新增数。此处只修正文档，不改测试或业务语义。
 
 ## 明确步骤与权限分界
 
