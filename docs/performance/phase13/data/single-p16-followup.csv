@@ -1,0 +1,4 @@
+round,requests,tool_completed_qps,tool_duration_seconds,command_wall_seconds,server_cpu_seconds,server_cpu_pct_one_core,tool_batch_first_read_p50_ms,tool_batch_first_read_p95_ms,tool_batch_first_read_p99_ms,VmPeak_KiB,VmSize_KiB,VmHWM_KiB,VmRSS_KiB,detected_errors,detected_timeouts,value_check
+round1,12043648,483447.66,24.911999780907,24.914676904678345,9.05,36.32397094541748,0.031,0.039,0.047,21056,20992,3020,3020,0,0,pre/post 128-byte value matched; not per-response validation
+round2,12043648,483525.28,24.90800067371865,24.910143613815308,9.04,36.290437101239206,0.031,0.039,0.047,21056,20992,3020,3020,0,0,pre/post 128-byte value matched; not per-response validation
+round3,12043648,482015.84,24.986000460067867,24.98774766921997,9.02,36.09769123413584,0.031,0.039,0.047,21056,20992,3020,3020,0,0,pre/post 128-byte value matched; not per-response validation

@@ -1,0 +1,16 @@
+round,case,operation,clients,pipeline,completed,tool_completed_qps,p50_tool_ms,p95_tool_ms,p99_tool_ms,client_wall_seconds,server_cpu_seconds,server_cpu_pct_one_core,VmPeak_KiB,VmSize_KiB,VmHWM_KiB,VmRSS_KiB,correctness
+round1,g1,HGET,1,1,128000,33350.7,0.031,0.039,0.047,3.8397128582000732,1.18,30.731464658353225,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round1,g16,HGET,1,16,128000,470588.22,0.031,0.039,0.055,0.27367067337036133,0.1,36.54026891828083,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round1,g64,HGET,1,64,128000,1546.94,0.255,0.351,0.447,82.7495219707489,0.4,0.4833864782220686,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round1,g8,HGET,8,1,128000,205787.78,0.039,0.055,0.087,0.6250324249267578,0.6,95.99501978962273,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round1,mod,HMOD,1,1,128000,33507.86,0.031,0.039,0.039,3.822596788406372,1.19,31.130670218977166,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round2,g1,HGET,1,1,128000,33100.59,0.031,0.039,0.047,3.869757890701294,1.2,31.00969192112768,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round2,g16,HGET,1,16,128000,442906.56,0.031,0.055,0.079,0.29351258277893066,0.1,34.070089620423026,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round2,g64,HGET,1,64,128000,1547.2,0.247,0.343,0.455,82.73508501052856,0.39,0.47138405665549266,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round2,g8,HGET,8,1,128000,212978.36,0.039,0.047,0.063,0.6029083728790283,0.59,97.8589826481613,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round2,mod,HMOD,1,1,128000,33844.53,0.031,0.039,0.039,3.784916639328003,1.18,31.176380154293287,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round3,g1,HGET,1,1,128000,33719.7,0.031,0.039,0.039,3.798135280609131,1.16,30.541302884134325,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round3,g16,HGET,1,16,128000,483018.91,0.031,0.039,0.047,0.26671910285949707,0.09,33.743364849052604,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round3,g64,HGET,1,64,128000,1532.27,0.247,0.359,0.455,83.54100394248962,0.38,0.45486645128372577,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round3,g8,HGET,8,1,128000,213689.48,0.039,0.047,0.063,0.601529598236084,0.6,99.74571521657964,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
+round3,mod,HMOD,1,1,128000,33773.09,0.031,0.039,0.039,3.7915990352630615,1.17,30.85769326130302,21068,20992,3056,3056,pre/post exact-value checks; tool completed count; not per-response content validation
