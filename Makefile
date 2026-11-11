@@ -63,6 +63,10 @@ all: $(BIN_DIR)/kvstore
 
 testcase: $(BIN_DIR)/testcase
 
+.PHONY: test-manual-testcase
+test-manual-testcase: $(BIN_DIR)/kvstore $(BIN_DIR)/testcase
+	python3 -u -B tests/test_manual_testcase.py
+
 $(BUILD_DIR) $(BIN_DIR):
 	mkdir -p $@
 

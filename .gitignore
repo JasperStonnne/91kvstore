@@ -21,9 +21,11 @@
 test_aof
 *.aof
 /snapshot.db
+/snapshot.bin
 # Editor and OS files
 .vscode/
 .idea/
 .DS_Store
 *~
 
+/replication.snapshot

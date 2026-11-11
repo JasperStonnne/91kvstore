@@ -183,9 +183,11 @@ $11\r\nhello world\r\n
 
 | 配置 | 写入/恢复边界 |
 | --- | --- |
-| `snapshot` | 普通写入只更新内存；成功 `SAVE` 后保存二进制 `snapshot.db`，重启只加载快照，不创建 AOF |
-| `aof` | 成功写回复前完成 AOF 追加和同步；重启回放 `appendonly.aof`，不需要 SAVE，也不生成快照 |
+| `snapshot` | 普通写入只更新内存；成功 `SAVE` 后保存二进制 `snapshot.bin`，重启只加载快照，不创建 AOF |
+| `aof` | 成功写回复前完成 AOF 追加和同步；重启回放 `commands.aof`，不需要 SAVE，也不生成快照 |
 | `legacy_hybrid` | 快照带 AOF 检查点，恢复快照后回放后续 AOF；用于当前主从。存在快照却缺 AOF，或已知边界错位时拒绝启动 |
+
+现场手动演示使用 `make all testcase` 构建 C 客户端，每次单独执行写入、读取校验、修改、删除或 SAVE；服务启动、宕机和重启由操作者控制。具体命令见[手动演示流程（HTML）](docs/MANUAL_DEMO.html)，可直接用浏览器打开。旧 `bin/testcase` 的数字模式已改为具名操作，使用 `bin/testcase --help` 查看参数。
 
 当前 Snapshot 是带版本、记录长度和校验的**二进制格式**，不是旧的 `AOF_OFFSET` 文本首行。SAVE 路径为临时文件 → io_uring 写入/文件同步 → rename → 父目录同步。rename 后目录同步失败时可能“返回错误但文件已替换”，不承诺自动回滚。AOF 错误不回复成功并停止；残缺日志拒绝恢复，不自动跳过或修剪。失败回复也不承诺相关命令绝不在重启后出现。
 
