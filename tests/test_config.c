@@ -412,19 +412,20 @@ static void test_example_config_files(void)
 
     kvs_config_t primary = load_example("config/primary.conf");
     assert(primary.role == KVS_ROLE_PRIMARY);
-    assert(strcmp(primary.bind_ip, "127.0.0.1") == 0);
     assert(primary.service_port == 29000);
     assert(primary.log_level == KVS_LOG_INFO);
-    assert(primary.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
+    assert(primary.persistence_mode == KVS_PERSISTENCE_NONE);
+    assert(primary.replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_SOCKET);
+    assert(primary.replication_capture_socket[0] == '\0');
 
     kvs_config_t replica = load_example("config/replica.conf");
     assert(replica.role == KVS_ROLE_REPLICA);
-    assert(strcmp(replica.bind_ip, "127.0.0.1") == 0);
     assert(replica.service_port == 29001);
-    assert(strcmp(replica.primary_host, "127.0.0.1") == 0);
-    assert(replica.primary_port == 29000);
+    /* 样例可随部署地址调整，只核对 Replica 指向样例 Primary。 */
+    assert(strcmp(replica.primary_host, primary.bind_ip) == 0);
+    assert(replica.primary_port == primary.service_port);
     assert(replica.log_level == KVS_LOG_INFO);
-    assert(replica.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
+    assert(replica.persistence_mode == KVS_PERSISTENCE_NONE);
 
     puts("example config files: 3 passed");
 }
