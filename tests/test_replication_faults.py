@@ -178,7 +178,7 @@ def case(fixture, mode):
         catchup = b"".join(commands)
         source_aof = fixture.root / "primary/appendonly.aof"
         rdma.require(source_aof.read_bytes()[start:] == catchup, "Primary catch-up bytes differ")
-        fence = start + len(catchup)
+        fence = gate.stream_offset + len(catchup)
         live = [rdma.frame("MOD", "base", "live"), rdma.frame("DEL", "during"),
                 rdma.frame("SET", "live_added", "live")]
         gate.configure(catchup, fence, live)
@@ -297,10 +297,9 @@ def case(fixture, mode):
         result["recovered_dataset"] = check_dataset(reader, online_case)
         reader.close()
         reader = None
-        primary_snapshot = fixture.root / "primary/replication.snapshot"
-        replica_snapshot = fixture.root / "replica/snapshot.db"
-        rdma.require(primary_snapshot.read_bytes() == replica_snapshot.read_bytes(),
-                     "fresh full-sync snapshots differ")
+        rdma.assert_rdma_snapshot(fixture)
+        rdma.require(not (fixture.root / "replica/snapshot.db").exists(),
+                     "fresh full sync created a local persistence Snapshot")
         new_offset = fresh.metadata[0]
         rdma.require(replica_aof.stat().st_size == new_offset, "fresh offset not aligned")
         rdma.require(source_aof.read_bytes()[new_offset:] == replica_aof.read_bytes()[new_offset:],

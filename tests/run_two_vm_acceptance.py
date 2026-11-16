@@ -249,13 +249,13 @@ class Gate:
             upstream.sendall(b'PSYNC ? -1\r\n')
             header = self.line(upstream)
             parts = header.split()
-            require(len(parts) == 6 and parts[0] == b'FULLRESYNC_RDMA',
+            require(len(parts) == 7 and parts[0] == b'FULLRESYNC_RDMA',
                     'expected RDMA full-sync notification')
             require(0 < int(parts[4]) <= 65535 and
                     re.fullmatch(rb'[0-9a-f]{40}', parts[1]) is not None and
                     re.fullmatch(rb'[0-9a-f]{40}', parts[5]) is not None,
                     'invalid RDMA port or synchronization ID')
-            self.metadata = dict(offset=int(parts[2]), size=int(parts[3]))
+            self.metadata = dict(offset=int(parts[2]), size=int(parts[3]), stream_offset=int(parts[6]))
             # O 已固定；先暂停通知，避免 Replica 绕过 TCP 代理开始 RDMA。
             self.event('snapshot_held', **self.metadata)
             self.ready.set()
@@ -405,7 +405,7 @@ class Suite:
 
     def ranges(self):
         return [(int(a), int(b)) for a, b in re.findall(
-            r'start AOF catch-up range=\[(\d+),(\d+)\)', self.log('primary'))]
+            r'start cache catch-up range=\[(\d+),(\d+)\)', self.log('primary'))]
 
     def direct(self):
         self.prepare(False)
@@ -482,8 +482,8 @@ class Suite:
             self.gate.release.set()
             self.online()
             ranges = self.ranges()
-            require(any(a == self.gate.metadata['offset'] and b > a for a, b in ranges),
-                    f'nonempty AOF catch-up not proven: {ranges}')
+            require(any(a == self.gate.metadata['stream_offset'] and b > a for a, b in ranges),
+                    f'nonempty cache catch-up not proven: {ranges}')
             for key, value in after:
                 self.write_checked(writer, key, value)
             self.event('online_writes_accepted', accepted=len(after))

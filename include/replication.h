@@ -38,6 +38,8 @@ int kvs_replication_network_protocol(
     kvs_output_buffer_t *response,
     int *consumed_length
 );
+/* 记录 Primary 成功写入的编码字节，调用者仍持有 encoded。 */
+int kvs_replication_advance_stream(const char *encoded, size_t encoded_bytes);
 int kvs_replication_stream(int connection_fd,char *output,int output_capacity);
 int kvs_replication_build_connector_config(kvs_connector_config_t *connector);
 /*
@@ -51,6 +53,8 @@ int kvs_replication_init(
     kvs_snapshot_install_handler snapshot_install_handler,
     kvs_replication_command_handler command_handler
 );
+/* Primary 在启动网络前设置独立采集端；复制模块复制路径。 */
+int kvs_replication_set_capture_socket(const char *path);
 /* Primary 初始化复制模块后调用；失败后由 destroy 清理。 */
 int kvs_replication_start_rdma_listener(
     const char *bind_ip,

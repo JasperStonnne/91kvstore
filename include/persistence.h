@@ -63,7 +63,7 @@ int kvs_snapshot_reader_read(kvs_snapshot_reader_t *reader,char *output,int outp
 void kvs_snapshot_reader_close(kvs_snapshot_reader_t *reader);
 int kvs_snapshot_writer_open(kvs_snapshot_writer_t *writer,const char *temp_path,long long expected_size);
 int kvs_snapshot_writer_write(kvs_snapshot_writer_t *writer,const char *data,int length);
-int kvs_snapshot_writer_commit(kvs_snapshot_writer_t *writer,const char *temp_path,const char *final_path);
+int kvs_snapshot_writer_finish(kvs_snapshot_writer_t *writer);
 void kvs_snapshot_writer_abort(kvs_snapshot_writer_t *writer,const char *temp_path);
 
 

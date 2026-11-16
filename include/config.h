@@ -2,6 +2,7 @@
 #define KVS_CONFIG_H
 
 #include <stddef.h>
+#include <sys/un.h>
 #include "log.h"
 #include "role.h"
 #include "kvs_allocator.h"
@@ -18,8 +19,14 @@
 typedef enum {
     KVS_PERSISTENCE_LEGACY_HYBRID = 0,
     KVS_PERSISTENCE_SNAPSHOT,
-    KVS_PERSISTENCE_AOF
+    KVS_PERSISTENCE_AOF,
+    KVS_PERSISTENCE_NONE
 } kvs_persistence_mode_t;
+
+typedef enum {
+    KVS_REPLICATION_INCREMENTAL_SOCKET = 0,
+    KVS_REPLICATION_INCREMENTAL_EBPF
+} kvs_replication_incremental_mode_t;
 
 /*
  * 配置对象自己保存地址字符串，不引用读取文件时使用的临时缓冲区。
@@ -41,6 +48,8 @@ typedef struct {
 
     kvs_log_level_t log_level;
     kvs_persistence_mode_t persistence_mode;
+    kvs_replication_incremental_mode_t replication_incremental_mode;
+    char replication_capture_socket[sizeof(((struct sockaddr_un *)0)->sun_path)];
     /* 保存启动时选择的内存分配后端。 */
     kvs_allocator_backend_t allocator_backend;
 

@@ -241,7 +241,7 @@ static void test_session(int reordered, int disconnect_early, int oversize)
     assert(starts == 0);
 
     int header_length = snprintf(input, sizeof(input),
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 %zu 29747 %s\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 %zu 29747 %s 112\r\n",
         sizeof(snapshot) - 1, sync_id);
     assert(header_length > 0);
     memcpy(input + header_length, command, sizeof(command) - 1);
@@ -283,7 +283,7 @@ static void test_session(int reordered, int disconnect_early, int oversize)
     assert(result == 0 && installed == 1 && transport.disconnected);
 
     /* ONLINE 与 RESP 粘包：只消费 ONLINE 行，下一轮才执行增量。 */
-    static const char control[] = "ONLINE 0\r\n";
+    static const char control[] = "ONLINE 112\r\n";
     memcpy(input, control, sizeof(control) - 1);
     memcpy(input + sizeof(control) - 1, command, sizeof(command) - 1);
     consumed = 0;
@@ -305,13 +305,13 @@ static void test_control_boundaries(void)
 {
     recv_before_send = early_disconnect = partial_disconnect = oversized_chunk = 0;
     static const char *headers[] = {
-        "FULLRESYNC_RDMA short 0 21 29747 abcdef0123456789abcdef0123456789abcdef01\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 -1 21 29747 abcdef0123456789abcdef0123456789abcdef01\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 0 29747 abcdef0123456789abcdef0123456789abcdef01\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 0 abcdef0123456789abcdef0123456789abcdef01\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 65536 abcdef0123456789abcdef0123456789abcdef01\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 short\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 extra\r\n"
+        "FULLRESYNC_RDMA short 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 -1 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 0 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 0 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 65536 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 short 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 extra\r\n"
     };
     for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
         kvs_connector_config_t connector = setup();
@@ -324,14 +324,14 @@ static void test_control_boundaries(void)
         teardown();
     }
     static const char *controls[] = {
-        "ONLINE -1\r\n", "ONLINE 1\r\n", "ONLINE abc\r\n", "ONLINE 0 extra\r\n"
+        "ONLINE -1\r\n", "ONLINE 111\r\n", "ONLINE abc\r\n", "ONLINE 112 extra\r\n"
     };
     for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
         kvs_connector_config_t connector = setup();
         char input[256], output[256];
         int consumed = 0;
         int length = snprintf(input, sizeof(input),
-            "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 %zu 29747 %s\r\n",
+            "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 %zu 29747 %s 112\r\n",
             sizeof(snapshot) - 1, sync_id);
         for (int prefix = 1; prefix < length; prefix++) {
             assert(feed(&connector, input, prefix, &consumed) == 0);
@@ -343,7 +343,7 @@ static void test_control_boundaries(void)
             result = connector.stream_handler(123, output, sizeof(output));
         assert(result == 0 && installed == 1 && !kvs_replication_is_online());
 
-        static const char online[] = "ONLINE 0\r\n";
+        static const char online[] = "ONLINE 112\r\n";
         for (size_t prefix = 1; prefix < sizeof(online) - 1; prefix++) {
             memcpy(input, online, sizeof(online));
             assert(feed(&connector, input, (int)prefix, &consumed) == 0);

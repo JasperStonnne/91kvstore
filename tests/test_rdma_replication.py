@@ -7,7 +7,6 @@ TCP 仍负责握手、控制消息和 AOF 增量；快照内容必须通过 RDMA
 设备缺失或同步失败会明确报错，不回退到 TCP 全量或将跳过记为通过。
 """
 import argparse
-import hashlib
 import ipaddress
 import json
 import os
@@ -298,7 +297,7 @@ class SnapshotGate:
             upstream.sendall(psync)
             header = self.line(upstream)
             parts = header.split()
-            require(len(parts) == 6 and parts[0] == b"FULLRESYNC_RDMA",
+            require(len(parts) == 7 and parts[0] == b"FULLRESYNC_RDMA",
                     f"expected RDMA full sync, got: {header!r}")
             require(re.fullmatch(rb"[0-9a-f]{40}", parts[1]) is not None and
                     re.fullmatch(rb"[0-9a-f]{40}", parts[5]) is not None,
@@ -306,6 +305,7 @@ class SnapshotGate:
             require(0 < int(parts[4]) <= 65535, "invalid RDMA port")
             self.full_sync_id = parts[5]
             self.metadata = (int(parts[2]), int(parts[3]))
+            self.stream_offset = int(parts[6])
             if self.advertised_rdma_port is not None:
                 parts[4] = str(self.advertised_rdma_port).encode()
                 header = b" ".join(parts) + b"\r\n"
@@ -351,6 +351,10 @@ class SnapshotGate:
         require(not self.thread.is_alive(), "relay thread did not stop")
 
 
+def primary_snapshot_path(fixture):
+    return fixture.root / "primary/replication.snapshot.tmp"
+
+
 def assert_rdma_snapshot(fixture):
     """结合传输日志和落盘文件验证真实 RDMA，而非只看最终 ONLINE 状态。"""
     primary_log = (fixture.root / "primary/server.log").read_text(errors="replace")
@@ -362,8 +366,6 @@ def assert_rdma_snapshot(fixture):
     received = [int(n) for n in re.findall(r"Replica wrote Snapshot chunk bytes=(\d+)", replica_log)]
     acknowledgements = [int(n) for n in re.findall(
         r"Primary received Snapshot ACK bytes=(\d+)", session)]
-    source = (fixture.root / "primary/replication.snapshot").read_bytes()
-    installed = (fixture.root / "replica/snapshot.db").read_bytes()
     require(sent and sent == received, f"RDMA chunk sequence differs: {sent} / {received}")
     require(all(0 < n <= RDMA_CHUNK_CAPACITY for n in sent), "invalid RDMA chunk size")
     cumulative = []
@@ -373,31 +375,33 @@ def assert_rdma_snapshot(fixture):
         cumulative.append(total)
     require(acknowledgements == cumulative,
             f"cumulative ACK differs: {acknowledgements} / {cumulative}")
-    require(total == len(source) == len(installed), "Snapshot byte count differs")
-    require(hashlib.sha256(source).digest() == hashlib.sha256(installed).digest(),
-            "installed Snapshot differs from Primary Snapshot")
+    require(re.search(rf"Snapshot installed, enter CATCH_UP offset=\d+ size={total} fd=",
+                      replica_log),
+            "Replica did not load the advertised number of Snapshot bytes")
+    require(not primary_snapshot_path(fixture).exists(),
+            "Primary kept the temporary Snapshot after final ACK")
     require(f"RDMA Snapshot fully acknowledged bytes={total}" in session,
             "missing final Snapshot ACK")
     require("Primary RDMA closed, start TCP catch-up" in session and
             "Replica RDMA closed, resume TCP catch-up" in replica_log,
             "RDMA did not close normally before TCP catch-up")
     require(not (fixture.root / "replica/snapshot.db.replication.tmp").exists(),
-            "Snapshot temporary file was not committed")
-    print(f"[PASS] real RDMA Snapshot: {total} bytes, {len(sent)} chunks, cumulative ACK and SHA-256",
+            "Replica kept the temporary Snapshot after loading")
+    print(f"[PASS] real RDMA Snapshot: {total} bytes, {len(sent)} chunks, cumulative ACK and temporary file cleanup",
           flush=True)
     return total, sent
 
 
 def assert_tcp_catchup_only(fixture, gate):
-    """全量通知后，TCP 字节数只能等于 [O, ONLINE offset) 的 AOF 加 ONLINE 行。"""
+    """全量通知后，TCP 字节数只能等于 [O, ONLINE offset) 的复制命令加 ONLINE 行。"""
     log = (fixture.root / "replica/server.log").read_text(errors="replace")
     offsets = re.findall(r"enter ONLINE offset=(\d+)", log)
     require(offsets, "missing ONLINE offset")
     online_offset = int(offsets[-1])
-    start, _ = gate.metadata
+    start = gate.stream_offset
     expected = online_offset - start + len(f"ONLINE {online_offset}\r\n".encode())
     require(gate.forwarded_bytes == expected,
-            f"unexpected TCP payload: {gate.forwarded_bytes} bytes; AOF + ONLINE needs {expected}")
+            f"unexpected TCP payload: {gate.forwarded_bytes} bytes; cache + ONLINE needs {expected}")
 
 
 def verify_online_mutations(fixture):
@@ -417,7 +421,7 @@ def verify_online_mutations(fixture):
     finally:
         reader.close()
         writer.close()
-    print("[PASS] ONLINE AOF insertion, modification and deletion", flush=True)
+    print("[PASS] ONLINE insertion, modification and deletion", flush=True)
 
 
 def exact_chunk_case(fixture):
@@ -433,6 +437,8 @@ def exact_chunk_case(fixture):
     fixture.start("replica", fixture.primary_port)
     fixture.online()
     size, chunks = assert_rdma_snapshot(fixture)
+    require(not (fixture.root / "replica/snapshot.db").exists(),
+            "replication created a local persistence Snapshot")
     require(size == RDMA_CHUNK_CAPACITY and chunks == [RDMA_CHUNK_CAPACITY],
             f"exact-chunk fixture changed: size={size}, chunks={chunks}")
     reader = Client(fixture.replica_port)
@@ -509,7 +515,7 @@ def catchup_case(fixture):
         require(gate.header_ready.wait(timeout=30), "FULLRESYNC_RDMA header not received")
         gate.check()
         require(gate.metadata is not None, "missing Snapshot metadata")
-        snapshot_offset, snapshot_size = gate.metadata
+        _, snapshot_size = gate.metadata
         require(snapshot_size >= len(payload) * 512, "Snapshot fixture is unexpectedly small")
         # 暂停的是 RDMA 启动通知，此时 Replica 尚未开始接收快照。
         probe = Client(fixture.replica_port)
@@ -556,11 +562,11 @@ def catchup_case(fixture):
             client.close()
         log = (fixture.root / "primary" / "server.log").read_text(errors="replace")
         ranges = [(int(a), int(b)) for a, b in re.findall(
-            r"start AOF catch-up range=\[(\d+),(\d+)\)", log
+            r"start cache catch-up range=\[(\d+),(\d+)\)", log
         )]
-        require(any(a == snapshot_offset and b > a for a, b in ranges),
-                f"nonempty Snapshot-to-AOF catch-up was not demonstrated: {ranges}")
-        print(f"[PASS] nonempty AOF catch-up {ranges}; all 512 Snapshot keys and 17 new keys verified",
+        require(any(a == gate.stream_offset and b > a for a, b in ranges),
+                f"nonempty Snapshot-to-cache catch-up was not demonstrated: {ranges}")
+        print(f"[PASS] nonempty cache catch-up {ranges}; all 512 Snapshot keys and 17 new keys verified",
               flush=True)
     finally:
         writer.close()
@@ -593,8 +599,8 @@ def restart_case(fixture):
             "Primary did not release old Replica control connection",
         )
         # 故意破坏测试目录中的旧文件，验证启动时不会恢复它们。
-        (fixture.root / "replica" / "snapshot.db").write_bytes(
-            b"invalid old snapshot\n")
+        old_snapshot = fixture.root / "replica" / "snapshot.db"
+        old_snapshot.write_bytes(b"invalid old snapshot\n")
         (fixture.root / "replica" / "appendonly.aof").write_bytes(
             b"invalid old AOF\n")
 
@@ -632,6 +638,8 @@ def restart_case(fixture):
             gate.check()
             assert_rdma_snapshot(fixture)
             assert_tcp_catchup_only(fixture, gate)
+            require(old_snapshot.read_bytes() == b"invalid old snapshot\n",
+                    "replication replaced the existing local Snapshot")
 
             require(client.command("HGET", "restart_base") == b"after",
                     "restarted Replica did not load current Primary data")
@@ -691,6 +699,9 @@ def interrupted_restart_case(fixture):
         fixture.wait(lambda: "Replica control connection released" in
                      primary_log.read_text(errors="replace"),
                      "Primary did not cancel interrupted sync", timeout=10)
+        require(not primary_snapshot_path(fixture).exists(),
+                "interrupted sync leaked the Primary Snapshot")
+        primary_snapshot_path(fixture).write_bytes(b"stale temporary snapshot")
         require(writer.command("HMOD", "interrupted_0", "latest") == b"OK",
                 "Primary update while Replica stopped failed")
         require(writer.command("HSET", "interrupted_new", "new-value") == b"OK",
@@ -806,6 +817,8 @@ def check_failed_handshake(fixture, silent_peer):
     fixture.wait(lambda: primary_log.read_text(errors="replace").count(
                  "Replica control connection released") > released_before,
                  "Primary did not release the failed handshake", timeout=10)
+    require(not primary_snapshot_path(fixture).exists(),
+            "failed handshake leaked the Primary Snapshot")
 
 
 def handshake_failure_case(fixture):

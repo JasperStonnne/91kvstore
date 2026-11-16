@@ -179,13 +179,14 @@ $11\r\nhello world\r\n
 
 ## 持久化
 
-单机持久化可独立选择；Primary/Replica 当前要求 `legacy_hybrid`：
+单机可选择 `snapshot`、`aof` 或 `none`。主从可用 `none` 运行纯内存复制，`legacy_hybrid` 暂供旧部署兼容。
 
 | 配置 | 写入/恢复边界 |
 | --- | --- |
+| `none` | 从空引擎启动，不写本地 AOF，也不支持客户端 SAVE。主从全量仍使用复制专用临时快照。 |
 | `snapshot` | 普通写入只更新内存；成功 `SAVE` 后保存二进制 `snapshot.bin`，重启只加载快照，不创建 AOF |
 | `aof` | 成功写回复前完成 AOF 追加和同步；重启回放 `commands.aof`，不需要 SAVE，也不生成快照 |
-| `legacy_hybrid` | 快照带 AOF 检查点，恢复快照后回放后续 AOF；用于当前主从。存在快照却缺 AOF，或已知边界错位时拒绝启动 |
+| `legacy_hybrid` | 快照带 AOF 检查点，恢复快照后回放后续 AOF；用于旧主从部署。存在快照却缺 AOF，或已知边界错位时拒绝启动 |
 
 现场手动演示使用 `make all testcase` 构建 C 客户端，每次单独执行写入、读取校验、修改、删除或 SAVE；服务启动、宕机和重启由操作者控制。具体命令见[手动演示流程（HTML）](docs/MANUAL_DEMO.html)，可直接用浏览器打开。旧 `bin/testcase` 的数字模式已改为具名操作，使用 `bin/testcase --help` 查看参数。
 
@@ -204,20 +205,20 @@ CONNECTING
 HANDSHAKE       PING / PONG / PSYNC
     │
     ▼
-FULL_SYNC       RDMA 发送并安装二进制 Snapshot
+FULL_SYNC       RDMA 传输临时快照，Replica 校验并加载后确认
     │
     ▼
-CATCH_UP        TCP 从 Snapshot 的边界 O 补齐 AOF 增量
+CATCH_UP        TCP 从快照记录的复制 offset 补齐内存缓存中的增量
     │
     ▼
-ONLINE          普通版 AOF；eBPF 版事件 payload + AOF 补偿
+ONLINE          继续从同一复制 offset 发送实时增量
 ```
 
 当前通过配置文件启动，在两个独立工作目录运行 Primary 与 Replica。具体配置和启动步骤见下文及[复现说明](docs/performance/REPRODUCING.md)。
 
 ### RDMA 现状
 
-- 已有数据的全量快照只走 RDMA；握手、控制通知和 AOF 追赶/ONLINE 增量仍走 TCP。
+- 已有数据的全量快照只走 RDMA；握手、控制通知和增量仍走 TCP。
 - 无自动重连或断点续传；失败后需重新启动 Replica，从当前 Primary 重新全量，不接着半份快照传输。
 - 开发机使用 Soft-iWARP（`siw0`），已有软件环境下的功能验收和整阶段测量，不代表物理 RDMA 网卡性能。
 - 构建需安装 `librdmacm-dev libibverbs-dev`；验收还需 `rdmacm-utils ibverbs-utils iproute2`。
@@ -228,14 +229,31 @@ ONLINE          普通版 AOF；eBPF 版事件 payload + AOF 补偿
 - 本机复现：`RDMA_TEST_IP=172.16.145.135 make test`（替换为自己的 iWARP IPv4）。
 - 架构、完整启动配置、失败场景和双机命令见 [RDMA 验收说明](tests/README_RDMA.md)。
 
-### eBPF ONLINE 增量
+### 增量模式
 
-可选构建使用 make ebpf-startup，生成 bin/kvstore-ebpf 和 BPF 对象。
-三路分工为 RDMA 传全量、TCP + AOF 追赶和补缺口、eBPF 提供正常 ONLINE 的完整命令。
-跨机发送仍由用户态通过现有 TCP 完成。事件附带 AOF offset，超限或丢失有明确计数和补偿。
-BPF 加载或消费失败会明确记录降级到 AOF；普通构建继续使用 AOF ONLINE。
-无逐条增量 ACK，不宣称端到端 exactly-once。
-构建、v1 事件格式、失败策略和故障验收见 [eBPF 验收说明](tests/README_EBPF.md)。
+Primary 和 Replica 都用 `bin/kvstore`。两端可配 `persistence_mode = none`。只在 Primary 的配置中选择增量来源：
+
+- `replication_incremental_mode = socket` 是默认值，由 Primary 持有 8 MiB 缓存。
+- `replication_incremental_mode = ebpf` 由独立进程持有 8 MiB 缓存。Primary 还需设置 `replication_capture_socket = /绝对路径/capture.sock`，和采集进程使用相同的路径。把 socket 放在 Primary 用户可访问的私有目录中。
+
+服务先启动 Primary，再启动采集进程。等采集进程输出已挂载的消息后，启动 Replica。采集进程提前暂存写入，Primary 处理 `PSYNC` 时自动发送本轮快照 offset。Replica 完成加载后，Primary 才从采集进程取数据，并通过原来的 TCP 连接发送。
+
+```sh
+make all ebpf-capture
+sudo bin/kvstore-ebpf-capture "$PRIMARY_PID" build/ebpf_capture.bpf.o --socket "$CAPTURE_SOCKET"
+```
+
+Primary 的发送临时文件在收到最终快照确认后删除，Replica 从接收临时文件加载后删除。缓存失效或采集进程退出时结束本轮复制，重启 Replica 后重新全量。eBPF 当前单个事件最多携带 4 KiB 编码命令。缺失事件导致进度无法追平时，本轮同步会报错结束。
+
+在具备 iWARP 的开发机上，可以用同一个脚本验证两种模式。脚本以普通用户启动主从，仅采集进程使用 sudo。
+
+```sh
+make all ebpf-capture
+sudo -v
+RDMA_TEST_IP=172.16.145.135 python3 -B tests/test_capture_replication.py .
+```
+
+旧 `bin/kvstore-ebpf` 实验和 AOF 补偿回归仍可用，详见 [旧 eBPF ONLINE 验收说明](tests/README_EBPF.md)。
 
 ## 网络后端
 

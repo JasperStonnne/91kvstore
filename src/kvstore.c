@@ -102,9 +102,15 @@ static kvs_role_t kvs_server_role = KVS_ROLE_STANDALONE;
 static kvs_persistence_mode_t kvs_persistence_mode =
     KVS_PERSISTENCE_LEGACY_HYBRID;
 
+static int kvs_persistence_uses_aof(void)
+{
+    return kvs_persistence_mode == KVS_PERSISTENCE_AOF ||
+           kvs_persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID;
+}
+
 static void kvs_close_current_persistence(void)
 {
-    if (kvs_persistence_mode != KVS_PERSISTENCE_SNAPSHOT) {
+    if (kvs_persistence_uses_aof()) {
         kvs_aof_close();
     }
 }
@@ -497,20 +503,44 @@ int kvs_filter_protocol(
         }
     }
 
-        if (ret == 0 &&
-        kvs_is_write_command(cmd) &&
-        source != KVS_COMMAND_SOURCE_RECOVERY &&
-        kvs_persistence_mode != KVS_PERSISTENCE_SNAPSHOT) {
-        int emit_event =
+    if (ret == 0 && kvs_is_write_command(cmd)) {
+        int primary_client_write =
             kvs_server_role == KVS_ROLE_PRIMARY &&
             source == KVS_COMMAND_SOURCE_CLIENT;
-        int aof_ret = kvs_aof_append(tokens, count, emit_event);
-        if(aof_ret<0){
-            fprintf(stderr,"failed to append AOF\n");
+
+        if (source != KVS_COMMAND_SOURCE_RECOVERY &&
+            kvs_persistence_uses_aof() &&
+            kvs_aof_append(tokens, count, primary_client_write) < 0) {
+            fprintf(stderr, "failed to append AOF\n");
             exit(EXIT_FAILURE);
         }
-    }
 
+        if (primary_client_write) {
+            kvs_slice_t fields[3];
+            for (int i = 0; i < count; i++) {
+                fields[i].data = tokens[i];
+                fields[i].length = strlen(tokens[i]);
+            }
+
+            size_t encoded_capacity;
+            if (kvs_encoded_command_size(fields, (size_t)count, &encoded_capacity) < 0) {
+                fprintf(stderr, "failed to size replication command\n");
+                exit(EXIT_FAILURE);
+            }
+
+            char *encoded = kvs_malloc(encoded_capacity);
+            size_t encoded_bytes;
+            if (encoded == NULL ||
+                kvs_encode_command(fields, (size_t)count, encoded,
+                                   encoded_capacity, &encoded_bytes) < 0 ||
+                kvs_replication_advance_stream(encoded, encoded_bytes) < 0) {
+                kvs_free(encoded);
+                fprintf(stderr, "failed to record replication command\n");
+                exit(EXIT_FAILURE);
+            }
+            kvs_free(encoded);
+        }
+    }
 
     return length;
 
@@ -1277,48 +1307,24 @@ static int kvs_install_replication_snapshot(
         exit(EXIT_FAILURE);
     }
 
-    /*
-     * 校验并加载二进制 Snapshot，同时核对其中保存的 AOF 边界 O。
-     * 加载操作不作为普通客户端写命令重复追加 AOF。
-     */
     kvs_snapshot_checkpoint_t checkpoint = {0};
-
     int load_result = kvs_snapshot_store_load_with_checkpoint(
         snapshot_path, &checkpoint);
 
+    /* 只有旧持久化模式才需要检查并对齐本地 AOF。 */
     if (load_result != 0 ||
-        !checkpoint.has_offset ||
-        checkpoint.offset != aof_offset) {
+        (kvs_persistence_uses_aof() &&
+         (!checkpoint.has_offset || checkpoint.offset != aof_offset ||
+          kvs_aof_reset_to_offset(aof_offset) < 0))) {
         dest_kvengine();
-
         if (init_kvengine() < 0) {
             fprintf(stderr,
                     "fatal: failed to recreate empty KV engines "
                     "after replication snapshot failure\n");
             exit(EXIT_FAILURE);
         }
-
         return -1;
     }
-
-    if(kvs_aof_reset_to_offset(aof_offset)<0){
-        /*
-         * AOF 无法对齐时，不能继续提供刚加载的数据，
-         * 否则当前内存与重启后的恢复结果可能不一致。
-         */
-        dest_kvengine();
-
-        if (init_kvengine() < 0) {
-            fprintf(stderr,
-                    "fatal: failed to recreate empty KV engines "
-                    "after replication snapshot failure\n");
-            exit(EXIT_FAILURE);
-        }
-
-        return -1;
-    }
-
-
 
     return 0;
 }
@@ -1332,11 +1338,26 @@ static int kvs_server_run(kvs_config_t config)
     kvs_server_role = config.role;
     kvs_persistence_mode = config.persistence_mode;
 
+#ifdef KVS_EBPF_STARTUP_EXPERIMENT
+    if (config.replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_EBPF) {
+        fprintf(stderr, "replication_incremental_mode=ebpf requires bin/kvstore\n");
+        return EXIT_FAILURE;
+    }
+    if (config.role == KVS_ROLE_PRIMARY &&
+        kvs_persistence_mode == KVS_PERSISTENCE_NONE) {
+        fprintf(stderr, "persistence_mode=none on a Primary requires the ordinary kvstore build; "
+                        "the experimental eBPF sender still requires AOF\n");
+        return EXIT_FAILURE;
+    }
+#endif
+
     if (init_kvengine() < 0) {
         fprintf(stderr, "failed to initialize KV engines\n");
         return EXIT_FAILURE;
     }
-    if (config.role == KVS_ROLE_REPLICA) {
+    if (kvs_persistence_mode == KVS_PERSISTENCE_NONE) {
+        /* 纯内存模式从空引擎启动，Replica 的数据由全量同步安装。 */
+    } else if (config.role == KVS_ROLE_REPLICA) {
         if (kvs_aof_open("appendonly.aof") < 0) {
             fprintf(stderr, "failed to open replica AOF\n");
             dest_kvengine();
@@ -1447,6 +1468,14 @@ kvs_close_current_persistence();
     int network_ret=-1;
 
     if (config.role == KVS_ROLE_PRIMARY) {
+        if (config.replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_EBPF &&
+            kvs_replication_set_capture_socket(config.replication_capture_socket) < 0) {
+            fprintf(stderr, "failed to configure replication capture socket\n");
+            kvs_replication_destroy();
+            kvs_close_current_persistence();
+            dest_kvengine();
+            return EXIT_FAILURE;
+        }
         if (kvs_replication_start_rdma_listener(
                 config.bind_ip, config.rdma_port) < 0) {
         fprintf(stderr, "failed to start RDMA listener %s:%u: %s\n",

@@ -200,39 +200,24 @@ int kvs_snapshot_writer_write(
     return written;
 }
 
-int kvs_snapshot_writer_commit(
-    kvs_snapshot_writer_t *writer,
-    const char *temp_path,
-    const char *final_path)
+int kvs_snapshot_writer_finish(kvs_snapshot_writer_t *writer)
 {
-    if(writer==NULL ||
-       writer->fd<0 ||
-       writer->remaining!=0 ||       // 必须完整收到协商好的 Snapshot 字节
-       temp_path==NULL ||
-       temp_path[0]=='\0' ||
-       final_path==NULL ||
-       final_path[0]=='\0'){
+    if (writer == NULL || writer->fd < 0 || writer->remaining != 0) {
+        errno = EINVAL;
         return -1;
     }
 
-    if(fsync(writer->fd)!=0){         // 确保临时文件内容写入磁盘
+    if (fsync(writer->fd) != 0) {
+        int saved_errno = errno;
         kvs_snapshot_file_close(writer->fd);
-        writer->fd=-1;
+        writer->fd = -1;
+        errno = saved_errno;
         return -1;
     }
 
-    if(kvs_snapshot_file_close(writer->fd)!=0){
-        writer->fd=-1;
-        return -1;
-    }
-
-    writer->fd=-1;
-
-    if(rename(temp_path,final_path)!=0){ // 原子地用完整文件替换正式 Snapshot
-        return -1;
-    }
-
-    return 0;
+    int result = kvs_snapshot_file_close(writer->fd);
+    writer->fd = -1;
+    return result;
 }
 
 void kvs_snapshot_writer_abort(

@@ -172,6 +172,7 @@ $(BUILD_DIR)/uring_io.o: \
 
 $(BUILD_DIR)/replication.o: \
 	$(REPLICATION_DIR)/replication.c \
+	$(INCLUDE_DIR)/replication_capture_ipc.h \
 	$(INCLUDE_DIR)/replication.h \
 	$(INCLUDE_DIR)/persistence.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
@@ -572,6 +573,16 @@ $(BUILD_DIR)/ebpf_capture.bpf.o: \
 	    -Wall -Wextra -Werror -I$(INCLUDE_DIR) -I/usr/include/$(shell $(CC) -dumpmachine) \
 	    -c $< -o $@
 
+.PHONY: ebpf-capture
+ebpf-capture: $(BIN_DIR)/kvstore-ebpf-capture $(BUILD_DIR)/ebpf_capture.bpf.o
+
+$(BIN_DIR)/kvstore-ebpf-capture: \
+    $(REPLICATION_DIR)/ebpf_capture_main.c \
+    $(BUILD_DIR)/ebpf_capture.o \
+    $(BUILD_DIR)/log.o \
+    $(INCLUDE_DIR)/replication_capture_ipc.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c %.o,$^) $(LDFLAGS) -lbpf -o $@
+
 $(BUILD_DIR)/kvstore_ebpf.o: \
     $(SRC_DIR)/kvstore.c \
     $(INCLUDE_DIR)/ebpf_capture.h \
@@ -590,6 +601,7 @@ $(BUILD_DIR)/replication_ebpf.o: \
     $(REPLICATION_DIR)/replication.c \
     $(INCLUDE_DIR)/ebpf_capture.h \
     $(INCLUDE_DIR)/ebpf_event.h \
+    $(INCLUDE_DIR)/replication_capture_ipc.h \
     $(INCLUDE_DIR)/replication.h \
     $(INCLUDE_DIR)/persistence.h \
     $(INCLUDE_DIR)/server.h \
@@ -621,6 +633,7 @@ $(BIN_DIR)/test_ebpf_online: \
     $(SRC_DIR)/log/log.c \
     $(INCLUDE_DIR)/ebpf_capture.h \
     $(INCLUDE_DIR)/ebpf_event.h \
+    $(INCLUDE_DIR)/replication_capture_ipc.h \
     $(INCLUDE_DIR)/replication.h \
     $(INCLUDE_DIR)/persistence.h \
     $(INCLUDE_DIR)/server.h \

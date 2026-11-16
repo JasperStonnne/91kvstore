@@ -24,6 +24,8 @@ enum config_field {
     FIELD_PRIMARY_HOST,
     FIELD_PRIMARY_PORT,
     FIELD_ALLOCATOR,
+    FIELD_REPLICATION_INCREMENTAL_MODE,
+    FIELD_REPLICATION_CAPTURE_SOCKET,
     FIELD_COUNT
 };
 
@@ -37,7 +39,9 @@ static const char *const field_names[FIELD_COUNT] = {
     "replication_port",
     "primary_host",
     "primary_port",
-    "allocator"
+    "allocator",
+    "replication_incremental_mode",
+    "replication_capture_socket"
 };
 
 /* 把错误位置和原因统一写入调用方提供的缓冲区。 */
@@ -225,14 +229,35 @@ static int parse_field(
             parsed->persistence_mode = KVS_PERSISTENCE_SNAPSHOT;
         } else if (strcmp(value, "aof") == 0) {
             parsed->persistence_mode = KVS_PERSISTENCE_AOF;
+        } else if (strcmp(value, "none") == 0) {
+            parsed->persistence_mode = KVS_PERSISTENCE_NONE;
         } else {
             return config_error(
                 error, error_capacity, path, line_number,
                 "unsupported persistence_mode '%s'; "
-                "expected legacy_hybrid, snapshot or aof",
+                "expected legacy_hybrid, snapshot, aof or none",
                 value
             );
         }
+        return 0;
+
+    case FIELD_REPLICATION_INCREMENTAL_MODE:
+        if (strcmp(value, "socket") == 0) {
+            parsed->replication_incremental_mode = KVS_REPLICATION_INCREMENTAL_SOCKET;
+        } else if (strcmp(value, "ebpf") == 0) {
+            parsed->replication_incremental_mode = KVS_REPLICATION_INCREMENTAL_EBPF;
+        } else {
+            return config_error(error, error_capacity, path, line_number,
+                                "replication_incremental_mode must be socket or ebpf");
+        }
+        return 0;
+
+    case FIELD_REPLICATION_CAPTURE_SOCKET:
+        if (value[0] != '/' || strlen(value) >= sizeof(parsed->replication_capture_socket)) {
+            return config_error(error, error_capacity, path, line_number,
+                                "replication_capture_socket must be an absolute Unix socket path");
+        }
+        strcpy(parsed->replication_capture_socket, value);
         return 0;
 
     case FIELD_REPLICATION_PORT:
@@ -369,11 +394,13 @@ static int validate_config(
             );
         }
         if (parsed->persistence_mode != KVS_PERSISTENCE_SNAPSHOT &&
-            parsed->persistence_mode != KVS_PERSISTENCE_AOF) {
+            parsed->persistence_mode != KVS_PERSISTENCE_AOF &&
+            parsed->persistence_mode != KVS_PERSISTENCE_NONE) {
             return config_error(
                 error, error_capacity, path,
                 field_lines[FIELD_PERSISTENCE_MODE],
-                "standalone supports only persistence_mode=snapshot or aof"
+                "standalone supports only persistence_mode=snapshot or aof "
+                "for local persistence, or none for pure memory"
             );
         }
         break;
@@ -436,13 +463,24 @@ static int validate_config(
         parsed->role == KVS_ROLE_REPLICA;
 
     if (is_replication_role &&
-        parsed->persistence_mode != KVS_PERSISTENCE_LEGACY_HYBRID) {
+        parsed->persistence_mode != KVS_PERSISTENCE_LEGACY_HYBRID &&
+        parsed->persistence_mode != KVS_PERSISTENCE_NONE) {
         return config_error(
             error, error_capacity, path,
             field_lines[FIELD_PERSISTENCE_MODE],
             "primary/replica currently support only "
-            "persistence_mode=legacy_hybrid"
+            "persistence_mode=legacy_hybrid or none"
         );
+    }
+    if (parsed->role != KVS_ROLE_PRIMARY &&
+        (seen[FIELD_REPLICATION_INCREMENTAL_MODE] || seen[FIELD_REPLICATION_CAPTURE_SOCKET])) {
+        return config_error(error, error_capacity, path, 0,
+                            "incremental replication settings are only valid for role=primary");
+    }
+    bool ebpf = parsed->replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_EBPF;
+    if (ebpf != seen[FIELD_REPLICATION_CAPTURE_SOCKET]) {
+        return config_error(error, error_capacity, path, 0,
+                            "replication_capture_socket is required for ebpf mode only");
     }
     /* Primary 的全量同步必须使用 RDMA，需要显式指定监听端口。 */
     if (parsed->role == KVS_ROLE_PRIMARY &&

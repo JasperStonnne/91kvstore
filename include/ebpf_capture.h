@@ -1,6 +1,7 @@
 #ifndef KVS_EBPF_CAPTURE_H
 #define KVS_EBPF_CAPTURE_H
 
+#include <sys/types.h>
 #include "ebpf_event.h"
 
 struct kvs_ebpf_failures {
@@ -12,7 +13,10 @@ struct kvs_ebpf_failures {
 /* 加载 BPF 对象、准备队列读取，并附着到当前 Primary。 */
 int kvs_ebpf_start(const char *object_path);
 
-/* 仅由 Primary 的同一线程调用；1=取到一条，0=暂无数据，负数=错误。 */
+/* 独立进程附着到指定 Primary 的复制提交点。 */
+int kvs_ebpf_start_replication(const char *object_path, pid_t primary_pid);
+
+/* 仅由当前采集进程的同一线程调用；1=取到一条，0=暂无数据，负数=错误。 */
 int kvs_ebpf_read(struct kvs_ebpf_event *event);
 
 /* 可用性和累计失败计数用于复制模块显式选择数据源、审计 AOF 补偿。 */

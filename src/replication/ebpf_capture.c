@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <limits.h>
+#include <stdio.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "ebpf_capture.h"
@@ -28,6 +29,7 @@ static int failure_map_fd = -1;
 /* 只在同步读取期间借用调用方的目标记录，不保留队列内存指针。 */
 struct capture_read_context {
     struct kvs_ebpf_event *destination;
+    int legacy_aof;
 };
 static struct capture_read_context read_context;
 
@@ -52,7 +54,8 @@ static int receive_event(void *ctx, void *data, size_t size)
         return -EPROTONOSUPPORT;
     }
     if (source->length == 0 || source->length > sizeof(source->payload) ||
-        source->end > LLONG_MAX || source->end < source->start ||
+        (context->legacy_aof && source->end > LLONG_MAX) ||
+        source->end < source->start ||
         source->end - source->start != source->length)
         return -EPROTO;
 
@@ -119,7 +122,8 @@ void kvs_ebpf_stop(void)
     capture_object = NULL;
 }
 
-int kvs_ebpf_start(const char *object_path)
+static int kvs_ebpf_attach(const char *object_path, pid_t pid,
+                           const char *executable, const char *function, int legacy_aof)
 {
     if (capture_link != NULL)
         return 0;
@@ -156,6 +160,7 @@ int kvs_ebpf_start(const char *object_path)
         error = failure_map_fd;
         goto failed;
     }
+    read_context.legacy_aof = legacy_aof;
     capture_queue = ring_buffer__new(map_fd, receive_event, &read_context, NULL);
     if (capture_queue == NULL) {
         error = -errno;
@@ -172,11 +177,11 @@ int kvs_ebpf_start(const char *object_path)
 
     struct bpf_uprobe_opts options = {
         .sz = sizeof(options),
-        .func_name = "kvs_aof_committed"
+        .func_name = function
     };
-    /* 4. 只挂当前进程自己的成功点；调用该点时由内核触发 BPF。 */
+    /* 4. 只挂指定进程；调用目标函数时由内核触发 BPF。 */
     capture_link = bpf_program__attach_uprobe_opts(
-        program, getpid(), "/proc/self/exe", 0, &options);
+        program, pid, executable, 0, &options);
     error = libbpf_get_error(capture_link);
     if (capture_link == NULL || error != 0) {
         capture_link = NULL;
@@ -191,4 +196,28 @@ failed:
     kvs_ebpf_stop();
     errno = (int)-error;
     return -1;
+}
+
+int kvs_ebpf_start(const char *object_path)
+{
+    return kvs_ebpf_attach(object_path, getpid(), "/proc/self/exe",
+                           "kvs_aof_committed", 1);
+}
+
+int kvs_ebpf_start_replication(const char *object_path, pid_t primary_pid)
+{
+    if (primary_pid <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char executable[64];
+    int length = snprintf(executable, sizeof(executable), "/proc/%ld/exe",
+                          (long)primary_pid);
+    if (length < 0 || (size_t)length >= sizeof(executable)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return kvs_ebpf_attach(object_path, primary_pid, executable,
+                           "kvs_replication_committed", 0);
 }

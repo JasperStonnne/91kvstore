@@ -67,17 +67,17 @@ def normal_case(root, binary):
             rdma.require(reader.command("HGET", f"during_{i}") == b"catchup",
                          "catch-up value differs")
         catchup_ranges = [tuple(map(int, row)) for row in re.findall(
-            r"start AOF catch-up range=\[(\d+),(\d+)\)", fixture.primary_log())]
+            r"start cache catch-up range=\[(\d+),(\d+)\)", fixture.primary_log())]
         fences = list(map(int, re.findall(r"enter ONLINE offset=(\d+)",
                                           fixture.primary_log())))
         rdma.require(len(catchup_ranges) == 1 and len(fences) == 1 and
-                     catchup_ranges[0] == (gate.metadata[0], fences[0]) and
-                     fences[0] > gate.metadata[0],
+                     catchup_ranges[0] == (gate.stream_offset, fences[0]) and
+                     fences[0] > gate.stream_offset,
                      "nonempty catch-up does not end exactly at the ONLINE fence")
 
         # 此后才开始写测试命令，确保 payload 计量明确发生在 ONLINE 之后。
         position = (root / "primary/appendonly.aof").stat().st_size
-        rdma.require(position == fences[0], "AOF tail and ONLINE fence differ")
+        rdma.require(position == gate.metadata[0] + fences[0] - gate.stream_offset, "AOF tail and ONLINE fence differ")
         expected_ranges = []
 
         def write(*fields, captured=True):
