@@ -13,11 +13,9 @@
 #define KVS_CONFIG_PRIMARY_HOST_CAPACITY 256
 
 /*
- * standalone 只支持 snapshot 和 aof。
- * primary/replica 的 legacy_hybrid 配置表示二进制快照 + 检查点 O + AOF。
+ * standalone 支持三种模式，primary 和 replica 仅支持 none。
  */
 typedef enum {
-    KVS_PERSISTENCE_LEGACY_HYBRID = 0,
     KVS_PERSISTENCE_SNAPSHOT,
     KVS_PERSISTENCE_AOF,
     KVS_PERSISTENCE_NONE

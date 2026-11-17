@@ -39,29 +39,10 @@ cd "$RUN_DIR"
 
 已有仓库缺少子模块时，运行 `git submodule update --init --recursive`。
 
-### 可选 eBPF 版
+### 可选 eBPF 增量采集
 
-普通版和 eBPF 版保留两个不同文件。额外需要有 BPF 后端的 Clang 和 libbpf 开发包：
-
-```bash
-# 仅供复现；需要管理员安装权限，本轮没有执行。
-sudo apt install -y clang libbpf-dev libelf-dev zlib1g-dev
-# 在仓库根目录，以普通用户构建：
-make ebpf-startup
-```
-
-产物是 `bin/kvstore-ebpf` 和 `build/ebpf_capture.bpf.o`。主程序默认参数为 `-std=gnu11 -Wall -Wextra -g`，没有 `-O`；BPF 对象按 Makefile 单独用 `-O2 -g`，不要混为整个程序都未优化。
-
-在独立工作目录准备 Primary 配置（复制 `config/primary.conf`，将 `bind_ip` 改为 ACTIVE iWARP 地址，确认端口空闲），再启动：
-
-```bash
-# REPO 为仓库路径，RUN_DIR 为本实例工作目录；先完成上述配置。
-cd "$RUN_DIR"
-sudo env KVS_EBPF_OBJECT="$REPO/build/ebpf_capture.bpf.o" \
-  "$REPO/bin/kvstore-ebpf" "$RUN_DIR/primary.conf"
-```
-
-本实验环境用 sudo 加载本项目 BPF；非 root capability 组合未验证，不要求修改 sysctl。仅 Primary 分支加载 BPF，Replica 可用同一二进制普通权限启动。日志必须显示 `ONLINE source=eBPF`，AOF 降级不能算 eBPF 验收通过。[完整构建、启动和复现说明](docs/performance/REPRODUCING.md)。
+使用 Clang 和 libbpf 开发包构建 `make ebpf-capture`，生成
+`bin/kvstore-ebpf-capture` 和 `build/ebpf_capture.bpf.o`。启动参数见下方主从复制配置。
 
 ### 2. 写入与读取
 
@@ -119,13 +100,13 @@ printf '*2\r\n$4\r\nHGET\r\n$9\r\nuser name\r\n' |
                              ▼
                          TCP client
 
-          Primary Snapshot + AOF
+          Primary 临时快照 + 复制流
                     │
                     ▼
           Replica 全量同步 + 增量追赶
 ```
 
-NtyCo 网络层负责连接、收发和缓冲区；长度前缀解析集中在协议模块。命令执行层根据命令前缀选择引擎，写命令按所选持久化模式保存。复制模块复用 Snapshot 和 AOF，将 Primary 的状态传给 Replica。
+NtyCo 网络层负责连接、收发和缓冲区；长度前缀解析集中在协议模块。命令执行层根据命令前缀选择引擎，写命令按所选持久化模式保存。复制模块通过 RDMA 临时快照和内存增量流将 Primary 的状态传给 Replica。
 
 | 层 | 位置 | 职责 |
 | --- | --- | --- |
@@ -179,14 +160,13 @@ $11\r\nhello world\r\n
 
 ## 持久化
 
-单机可选择 `snapshot`、`aof` 或 `none`。主从可用 `none` 运行纯内存复制，`legacy_hybrid` 暂供旧部署兼容。
+单机可选择 `snapshot`、`aof` 或 `none`。Primary 和 Replica 只接受 `none`。
 
 | 配置 | 写入/恢复边界 |
 | --- | --- |
 | `none` | 从空引擎启动，不写本地 AOF，也不支持客户端 SAVE。主从全量仍使用复制专用临时快照。 |
 | `snapshot` | 普通写入只更新内存；成功 `SAVE` 后保存二进制 `snapshot.bin`，重启只加载快照，不创建 AOF |
 | `aof` | 成功写回复前完成 AOF 追加和同步；重启回放 `commands.aof`，不需要 SAVE，也不生成快照 |
-| `legacy_hybrid` | 快照带 AOF 检查点，恢复快照后回放后续 AOF；用于旧主从部署。存在快照却缺 AOF，或已知边界错位时拒绝启动 |
 
 现场手动演示使用 `make all testcase` 构建 C 客户端，每次单独执行写入、读取校验、修改、删除或 SAVE；服务启动、宕机和重启由操作者控制。具体命令见[手动演示流程（HTML）](docs/MANUAL_DEMO.html)，可直接用浏览器打开。旧 `bin/testcase` 的数字模式已改为具名操作，使用 `bin/testcase --help` 查看参数。
 
@@ -243,6 +223,9 @@ make all ebpf-capture
 sudo bin/kvstore-ebpf-capture "$PRIMARY_PID" build/ebpf_capture.bpf.o --socket "$CAPTURE_SOCKET"
 ```
 
+Primary 和 Replica 需要使用同一版本的全量握手。当前通知格式为
+`FULLRESYNC_RDMA <repl_id> <snapshot_bytes> <rdma_port> <sync_id> <stream_offset>`。
+
 Primary 的发送临时文件在收到最终快照确认后删除，Replica 从接收临时文件加载后删除。缓存失效或采集进程退出时结束本轮复制，重启 Replica 后重新全量。eBPF 当前单个事件最多携带 4 KiB 编码命令。缺失事件导致进度无法追平时，本轮同步会报错结束。
 
 在具备 iWARP 的开发机上，可以用同一个脚本验证两种模式。脚本以普通用户启动主从，仅采集进程使用 sudo。
@@ -253,7 +236,6 @@ sudo -v
 RDMA_TEST_IP=172.16.145.135 python3 -B tests/test_capture_replication.py .
 ```
 
-旧 `bin/kvstore-ebpf` 实验和 AOF 补偿回归仍可用，详见 [旧 eBPF ONLINE 验收说明](tests/README_EBPF.md)。
 
 ## 网络后端
 
@@ -289,7 +271,7 @@ RDMA_TEST_IP=172.16.145.135 python3 -B tests/test_capture_replication.py .
 | `make test-persistence-100k` | Snapshot/AOF 各10万条 | 单机、独立临时目录；默认在成功边界 SIGKILL 后逐条读回；不是断电测试 |
 | `make test-clients` | redis-cli/hiredis/benchmark 已列支持场景 | 可选依赖缺失标 SKIP，默认 PING 标 UNSUPPORTED，两者不计 PASS |
 | `make test-clients-strict` | 严格客户端对照 | 任意 SKIP 或默认 PING 未支持均非零；当前不能期望全绿 |
-| `make test-ebpf-replication` | 真实 eBPF、RDMA、补偿专项 | 先普通用户构建，再以批准的 BPF 权限运行；需要 ACTIVE iWARP |
+| `tests/test_capture_replication.py` | 真实 RDMA 与两种增量模式字节对账 | 先普通用户构建，再以批准的 BPF 权限运行；需要 ACTIVE iWARP |
 | `tests/test_two_vm_100k.py` | 先5万、从机同步后再5万，两端各10万读回 | 双VM、同程序/依赖指纹；客户端本身不启动/清理服务，必须落实实例归属及超时 |
 
 详细的依赖、执行步骤、资源要求、正确性判据、历史通过范围及未验证项见[测试方案](docs/performance/TESTING.md)和[复现说明](docs/performance/REPRODUCING.md)。完整 `make test` 不含所有大数据、可选客户端或真实 BPF 专项；SKIP 不等于 PASS。新机器全套安装/构建未在本阶段重新验证。

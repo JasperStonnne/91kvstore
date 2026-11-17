@@ -2,7 +2,6 @@
 """测试专属 AOF 子进程部分写失败：无假成功、退出、拒绝残缺日志恢复。
 
 只修改子进程 RLIMIT_FSIZE，不填磁盘、不改系统设置，无需 root/BPF。
-默认单机模式无需 SIW；--primary-hybrid 使用真实 SIW，并先保存快照。
 SIGXFSZ 只在故障子进程中忽略，让程序走写错误分支，而非被信号直接杀死。
 """
 import argparse
@@ -29,43 +28,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
                         default=Path(__file__).resolve().parent.parent / "bin/kvstore")
-    parser.add_argument("--primary-hybrid", action="store_true",
-                        help="test Primary snapshot+AOF path (requires ACTIVE SIW)")
     args = parser.parse_args()
     binary = args.binary.resolve()
     host = "127.0.0.1"
     root = Path(tempfile.mkdtemp(prefix="91kv-aof-write-failure-"))
     port = choose_port()
     aof_name = "commands.aof"
-    if args.primary_hybrid:
-        import test_rdma_replication as rdma
-        host = rdma.discover_rdma_host()
-        rdma.TEST_HOST = host
-        rdma_port = rdma.free_port()
-        while rdma_port == port:
-            rdma_port = rdma.free_port()
-        config_text = (f"role=primary\nbind_ip={host}\nservice_port={port}\n"
-                       f"rdma_port={rdma_port}\nallocator=pool\n"
-                       "persistence_mode=legacy_hybrid\n")
-        aof_name = "appendonly.aof"
-    else:
-        config_text = (
-            "role=standalone\nbind_ip=127.0.0.1\n"
-            f"service_port={port}\nallocator=pool\npersistence_mode=aof\n")
+    config_text = (
+        "role=standalone\nbind_ip=127.0.0.1\n"
+        f"service_port={port}\nallocator=pool\npersistence_mode=aof\n")
 
-    def invoke(*fields):
-        if not args.primary_hybrid:
-            return command(port, *fields)
-        client = rdma.Client(port)
-        try:
-            return client.command(*fields)
-        finally:
-            client.close()
     owned = []
     parent_limits = resource.getrlimit(resource.RLIMIT_FSIZE)
     result = {"binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-              "port": port, "mode": "primary/legacy_hybrid" if args.primary_hybrid
-              else "standalone/aof", "checks_complete": False}
+              "port": port, "mode": "standalone/aof", "checks_complete": False}
     print(f"[INFO] evidence retained: {root}", flush=True)
 
     def launch(directory, inject=False):
@@ -85,19 +61,12 @@ def main():
         directory = root / "fault"
         process = launch(directory, inject=True)
         wait_for_server(process, port, host)
-        assert invoke(b"HSET", b"base", b"committed") == b"OK"
-        assert invoke(b"HGET", b"base") == b"committed"
-        snapshot_bytes = None
-        if args.primary_hybrid:
-            assert invoke(b"SAVE") == b"OK"
-            snapshot_bytes = (directory / "snapshot.db").read_bytes()
+        assert command(port, b"HSET", b"base", b"committed") == b"OK"
+        assert command(port, b"HGET", b"base") == b"committed"
         aof = directory / aof_name
         committed = aof.read_bytes()
         assert committed == encode_command(b"HSET", b"base", b"committed")
         (root / "committed-aof.backup").write_bytes(committed)
-        if snapshot_bytes is not None:
-            result["snapshot_checkpoint"] = int.from_bytes(snapshot_bytes[24:32], "big")
-            assert result["snapshot_checkpoint"] == len(committed)
 
         # 只允许下一条命令写出 8 字节，迫使剩余写入返回错误。
         _, hard_limit = resource.prlimit(process.pid, resource.RLIMIT_FSIZE)
@@ -136,20 +105,15 @@ def main():
         (directory / "restart.log").write_bytes(restarted.stdout)
         result["restart_exit"] = restarted.returncode
         assert restarted.returncode == 1, restarted.stdout
-        diagnostic = (b"failed to replay AOF" if args.primary_hybrid
-                      else b"failed to replay standalone AOF")
+        diagnostic = b"failed to replay standalone AOF"
         assert diagnostic in restarted.stdout, restarted.stdout
         assert b"listen port :" not in restarted.stdout, restarted.stdout
         assert aof.read_bytes() == damaged, "restart changed damaged AOF"
-        if snapshot_bytes is not None:
-            assert (directory / "snapshot.db").read_bytes() == snapshot_bytes
 
         # 独立对照目录只放故障前的完整日志；不修改故障文件。
         control = root / "committed-only-control"
         control.mkdir()
         (control / aof_name).write_bytes(committed)
-        if snapshot_bytes is not None:
-            (control / "snapshot.db").write_bytes(snapshot_bytes)
         # launch 拥有目录创建，因此此处直接使用已创建目录的配置启动。
         control_config = control / "server.conf"
         control_config.write_text(config_text)
@@ -159,7 +123,7 @@ def main():
             stderr=subprocess.STDOUT)
         owned.append((clean, control / "server.log"))
         wait_for_server(clean, port, host)
-        assert invoke(b"HGET", b"base") == b"committed"
+        assert command(port, b"HGET", b"base") == b"committed"
         assert (control / aof_name).read_bytes() == committed
         result["committed_only_control_value"] = "committed"
         result["checks_complete"] = True

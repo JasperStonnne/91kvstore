@@ -8,9 +8,6 @@
 #include "protocol.h"
 #include "config.h"
 #include "log.h"
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-#include "ebpf_capture.h"
-#endif
 #include <string.h>
 #include<errno.h>
 #include<limits.h>
@@ -100,12 +97,11 @@ const char *response[]={
 
 static kvs_role_t kvs_server_role = KVS_ROLE_STANDALONE;
 static kvs_persistence_mode_t kvs_persistence_mode =
-    KVS_PERSISTENCE_LEGACY_HYBRID;
+    KVS_PERSISTENCE_NONE;
 
 static int kvs_persistence_uses_aof(void)
 {
-    return kvs_persistence_mode == KVS_PERSISTENCE_AOF ||
-           kvs_persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID;
+    return kvs_persistence_mode == KVS_PERSISTENCE_AOF;
 }
 
 static void kvs_close_current_persistence(void)
@@ -119,21 +115,6 @@ static int kvs_save_current_snapshot(void)
 {
     if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
         return kvs_snapshot_store_save("snapshot.bin");
-    }
-
-    if (kvs_persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID) {
-        long long offset = kvs_aof_get_offset();
-        if (offset < 0) {
-            return -1;
-        }
-
-        kvs_snapshot_checkpoint_t checkpoint = {
-            .has_offset = 1,
-            .offset = offset
-        };
-
-        return kvs_snapshot_store_save_with_checkpoint(
-            "snapshot.db", &checkpoint);
     }
 
     errno = ENOTSUP;
@@ -510,7 +491,7 @@ int kvs_filter_protocol(
 
         if (source != KVS_COMMAND_SOURCE_RECOVERY &&
             kvs_persistence_uses_aof() &&
-            kvs_aof_append(tokens, count, primary_client_write) < 0) {
+            kvs_aof_append(tokens, count) < 0) {
             fprintf(stderr, "failed to append AOF\n");
             exit(EXIT_FAILURE);
         }
@@ -1289,9 +1270,7 @@ void dest_kvengine(void){
  * replication 模块只负责在合适的时间调用这个函数；
  * Engine 的销毁、初始化和恢复仍由 kvstore 模块负责。
  */
-static int kvs_install_replication_snapshot(
-    const char *snapshot_path,
-    long long aof_offset)
+static int kvs_install_replication_snapshot(const char *snapshot_path)
 {
     if(snapshot_path==NULL || snapshot_path[0]=='\0'){
         return -1;
@@ -1307,15 +1286,7 @@ static int kvs_install_replication_snapshot(
         exit(EXIT_FAILURE);
     }
 
-    kvs_snapshot_checkpoint_t checkpoint = {0};
-    int load_result = kvs_snapshot_store_load_with_checkpoint(
-        snapshot_path, &checkpoint);
-
-    /* 只有旧持久化模式才需要检查并对齐本地 AOF。 */
-    if (load_result != 0 ||
-        (kvs_persistence_uses_aof() &&
-         (!checkpoint.has_offset || checkpoint.offset != aof_offset ||
-          kvs_aof_reset_to_offset(aof_offset) < 0))) {
+    if (kvs_snapshot_store_load(snapshot_path) != 0) {
         dest_kvengine();
         if (init_kvengine() < 0) {
             fprintf(stderr,
@@ -1338,32 +1309,12 @@ static int kvs_server_run(kvs_config_t config)
     kvs_server_role = config.role;
     kvs_persistence_mode = config.persistence_mode;
 
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    if (config.replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_EBPF) {
-        fprintf(stderr, "replication_incremental_mode=ebpf requires bin/kvstore\n");
-        return EXIT_FAILURE;
-    }
-    if (config.role == KVS_ROLE_PRIMARY &&
-        kvs_persistence_mode == KVS_PERSISTENCE_NONE) {
-        fprintf(stderr, "persistence_mode=none on a Primary requires the ordinary kvstore build; "
-                        "the experimental eBPF sender still requires AOF\n");
-        return EXIT_FAILURE;
-    }
-#endif
-
     if (init_kvengine() < 0) {
         fprintf(stderr, "failed to initialize KV engines\n");
         return EXIT_FAILURE;
     }
-    if (kvs_persistence_mode == KVS_PERSISTENCE_NONE) {
-        /* 纯内存模式从空引擎启动，Replica 的数据由全量同步安装。 */
-    } else if (config.role == KVS_ROLE_REPLICA) {
-        if (kvs_aof_open("appendonly.aof") < 0) {
-            fprintf(stderr, "failed to open replica AOF\n");
-            dest_kvengine();
-            return EXIT_FAILURE;
-        }
-    }else if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
+    /* 纯内存模式从空引擎启动，Replica 的数据由全量同步安装。 */
+    if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
         int load_result = kvs_snapshot_store_load("snapshot.bin");
 
         if (load_result < 0) {
@@ -1386,64 +1337,6 @@ static int kvs_server_run(kvs_config_t config)
 
         if (kvs_aof_open("commands.aof") < 0) {
             fprintf(stderr, "failed to open standalone AOF\n");
-            dest_kvengine();
-            return 1;
-        }
-    } else {
-        kvs_snapshot_checkpoint_t checkpoint = {0};
-
-        int load_result =
-            kvs_snapshot_store_load_with_checkpoint(
-                "snapshot.db", &checkpoint);
-
-        if (load_result < 0 ||
-            (load_result == 0 && !checkpoint.has_offset)) {
-            fprintf(stderr, "failed to load snapshot with checkpoint\n");
-            dest_kvengine();
-            return EXIT_FAILURE;
-        }
-
-        /*
-         * Hybrid 恢复已有快照时，必须保留配套 AOF。
-         * 否则无法判断快照之后的已确认写入是否丢失，不能创建空日志继续启动。
-         * 首次启动没有快照（load_result == 1），仍允许随后创建新 AOF。
-         */
-        if (load_result == 0) {
-            struct stat aof_info;
-            if (stat("appendonly.aof", &aof_info) < 0) {
-                fprintf(stderr,
-                        "failed to recover hybrid: snapshot.db requires "
-                        "appendonly.aof: %s\n", strerror(errno));
-                dest_kvengine();
-                return EXIT_FAILURE;
-            }
-
-            /* 检查点可以恰好位于末尾，但不能超过实际日志长度。 */
-            if (checkpoint.offset > (long long)aof_info.st_size) {
-                fprintf(stderr,
-                        "failed to recover hybrid: snapshot offset=%lld "
-                        "exceeds AOF size=%lld\n",
-                        checkpoint.offset, (long long)aof_info.st_size);
-                dest_kvengine();
-                return EXIT_FAILURE;
-            }
-        }
-
-        long long offset =
-            load_result == 1 ? 0 : checkpoint.offset;
-
-        if (kvs_aof_replay(
-                "appendonly.aof",
-                offset,
-                kvs_recovery_fields_protocol
-            ) < 0) {
-            fprintf(stderr, "failed to replay AOF\n");
-            dest_kvengine();
-            return 1;
-        }
-
-        if (kvs_aof_open("appendonly.aof") < 0) {
-            fprintf(stderr, "failed to open AOF\n");
             dest_kvengine();
             return 1;
         }
@@ -1485,19 +1378,6 @@ kvs_close_current_persistence();
         dest_kvengine();
         return EXIT_FAILURE;
     }
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    if (kvs_ebpf_start(getenv("KVS_EBPF_OBJECT")) < 0) {
-        kvs_log_message(
-            KVS_LOG_ERROR,
-            "ebpf: startup capture unavailable: %s; ONLINE source=AOF\n",
-            strerror(errno));
-    } else {
-        kvs_log_message(
-            KVS_LOG_INFO,
-            "ebpf: startup attach successful; ONLINE source=eBPF; "
-            "AOF catch-up and compensation enabled\n");
-    }
-#endif
 kvs_listener_config_t listener = {
     .port = config.service_port,
     .bind_ip = config.bind_ip,
@@ -1539,10 +1419,6 @@ kvs_listener_config_t listener = {
         };
         network_ret = ntyco_start_listeners(&listener, 1);
     }
-
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    kvs_ebpf_stop();
-#endif
 
     if(network_ret<0){
         fprintf(stderr,"failed to start network service\n");

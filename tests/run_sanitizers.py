@@ -12,7 +12,7 @@ TESTS = ("test_protocol", "test_config", "test_snapshot_store",
          "test_hash_memory_pool", "test_rbtree_memory_pool", "test_skiplist_memory_pool",
          "test_array_memory", "test_allocator", "test_buffer_allocator",
          "test_mapped_file", "test_uring_io", "test_aof_replay",
-         "test_connection_protocol", "test_replication_boundary", "test_ebpf_online")
+         "test_connection_protocol", "test_replication_boundary")
 
 
 def main():

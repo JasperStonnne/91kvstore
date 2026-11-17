@@ -32,8 +32,8 @@ RDMA 路径；跨机器网络连通性仍由双机验收验证。
 | `Client` | 编解码测试使用的 RESP 命令和响应 |
 | `Fixture` | 创建临时配置、启动服务、等待状态、清理自己启动的进程 |
 | `SnapshotGate` | 代理 TCP，暂停全量启动通知；不代理 RDMA 快照数据 |
-| `assert_rdma_snapshot` | 检查分块、累计 ACK、快照字节数及 SHA-256、正常断开 |
-| `assert_tcp_catchup_only` | 检查全量通知后 TCP 只有 AOF 增量与 ONLINE 行 |
+| `assert_rdma_snapshot` | 检查分块、累计 ACK、快照字节数及临时文件清理、正常断开 |
+| `assert_tcp_catchup_only` | 检查全量通知后 TCP 只有复制增量与 ONLINE 行 |
 | 各个 `*_case` | 按业务场景组织操作与断言 |
 
 ## 八个集成场景
@@ -45,15 +45,14 @@ RDMA 路径；跨机器网络连通性仍由双机验收验证。
    512 个原有键和 17 个增量键；非 ONLINE 时 PING 可用、读取返回 LOADING。
 4. **Replica 重启**：停止副本后破坏其测试目录中的旧快照和 AOF，更新
    Primary，再从同一目录启动副本，确认重新全量同步得到最新数据。
-5. **Primary 本地恢复**：保存二进制快照后再写入 AOF，重启后同时恢复
-   两部分数据，且恢复过程不改写 AOF。
-6. **全量中途停止再重启**：首块实际落盘后停止 Replica，确认只有不完整
+5. **全量中途停止再重启**：首块实际落盘后停止 Replica，确认只有不完整
    临时文件、没有正式快照；同目录重启使用新同步 ID，重新全量得到最新数据。
-7. **RDMA 监听端口占用**：第二个 Primary 绑定同一 RDMA 端口，要求
+6. **RDMA 监听端口占用**：第二个 Primary 绑定同一 RDMA 端口，要求
    10 秒内非零退出，日志含失败的 IPv4/端口，不能降级启动 TCP 服务。
-8. **通知中的 RDMA 端口错误**：分别改为未监听端口（连接拒绝）和普通 TCP
+7. **通知中的 RDMA 端口错误**：分别改为未监听端口（连接拒绝）和普通 TCP
    监听者（不回应 RDMA 握手）。后者要求 3 秒主动建连截止时间生效；
    两者均记录端点并取消同步、删除临时快照，不进入 ONLINE；PING 仍可用。
+8. **INFO 日志**：保留复制阶段切换，逐块传输日志只在 DEBUG 下出现。
 
 第三个场景的顺序是：
 
@@ -63,7 +62,7 @@ Primary 生成快照、固定 O
     → Primary 写入 17 条增量
     → 放行通知，Replica 建立真实 RDMA 连接
     → 分块接收快照、安装、累计 ACK、正常断开
-    → TCP 从 O 开始发送 AOF，通知 ONLINE
+    → TCP 从快照复制流位置开始发送缓存增量，通知 ONLINE
     → 核对全部数据及传输证据
 ```
 
@@ -72,16 +71,15 @@ TCP 代理还统计通知之后的字节数，要求恰好等于
 `ONLINE offset - O + ONLINE 行长度`，防止快照混入 TCP 路径而测试仍通过。
 
 每个场景使用独立临时目录和端口。成功时删除测试目录；失败时保留
-配置、快照、AOF 和日志，并打印路径。退出时只终止本脚本启动的进程。
+配置、快照和日志，并打印路径。退出时只终止本脚本启动的进程。
 
 
 ## 全量路径迁移完成后的约定
 
 Primary 必须显式配置 `rdma_port`，且与 `service_port` 不同。
 只生成、接受 `FULLRESYNC_RDMA` 通知；全量期间的 TCP 数据被拒绝。
-快照的生成、校验、安装及边界 O 继续复用现有 store/io 接口。
-`legacy_hybrid` 仍是当前主从持久化配置名，数据使用二进制快照与 AOF，
-不代表恢复旧的文本快照实现。eBPF 增量不属于此次迁移。
+快照的生成、校验和安装继续复用现有 store/io 接口。主从要求
+`persistence_mode=none`，快照边界使用独立复制流位置。
 
 `test_replication_boundary.c` 使用仅存在于单测中的传输替身，无需设备，
 检查控制行边界、旧通知拒绝、全量期间 TCP 数据拒绝、RECV 早于 SEND
@@ -109,7 +107,7 @@ kvstore.c：读配置、启动 Primary 监听、提供快照安装回调
 | `kvs_replication_start_rdma_listener` | Primary 创建独立 RDMA 监听器 |
 | `kvs_replication_frame_protocol` 的 PSYNC 分支 | 固定 O、生成快照及同步 ID、返回 TCP 通知 |
 | `kvs_replication_upstream_frame_protocol` | Replica 解析通知、准备临时文件、发起 RDMA 建连 |
-| `kvs_replication_stream` | Primary 推进 RDMA，并在正常结束后复用 AOF 追赶 |
+| `kvs_replication_stream` | Primary 推进 RDMA，并在正常结束后读取复制缓存追赶 |
 | `kvs_replication_upstream_stream` | Replica 推进 RDMA、发送 READY、接收快照、累计 ACK |
 | `kvs_replication_receive_snapshot_data` / `finish_full_sync` | 写入、提交、调用安装回调并进入 CATCH_UP |
 | `kvs_replication_on_primary_disconnected` | Replica 取消本轮并删除未完成快照 |
@@ -156,7 +154,7 @@ CM 的 `ESTABLISHED/DISCONNECTED` 与 CQ 的 `SEND/RECV` 是不同事件；
 
 先在两端构建 `make all`，确认 `rdma link show` 中 siw 链路为 ACTIVE。
 下面以 Primary `172.16.145.135`、Replica `172.16.145.136` 为例，替换为实际地址。
-在两个独立目录中分别保存以下 `server.conf`，不能共用快照/AOF 文件：
+在两个独立目录中分别保存以下 `server.conf`，分别生成各自的临时快照文件：
 
 ```ini
 # Primary 的 server.conf
@@ -164,7 +162,7 @@ role=primary
 bind_ip=172.16.145.135
 service_port=29000
 rdma_port=29747
-persistence_mode=legacy_hybrid
+persistence_mode=none
 log_level=info
 ```
 
@@ -175,7 +173,7 @@ bind_ip=172.16.145.136
 service_port=29001
 primary_host=172.16.145.135
 primary_port=29000
-persistence_mode=legacy_hybrid
+persistence_mode=none
 log_level=info
 ```
 

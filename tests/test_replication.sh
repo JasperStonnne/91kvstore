@@ -223,14 +223,14 @@ for port in "$PRIMARY_PORT" "$REPLICA_PORT" "$RDMA_PORT"; do
 done
 
 # 配置文件也放在测试临时目录中，不写入仓库。
-# TCP 服务端口负责客户端/控制/AOF；独立 RDMA 端口负责快照全量。
+# TCP 服务端口负责客户端/控制/复制增量；独立 RDMA 端口负责快照全量。
 cat >"$PRIMARY_CONFIG" <<EOF
 role = primary
 bind_ip = $TEST_HOST
 service_port = $PRIMARY_PORT
 rdma_port = $RDMA_PORT
 log_level = info
-persistence_mode = legacy_hybrid
+persistence_mode = none
 EOF
 
 # 启动 Primary。工作目录是临时目录，PID 是本脚本启动的进程。
@@ -388,7 +388,7 @@ service_port = $REPLICA_PORT
 primary_host = $TEST_HOST
 primary_port = $PRIMARY_PORT
 log_level = info
-persistence_mode = legacy_hybrid
+persistence_mode = none
 EOF
 
 # 启动 Replica，它的数据文件位于另一个临时目录。
@@ -424,7 +424,7 @@ if [ "$large_read_response" != "$large_expected_response" ]; then
 fi
 echo "[PASS] Snapshot full synchronization with a 2048-byte value"
 
-# Replica ONLINE 后再写入，验证 AOF 增量复制。
+# Replica ONLINE 后再写入，验证 实时增量复制。
 online_response=$(
     send_resp_frame "$PRIMARY_PORT" \
         '*3\r\n$4\r\nHSET\r\n$11\r\nonline_test\r\n$18\r\nafter online value\r\n'

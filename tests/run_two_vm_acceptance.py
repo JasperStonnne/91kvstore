@@ -84,7 +84,7 @@ if action == 'init':
     root = pathlib.Path(tempfile.mkdtemp(prefix='91kv-auto-' + arg['role'] + '-', dir=parent))
     config = root/'server.conf'
     content = (f"role={arg['role']}\nbind_ip={arg['host']}\nservice_port={arg['port']}\n"
-               'log_level=info\npersistence_mode=legacy_hybrid\n')
+               'log_level=info\npersistence_mode=none\n')
     if arg['role'] == 'primary':
         with socket.socket() as probe: probe.bind((arg['host'], arg['rdma_port']))
         content += f"rdma_port={arg['rdma_port']}\n"
@@ -249,13 +249,13 @@ class Gate:
             upstream.sendall(b'PSYNC ? -1\r\n')
             header = self.line(upstream)
             parts = header.split()
-            require(len(parts) == 7 and parts[0] == b'FULLRESYNC_RDMA',
+            require(len(parts) == 6 and parts[0] == b'FULLRESYNC_RDMA',
                     'expected RDMA full-sync notification')
-            require(0 < int(parts[4]) <= 65535 and
+            require(0 < int(parts[3]) <= 65535 and
                     re.fullmatch(rb'[0-9a-f]{40}', parts[1]) is not None and
-                    re.fullmatch(rb'[0-9a-f]{40}', parts[5]) is not None,
+                    re.fullmatch(rb'[0-9a-f]{40}', parts[4]) is not None,
                     'invalid RDMA port or synchronization ID')
-            self.metadata = dict(offset=int(parts[2]), size=int(parts[3]), stream_offset=int(parts[6]))
+            self.metadata = dict(size=int(parts[2]), stream_offset=int(parts[5]))
             # O 已固定；先暂停通知，避免 Replica 绕过 TCP 代理开始 RDMA。
             self.event('snapshot_held', **self.metadata)
             self.ready.set()

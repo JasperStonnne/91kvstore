@@ -115,7 +115,7 @@ static void test_invalid_configs(void)
     {
         "replica rejects rdma port",
         "role=replica\nservice_port=29001\n"
-        "persistence_mode=legacy_hybrid\n"
+        "persistence_mode=none\n"
         "primary_host=127.0.0.1\nprimary_port=29000\n"
         "rdma_port=29747\n",
         "rdma_port is only valid for role=primary"
@@ -125,19 +125,19 @@ static void test_invalid_configs(void)
         "primary requires rdma port",
         "role=primary\n"
         "service_port=29000\n"
-        "persistence_mode=legacy_hybrid\n",
+        "persistence_mode=none\n",
         "role=primary requires rdma_port"
     },
     {
         "primary rejects equal rdma port",
         "role=primary\nservice_port=29000\n"
-        "persistence_mode=legacy_hybrid\nrdma_port=29000\n",
+        "persistence_mode=none\nrdma_port=29000\n",
         "rdma_port must differ from service_port"
     },
     {
         "primary rejects zero rdma port",
         "role=primary\nservice_port=29000\n"
-        "persistence_mode=legacy_hybrid\nrdma_port=0\n",
+        "persistence_mode=none\nrdma_port=0\n",
         "invalid rdma_port"
     },
         {
@@ -145,7 +145,20 @@ static void test_invalid_configs(void)
             "role=standalone\n"
             "service_port=29000\n"
             "persistence_mode=legacy_hybrid\n",
-            "standalone supports only persistence_mode=snapshot or aof"
+            "unsupported persistence_mode"
+        },
+        {
+            "primary rejects legacy hybrid",
+            "role=primary\nservice_port=29000\nrdma_port=29747\n"
+            "persistence_mode=legacy_hybrid\n",
+            "unsupported persistence_mode"
+        },
+        {
+            "replica rejects legacy hybrid",
+            "role=replica\nservice_port=29001\n"
+            "primary_host=127.0.0.1\nprimary_port=29000\n"
+            "persistence_mode=legacy_hybrid\n",
+            "unsupported persistence_mode"
         },
         {
             "unknown field",
@@ -212,61 +225,61 @@ static void test_invalid_configs(void)
             "primary rejects old equal replication port",
             "role=primary\nservice_port=29000\n"
             "replication_port=29000\n"
-            "persistence_mode=legacy_hybrid\n",
+            "persistence_mode=none\n",
             "replication_port has been removed; use service_port"
         },
         {
             "primary rejects old different replication port",
             "role=primary\nservice_port=29000\n"
             "replication_port=29100\n"
-            "persistence_mode=legacy_hybrid\n",
+            "persistence_mode=none\n",
             "replication_port has been removed; use service_port"
         },
         {
             "replica missing primary host",
             "role=replica\nservice_port=29001\nprimary_port=29100\n"
-            "persistence_mode=legacy_hybrid\n",
+            "persistence_mode=none\n",
             "requires primary_host"
         },
         {
             "replica missing primary port",
             "role=replica\nservice_port=29001\n"
             "primary_host=127.0.0.1\n"
-            "persistence_mode=legacy_hybrid\n",
+            "persistence_mode=none\n",
             "requires primary_port"
         },
         {
             "standalone with replication field",
             "role=standalone\nservice_port=29000\n"
             "replication_port=29100\n"
-            "persistence_mode=legacy_hybrid\n",
+            "persistence_mode=none\n",
             "replication_port is only valid"
         },
         {
             "primary rejects snapshot mode",
             "role=primary\nservice_port=29000\n"
             "persistence_mode=snapshot\n",
-            "primary/replica currently support only"
+            "primary/replica support only"
         },
         {
             "primary rejects aof mode",
             "role=primary\nservice_port=29000\n"
             "persistence_mode=aof\n",
-            "primary/replica currently support only"
+            "primary/replica support only"
         },
         {
             "replica rejects snapshot mode",
             "role=replica\nservice_port=29001\n"
             "primary_host=127.0.0.1\nprimary_port=29100\n"
             "persistence_mode=snapshot\n",
-            "primary/replica currently support only"
+            "primary/replica support only"
         },
         {
             "replica rejects aof mode with mode field first",
             "persistence_mode=aof\nrole=replica\n"
             "service_port=29001\nprimary_host=127.0.0.1\n"
             "primary_port=29100\n",
-            "primary/replica currently support only"
+            "primary/replica support only"
         },
         {
             "malformed line",
@@ -344,7 +357,7 @@ static void test_valid_primary_and_replica(void)
         "service_port = 29000\n"
         "rdma_port = 29747\n"
         "log_level = error\n"
-        "persistence_mode=legacy_hybrid\n"
+        "persistence_mode=none\n"
     );
 
     assert(primary.role == KVS_ROLE_PRIMARY);
@@ -352,13 +365,13 @@ static void test_valid_primary_and_replica(void)
     assert(primary.service_port == 29000);
     assert(primary.rdma_port == 29747);
     assert(primary.log_level == KVS_LOG_ERROR);
-    assert(primary.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
+    assert(primary.persistence_mode == KVS_PERSISTENCE_NONE);
     kvs_config_t replica = load_valid(
         "role = replica\n"
         "service_port = 29001\n"
         "primary_host = 127.0.0.1\n"
         "primary_port = 29100\n"
-        "persistence_mode=legacy_hybrid\n"
+        "persistence_mode=none\n"
     );
 
     assert(replica.role == KVS_ROLE_REPLICA);
@@ -369,7 +382,7 @@ static void test_valid_primary_and_replica(void)
     /* 省略的可选字段应使用明确的默认值。 */
     assert(strcmp(replica.bind_ip, "0.0.0.0") == 0);
     assert(replica.log_level == KVS_LOG_INFO);
-    assert(replica.persistence_mode == KVS_PERSISTENCE_LEGACY_HYBRID);
+    assert(replica.persistence_mode == KVS_PERSISTENCE_NONE);
 }
 
 static void test_missing_file(void)

@@ -10,32 +10,18 @@
 
 | 命令／脚本 | 覆盖 | 环境 |
 | --- | --- | --- |
-| make test-hybrid-recovery | 缺日志、日志过短、两种普通检查点错位 | 无 SIW/BPF/root 要求 |
 | make test-aof-write-failure | AOF 部分写、无假成功、残缺日志拒绝恢复 | Linux 同 UID 子进程限制 |
 | make test-aof-sync-failure | 同步函数 EIO、完整未确认命令重启恢复 | 独立测试程序，无 root |
 | make test-snapshot-save-failure | 临时文件同步、rename、目录同步错误 | 独立测试程序，无 root |
 | make test-snapshot-crash | 七个崩溃窗口，四引擎新增/修改/删除 | 只 SIGKILL 专属子进程 |
 | make test-replication-faults | 五种断线、四种主/副本 SIGKILL | ACTIVE iWARP/SIW |
-| make test-rdma | 原有真实 RDMA 加 Primary AOF 错误回归 | ACTIVE iWARP/SIW |
-| make test-sanitizers | 独立临时构建的 15 个 ASan/UBSan 单测 | GCC sanitizer 运行库 |
+| make test-rdma | 真实 RDMA 与增量边界 | ACTIVE iWARP/SIW |
+| make test-sanitizers | 独立临时构建的 14 个 ASan/UBSan 单测 | GCC sanitizer 运行库 |
 | make fuzz-protocol | 有界 RESP 覆盖引导诊断，默认 50000 次 | clang 与 libclang-rt |
-| tests/test_ebpf_replication.py | 真实 BPF payload、溢出、消费错、版本拒收等 | BPF 权限与 SIW |
 
 前三类持久化故障、Snapshot、复制故障和固定单测已接入 make test。
 可选 sanitizer/fuzz 不强制加入普通回归。
-Primary 写入与同步错误复用单机脚本的 --primary-hybrid 模式，并由 test-rdma 调用。
-
-真实中断入口先普通用户 make ebpf-startup，再使用已授权的 BPF 权限运行：
-
-~~~bash
-sudo env KVS_EBPF_OBJECT="$PWD/build/ebpf_capture.bpf.o" RDMA_TEST_IP=<本机SIW的IPv4> \
-  python3 -B tests/test_replication_faults.py . \
-  --binary "$PWD/bin/kvstore-ebpf" --require-ebpf
-~~~
-
-该模式要求真实附着；ONLINE 后案例还要求实际 payload 日志；
-出现 ONLINE source=AOF 降级即失败，不能用模拟单测代替。
-不要向终端粘贴提示符或历史输出。
+**真实 eBPF** 见仓库 README 中的双模式验收命令。
 
 ## Snapshot-only SAVE
 
@@ -60,18 +46,13 @@ rename 前恢复旧版本；rename 后的普通重启恢复新版本。
 SIGTERM 不能替代成功 SAVE；SIGKILL 只模拟进程退出，不等于断电。
 真实磁盘故障与断电按用户要求不实测，保留为未验证。
 
-## AOF 与 hybrid
+## 单机 AOF
 
 - 内存操作先发生，然后 AOF 写入和文件同步；成功后才推进提交 offset 并允许回复成功。
 - 写入或同步失败：当前命令不回复成功，进程报错退出；不回滚内存或自动修剪日志。
 - 残缺尾部：重启拒绝恢复、文件保持原样；完整前缀可能已经回放，但失败启动不对外服务。
 - 完整命令写入后同步报错：普通重启仍可能恢复这条命令；无成功回复不代表未执行。
-- Primary hybrid 有快照但缺配套 AOF，或 AOF 短于快照检查点：拒绝启动。
-- AOF 等于检查点时无需回放，大于时继续解析检查点之后的完整命令。
-- 空目录首次启动和 Snapshot-only 不受配套 AOF 检查影响。
-- 有意用独立快照初始化 hybrid 没有新增专用入口；普通恢复不能自行猜测用户意图。
 - 合法重复 AOF 记录按顺序执行，不自动去重，不宣称 exactly-once。
-- 两种普通错位有测试，不保证识别所有不配套文件、合法整记录丢失或任意伪造边界。
 
 test_aof_replay 覆盖逐位置截断、固定错误尾部、文件保持和重复记录顺序；
 test_snapshot_store 覆盖逐位置截断及 CRC 正确但结构不合法的固定文件。
@@ -87,9 +68,9 @@ test_protocol 覆盖逐字节半包、粘包、NUL/CRLF、4096 字节精确限�
 ONLINE 后命令中间。四种进程场景：Primary/Replica 在 ONLINE 前和实时命令中途退出。
 闸门仅代理本轮 TCP 控制/增量，快照仍走真实 RDMA。
 暂停全量通知后先写四引擎 MOD/DEL/SET，形成确定的非空追赶。
-逐字节比较两端 AOF 后缀，检查只有完整命令应用；断线后拒绝数据读取。
+逐字节对照代理转发的 TCP 流，并对照 Replica 成功应用的字节区间；断线后拒绝数据读取。
 SIGKILL 先确认完整前缀已应用，再结束专属进程并释放代理。
-人工重启重新全量，验证新同步 ID、四引擎数据、快照字节及新 offset。
+人工重启重新全量，验证新同步 ID、四引擎数据、快照字节及新 offset。Primary 崩溃后从空内存重新开始。
 没有自动重连、断点续传、逐条增量 ACK 或端到端 exactly-once。
 Primary 发送游标不是 Replica 已应用确认。
 

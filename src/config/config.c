@@ -223,9 +223,7 @@ static int parse_field(
         return 0;
 
     case FIELD_PERSISTENCE_MODE:
-        if (strcmp(value, "legacy_hybrid") == 0) {
-            parsed->persistence_mode = KVS_PERSISTENCE_LEGACY_HYBRID;
-        } else if (strcmp(value, "snapshot") == 0) {
+        if (strcmp(value, "snapshot") == 0) {
             parsed->persistence_mode = KVS_PERSISTENCE_SNAPSHOT;
         } else if (strcmp(value, "aof") == 0) {
             parsed->persistence_mode = KVS_PERSISTENCE_AOF;
@@ -235,7 +233,7 @@ static int parse_field(
             return config_error(
                 error, error_capacity, path, line_number,
                 "unsupported persistence_mode '%s'; "
-                "expected legacy_hybrid, snapshot, aof or none",
+                "expected snapshot, aof or none",
                 value
             );
         }
@@ -463,13 +461,12 @@ static int validate_config(
         parsed->role == KVS_ROLE_REPLICA;
 
     if (is_replication_role &&
-        parsed->persistence_mode != KVS_PERSISTENCE_LEGACY_HYBRID &&
         parsed->persistence_mode != KVS_PERSISTENCE_NONE) {
         return config_error(
             error, error_capacity, path,
             field_lines[FIELD_PERSISTENCE_MODE],
-            "primary/replica currently support only "
-            "persistence_mode=legacy_hybrid or none"
+            "primary/replica support only "
+            "persistence_mode=none"
         );
     }
     if (parsed->role != KVS_ROLE_PRIMARY &&

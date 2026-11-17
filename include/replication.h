@@ -22,8 +22,7 @@ typedef struct {
 } kvs_replica_connection_t;
 
 typedef int (*kvs_snapshot_install_handler)(
-    const char *snapshot_path,
-    long long aof_offset
+    const char *snapshot_path
 );
 typedef int (*kvs_replication_command_handler)(
     const kvs_slice_t *fields,

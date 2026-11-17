@@ -5,9 +5,6 @@
 #include "server.h"
 #include "log.h"
 #include "rdma_transport.h"
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-#include "ebpf_capture.h"
-#endif
 #include <stdio.h>
 #include <sys/stat.h>
 #include <string.h>
@@ -20,8 +17,6 @@
 #define KVS_REPLICATION_ID_HEX_LENGTH 40 // 20 字节随机数转换成 40 个十六进制字符
 // Primary 为全量同步生成并发送的 Snapshot
 #define KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH "replication.snapshot.tmp"
-// Primary 在 Snapshot 之后从这个 AOF 文件读取增量命令
-#define KVS_REPLICATION_PRIMARY_AOF_PATH "appendonly.aof"
 // Replica 接收期间写入的临时文件，未收完整时不能使用
 #define KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH "snapshot.db.replication.tmp"
 /* Replica 主动 RDMA 建连的整体超时，包含地址、路由解析。 */
@@ -58,26 +53,11 @@ kvs_replication_rdma_sync_t rdma_sync;
     kvs_rdma_connection_t *rdma_cleanup_connection;
     unsigned short rdma_port;          // 本机 RDMA 监听端口
     unsigned short primary_rdma_port; // Replica 从同步通知中取得的 Primary RDMA 端口
-    long long replication_offset;  // 当前复制进度
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    /* length=0 表示没有待发事件；分段期间保留完整命令及已交出字节数。 */
-    struct kvs_ebpf_event pending_event;
-    size_t pending_event_sent;
-    struct {
-        unsigned long long payload_events;
-        unsigned long long payload_bytes;
-        unsigned long long duplicate_events;
-        unsigned long long compensation_ranges;
-        unsigned long long compensation_bytes;
-        struct kvs_ebpf_failures observed_failures;
-    } ebpf_stats;
-#endif
     uint64_t snapshot_stream_offset; // 本轮快照对应的复制流位置
     uint64_t send_stream_offset; // 下一段要交给 TCP 的缓存位置
     uint64_t applied_stream_offset; // Replica 已成功应用的完整命令边界
     long long snapshot_file_size; // 当前全量同步 Snapshot 文件的总字节数
     kvs_snapshot_reader_t snapshot_reader; // Primary 当前正在分块读取的复制快照
-    kvs_aof_reader_t aof_reader; // Primary 当前正在分块读取的增量 AOF
     kvs_snapshot_writer_t snapshot_writer;
     int snapshot_connection_fd; // Primary 当前向哪条 Replica 连接发送 Snapshot
     char replication_id[KVS_REPLICATION_ID_HEX_LENGTH + 1]; // Primary 当前数据历史的唯一标识
@@ -104,14 +84,9 @@ static kvs_replication_manager_t replication_manager = {
     },
     .rdma_cleanup_connection = NULL,
     .rdma_port = 0,
-    .replication_offset = 0,
     .snapshot_file_size = -1,
     .snapshot_reader = {
     .fd = -1,
-    .remaining = 0},
-    .aof_reader = {
-    .fd = -1,
-    .offset = 0,
     .remaining = 0},
     .snapshot_writer = {
     .fd = -1,
@@ -255,177 +230,6 @@ static int kvs_replication_remove_primary_snapshot(void)
     return -1;
 }
 
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-/* 仅在捕获模块发生错误时，通知外层显式改走原有 AOF ONLINE 分支。 */
-#define KVS_EBPF_AOF_FALLBACK (-3)
-#define KVS_EBPF_DRAIN_BUDGET 64
-
-static void kvs_replication_ebpf_reset(void)
-{
-    replication_manager.pending_event.length = 0;
-    replication_manager.pending_event_sent = 0;
-    memset(&replication_manager.ebpf_stats, 0,
-           sizeof(replication_manager.ebpf_stats));
-}
-
-static int kvs_replication_ebpf_fallback(int error)
-{
-    kvs_log_message(
-        KVS_LOG_ERROR,
-        "replication: eBPF consumer failed error=%d; ONLINE source=AOF\n",
-        error);
-    kvs_ebpf_stop();
-    replication_manager.pending_event.length = 0;
-    replication_manager.pending_event_sent = 0;
-    return KVS_EBPF_AOF_FALLBACK;
-}
-
-/* 缺口两端均为命令边界；保留手上的后续事件，先把缺口补完。 */
-static int kvs_replication_ebpf_replay(long long end, const char *reason)
-{
-    long long start = replication_manager.replication_offset;
-    if (kvs_aof_reader_open(&replication_manager.aof_reader,
-                           KVS_REPLICATION_PRIMARY_AOF_PATH, start, end) < 0) {
-        kvs_log_message(KVS_LOG_ERROR,
-                        "replication: AOF compensation open failed range=[%lld,%lld)\n",
-                        start, end);
-        return -1;
-    }
-    replication_manager.ebpf_stats.compensation_ranges++;
-    kvs_log_message(
-        KVS_LOG_INFO,
-        "replication: AOF compensation reason=%s range=[%lld,%lld) ranges=%llu\n",
-        reason, start, end,
-        replication_manager.ebpf_stats.compensation_ranges);
-    return 0;
-}
-
-/*
- * ONLINE 正常命令只从 eBPF 事件取 payload。
- * AOF 只用于已发现的缺口；读取尾部位置属于对账，不读取正常命令内容。
- * 当前 NtyCo 写入和本函数在同一线程，AOF 成功探针在写入返回前同步完成。
- */
-static int kvs_replication_ebpf_stream(char *output, int output_capacity)
-{
-    for (int attempt = 0; attempt < KVS_EBPF_DRAIN_BUDGET; attempt++) {
-        if (replication_manager.aof_reader.fd >= 0) {
-            int bytes = kvs_aof_reader_read(&replication_manager.aof_reader,
-                                            output, output_capacity);
-            if (bytes < 0)
-                return -1;
-            if (bytes > 0) {
-                replication_manager.ebpf_stats.compensation_bytes += bytes;
-                /* 最后一块交给网络层时立即提交该补偿区间的边界。 */
-                if (replication_manager.aof_reader.remaining == 0) {
-                    replication_manager.replication_offset =
-                        replication_manager.aof_reader.offset;
-                    kvs_aof_reader_close(&replication_manager.aof_reader);
-                }
-                return bytes;
-            }
-            replication_manager.replication_offset =
-                replication_manager.aof_reader.offset;
-            kvs_aof_reader_close(&replication_manager.aof_reader);
-        }
-
-        struct kvs_ebpf_event *event = &replication_manager.pending_event;
-        if (event->length == 0) {
-            /*
-             * 先取已提交尾部，再消费队列。即使最后一条丢失、没有后续事件，
-             * 读空后仍可用这个边界识别尾部缺口。
-             */
-            long long committed_end = kvs_aof_get_offset();
-            if (committed_end < replication_manager.replication_offset)
-                return -1;
-
-            int received = kvs_ebpf_read(event);
-            if (received < 0)
-                return kvs_replication_ebpf_fallback(received);
-            if (received == 0) {
-                struct kvs_ebpf_failures failures;
-                int status = kvs_ebpf_get_failures(&failures);
-                if (status < 0)
-                    return kvs_replication_ebpf_fallback(status);
-                if (memcmp(&failures,
-                           &replication_manager.ebpf_stats.observed_failures,
-                           sizeof(failures)) != 0) {
-                    kvs_log_message(
-                        KVS_LOG_ERROR,
-                        "replication: eBPF losses oversize=%llu ring_full=%llu read_error=%llu\n",
-                        (unsigned long long)failures.oversize,
-                        (unsigned long long)failures.ring_full,
-                        (unsigned long long)failures.read_error);
-                    replication_manager.ebpf_stats.observed_failures = failures;
-                }
-                if (committed_end > replication_manager.replication_offset) {
-                    if (kvs_replication_ebpf_replay(
-                            committed_end, "queue_empty_gap") < 0)
-                        return -1;
-                    continue;
-                }
-                return KVS_STREAM_WAIT;
-            }
-            replication_manager.pending_event_sent = 0;
-            if (event->end > (unsigned long long)committed_end)
-                return -1;
-        }
-
-        if (replication_manager.pending_event_sent == 0) {
-            unsigned long long expected =
-                (unsigned long long)replication_manager.replication_offset;
-            if (event->end <= expected) {
-                /* 追赶期已通过 AOF 覆盖的事件，或补偿后到达的旧事件。 */
-                replication_manager.ebpf_stats.duplicate_events++;
-                event->length = 0;
-                continue;
-            }
-            if (event->start < expected) {
-                kvs_log_message(
-                    KVS_LOG_ERROR,
-                    "replication: overlapping eBPF event range=[%llu,%llu) expected=%llu\n",
-                    (unsigned long long)event->start,
-                    (unsigned long long)event->end, expected);
-                return -1;
-            }
-            if (event->start > expected) {
-                if (kvs_replication_ebpf_replay(
-                        (long long)event->start, "event_offset_gap") < 0)
-                    return -1;
-                continue;
-            }
-        }
-
-        /* 一条大命令可以分多轮填 output；整条交出后才推进命令边界。 */
-        size_t remaining = event->length - replication_manager.pending_event_sent;
-        size_t bytes = remaining;
-        if (bytes > (size_t)output_capacity)
-            bytes = (size_t)output_capacity;
-        memcpy(output, event->payload + replication_manager.pending_event_sent, bytes);
-        replication_manager.pending_event_sent += bytes;
-        kvs_log_message(KVS_LOG_DEBUG,
-                        "replication: eBPF chunk bytes=%zu progress=%zu/%u\n",
-                        bytes, replication_manager.pending_event_sent, event->length);
-
-        if (replication_manager.pending_event_sent == event->length) {
-            replication_manager.replication_offset = (long long)event->end;
-            replication_manager.ebpf_stats.payload_events++;
-            replication_manager.ebpf_stats.payload_bytes += event->length;
-            kvs_log_message(
-                KVS_LOG_DEBUG,
-                "replication: eBPF payload range=[%llu,%llu) bytes=%u events=%llu total_bytes=%llu\n",
-                (unsigned long long)event->start,
-                (unsigned long long)event->end, event->length,
-                replication_manager.ebpf_stats.payload_events,
-                replication_manager.ebpf_stats.payload_bytes);
-            event->length = 0;
-            replication_manager.pending_event_sent = 0;
-        }
-        return (int)bytes;
-    }
-    /* 限制每轮清理旧事件的工作量，让出 CPU 给客户端及其他协程。 */
-    return KVS_STREAM_WAIT;
-}
-#endif
 
 /* 释放本轮 RDMA 连接，并重置本轮进度。 */
 static int kvs_replication_rdma_sync_close(
@@ -585,7 +389,6 @@ static int kvs_replication_upstream_frame_protocol(
             KVS_REPLICATION_ID_HEX_LENGTH + 1
         ] = {0};
 
-        long long primary_offset = -1;
         char stream_offset_text[21] = {0};
         uint64_t stream_offset;
         long long primary_snapshot_file_size = -1;
@@ -595,20 +398,18 @@ static int kvs_replication_upstream_frame_protocol(
         /* 只接受包含 RDMA 端口和本轮同步 ID 的全量通知。 */
         int matched = sscanf(
             frame,
-            "FULLRESYNC_RDMA %40[0-9a-f] %lld %lld %5u %40[0-9a-f] %20[0-9]%n",
+            "FULLRESYNC_RDMA %40[0-9a-f] %lld %5u %40[0-9a-f] %20[0-9]%n",
             primary_replication_id,
-            &primary_offset,
             &primary_snapshot_file_size,
             &primary_rdma_port,
             full_sync_id,
             stream_offset_text,
             &parsed_length);
 
-        if (matched != 6 ||
+        if (matched != 5 ||
             parsed_length != frame_length ||
             strlen(primary_replication_id) != KVS_REPLICATION_ID_HEX_LENGTH ||
             strlen(full_sync_id) != KVS_REPLICATION_ID_HEX_LENGTH ||
-            primary_offset < 0 ||
             primary_snapshot_file_size <= 0 ||
             primary_rdma_port == 0 ||
             primary_rdma_port > 65535 ||
@@ -640,7 +441,6 @@ static int kvs_replication_upstream_frame_protocol(
         replication_manager.full_sync_id,
         full_sync_id,
         sizeof(full_sync_id));
-        replication_manager.replication_offset=primary_offset;
         replication_manager.snapshot_stream_offset = stream_offset;
         replication_manager.snapshot_file_size =primary_snapshot_file_size;
         /* 根据 TCP 通知中的端口，异步发起 RDMA 连接。 */
@@ -660,9 +460,9 @@ static int kvs_replication_upstream_frame_protocol(
         replication_manager.state=KVS_REPLICATION_STATE_FULL_SYNC;
 kvs_log_message(
     KVS_LOG_INFO,
-    "replication: enter FULL_SYNC id=%s offset=%lld snapshot_size=%lld fd=%d\n",
+    "replication: enter FULL_SYNC id=%s offset=%" PRIu64 " snapshot_size=%lld fd=%d\n",
     replication_manager.replication_id,
-    replication_manager.replication_offset,
+    replication_manager.snapshot_stream_offset,
     replication_manager.snapshot_file_size,
     connection_fd
 );
@@ -671,7 +471,7 @@ kvs_log_message(
     return -1; // 握手阶段收到未知的 Primary 响应
 }
 /*
- * 处理 Primary 发来的单条增量 AOF 命令。
+ * 处理 Primary 发来的单条增量命令。
  *
  * 命令交给 kvstore 模块执行；执行成功后返回 0，
  * 表示消费命令但不向 Primary 发送响应。
@@ -737,7 +537,7 @@ static int kvs_replication_catch_up_command_protocol(
         return -1;
     }
 
-    /* 执行字段；成功的写命令会由 kvstore 追加到 Replica 本地 AOF。 */
+    /* 执行字段。 */
     int response_length = replication_manager.command_handler(
         fields,
         field_count,
@@ -750,7 +550,11 @@ static int kvs_replication_catch_up_command_protocol(
         return -1;
     }
 
+    uint64_t start = replication_manager.applied_stream_offset;
     replication_manager.applied_stream_offset += parsed_bytes;
+    kvs_log_message(KVS_LOG_DEBUG,
+                    "replication: applied range=[%" PRIu64 ",%" PRIu64 ")\n",
+                    start, replication_manager.applied_stream_offset);
     return 0;
 }
 
@@ -800,8 +604,7 @@ static int kvs_replication_finish_full_sync(int connection_fd)
     if (kvs_snapshot_writer_finish(&replication_manager.snapshot_writer) < 0 ||
         replication_manager.snapshot_install_handler == NULL ||
         replication_manager.snapshot_install_handler(
-            KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH,
-            replication_manager.replication_offset) < 0) {
+            KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH) < 0) {
         kvs_snapshot_writer_abort(
             &replication_manager.snapshot_writer,
             KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH);
@@ -822,8 +625,8 @@ static int kvs_replication_finish_full_sync(int connection_fd)
     kvs_log_message(
         KVS_LOG_INFO,
         "replication: Snapshot installed, enter CATCH_UP "
-        "offset=%lld size=%lld fd=%d\n",
-        replication_manager.replication_offset,
+        "offset=%" PRIu64 " size=%lld fd=%d\n",
+        replication_manager.snapshot_stream_offset,
         replication_manager.snapshot_file_size,
         connection_fd);
 
@@ -902,7 +705,7 @@ static int kvs_replication_upstream_network_protocol(
 if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
     replication_manager.state == KVS_REPLICATION_STATE_ONLINE) {
 
-    /* AOF 增量命令以 * 开头，按长度字段解析。 */
+    /* 增量命令以 * 开头，按长度字段解析。 */
     if (msg[0] == '*') {
         kvs_slice_t fields[3];
         size_t field_count = 0;
@@ -922,10 +725,10 @@ if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
             return 0;
         }
         if (parse_result < 0) {
-            return -1; /* AOF 中出现格式错误。 */
+            return -1; /* 增量流中出现格式错误。 */
         }
 
-        /* 完整命令交给字段回调执行，并追加到 Replica 本地 AOF。 */
+        /* 完整命令交给字段回调执行。 */
         if (kvs_replication_catch_up_command_protocol(
                 connection_fd,
                 fields,
@@ -1377,15 +1180,6 @@ static int kvs_replication_primary_cache_stream(
         return KVS_STREAM_WAIT;
     }
 
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    /* 旧探针仍按 AOF 字节区间过滤追赶期事件。 */
-    long long aof_end = kvs_aof_get_offset();
-    if (aof_end < 0) {
-        return -1;
-    }
-    replication_manager.replication_offset = aof_end;
-    kvs_replication_cache_clear();
-#endif
 
     int length = snprintf(output, output_capacity, "ONLINE %" PRIu64 "\r\n", offset);
     if (length < 0 || length >= output_capacity) {
@@ -1464,14 +1258,6 @@ int kvs_replication_stream(
        replication_manager.snapshot_connection_fd){
         return 0; // 当前 Snapshot 不属于这条连接
     }
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    if (replication_manager.state == KVS_REPLICATION_STATE_ONLINE &&
-        kvs_ebpf_is_ready()) {
-        int ebpf_result = kvs_replication_ebpf_stream(output, output_capacity);
-        if (ebpf_result != KVS_EBPF_AOF_FALLBACK)
-            return ebpf_result;
-    }
-#endif
         /* RDMA 全量同步：推进建连、分块发送和确认，不从 TCP 输出快照。 */
         if (replication_manager.state == KVS_REPLICATION_STATE_FULL_SYNC) {
             if (replication_manager.rdma_cleanup_connection != NULL) {
@@ -1674,48 +1460,7 @@ int kvs_replication_stream(
         replication_manager.state != KVS_REPLICATION_STATE_ONLINE) {
         return 0;
     }
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP) {
-#endif
-        return kvs_replication_primary_cache_stream(connection_fd, output, output_capacity);
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    }
-
-    /* 仅旧 eBPF ONLINE 的降级路径继续读取 AOF。 */
-    kvs_aof_reader_t *reader = &replication_manager.aof_reader;
-    if (reader->fd >= 0) {
-        int bytes = kvs_aof_reader_read(reader, output, output_capacity);
-        if (bytes > 0) {
-            return bytes;
-        }
-        if (bytes == 0) {
-            replication_manager.replication_offset = reader->offset;
-        }
-        kvs_aof_reader_close(reader);
-        if (bytes < 0) {
-            return -1;
-        }
-    }
-
-    long long latest_offset = kvs_aof_get_offset();
-    if (latest_offset < replication_manager.replication_offset) {
-        return -1;
-    }
-    if (latest_offset == replication_manager.replication_offset) {
-        return KVS_STREAM_WAIT;
-    }
-    if (kvs_aof_reader_open(reader, KVS_REPLICATION_PRIMARY_AOF_PATH,
-                            replication_manager.replication_offset, latest_offset) < 0) {
-        return -1;
-    }
-
-    int bytes = kvs_aof_reader_read(reader, output, output_capacity);
-    if (bytes <= 0) {
-        kvs_aof_reader_close(reader);
-        return -1;
-    }
-    return bytes;
-#endif
+    return kvs_replication_primary_cache_stream(connection_fd, output, output_capacity);
 }
 
 static int kvs_replication_frame_protocol(
@@ -1761,17 +1506,6 @@ static int kvs_replication_frame_protocol(
             return -1;
         }
 
-        /* 未打开 AOF 时复用无检查点快照格式，旧握手字段发送 0。 */
-        long long aof_offset = kvs_aof_get_offset();
-        kvs_snapshot_metadata_t snapshot_metadata = {
-            .aof_offset = aof_offset < 0 ? 0 : aof_offset,
-            .file_size = -1
-        };
-        kvs_snapshot_checkpoint_t checkpoint = {
-            .has_offset = aof_offset >= 0,
-            .offset = snapshot_metadata.aof_offset
-        };
-
         /* 快照生成和写入命令在同一调度线程执行，保存前取值固定本轮边界。 */
         uint64_t snapshot_stream_offset = replication_stream_end;
         if (capture_address.sun_path[0] != '\0' &&
@@ -1781,9 +1515,7 @@ static int kvs_replication_frame_protocol(
             goto snapshot_setup_failed;
         }
 
-        if (kvs_snapshot_store_save_with_checkpoint(
-                KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH,
-                checkpoint.has_offset ? &checkpoint : NULL) < 0) {
+        if (kvs_snapshot_store_save(KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH) < 0) {
             goto snapshot_setup_failed;
         }
 
@@ -1795,14 +1527,12 @@ static int kvs_replication_frame_protocol(
             goto snapshot_setup_failed;
         }
 
-        snapshot_metadata.file_size =
-            (long long)snapshot_stat.st_size;
+        long long snapshot_file_size = (long long)snapshot_stat.st_size;
 
-        kvs_aof_reader_close(&replication_manager.aof_reader);
         if(kvs_snapshot_reader_open(
                 &replication_manager.snapshot_reader,
                 KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH,
-                snapshot_metadata.file_size) < 0){
+                snapshot_file_size) < 0){
             goto snapshot_setup_failed;
         }
         /* 每轮全量同步生成独立 ID，用于匹配控制连接和 RDMA 连接。 */
@@ -1813,8 +1543,7 @@ static int kvs_replication_frame_protocol(
         }
 
 
-        replication_manager.replication_offset =snapshot_metadata.aof_offset;
-        replication_manager.snapshot_file_size =snapshot_metadata.file_size;
+        replication_manager.snapshot_file_size =snapshot_file_size;
         replication_manager.snapshot_stream_offset = snapshot_stream_offset;
         if (capture_fd < 0) {
             /* 普通 socket 模式由 Primary 持有缓存。 */
@@ -1832,9 +1561,8 @@ static int kvs_replication_frame_protocol(
         response_length = snprintf(
             response,
             response_capacity,
-            "FULLRESYNC_RDMA %s %lld %lld %u %s %" PRIu64 "\r\n",
+            "FULLRESYNC_RDMA %s %lld %u %s %" PRIu64 "\r\n",
             replication_manager.replication_id,
-            replication_manager.replication_offset,
             replication_manager.snapshot_file_size,
             (unsigned int)replication_manager.rdma_port,
             replication_manager.full_sync_id,
@@ -1859,9 +1587,9 @@ static int kvs_replication_frame_protocol(
    if(is_full_resync_response){
         kvs_log_message(
             KVS_LOG_DEBUG,
-            "replication: FULLRESYNC_RDMA response ready id=%s offset=%lld snapshot_size=%lld fd=%d\n",
+            "replication: FULLRESYNC_RDMA response ready id=%s offset=%" PRIu64 " snapshot_size=%lld fd=%d\n",
             replication_manager.replication_id,
-            replication_manager.replication_offset,
+            replication_manager.snapshot_stream_offset,
             replication_manager.snapshot_file_size,
             connection_fd
         );
@@ -1991,11 +1719,7 @@ int kvs_replication_init(
 }
 
 
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    kvs_replication_ebpf_reset();
-#endif
     replication_manager.role = role;
-    replication_manager.replication_offset = 0;
     replication_manager.snapshot_install_handler =snapshot_install_handler;
     replication_manager.command_handler = command_handler;
     replication_manager.snapshot_stream_offset = 0;
@@ -2003,9 +1727,6 @@ int kvs_replication_init(
     replication_manager.snapshot_connection_fd = -1; // 初始化时没有 Snapshot 接收连接
     replication_manager.snapshot_reader.fd = -1;       // 当前没有打开复制快照
     replication_manager.snapshot_reader.remaining = 0; // 当前没有待发送字节
-    replication_manager.aof_reader.fd = -1;        // 当前没有打开增量 AOF
-    replication_manager.aof_reader.offset = 0;     // 当前没有增量读取位置
-    replication_manager.aof_reader.remaining = 0;  // 当前没有待发送的增量字节
     if(role == KVS_ROLE_PRIMARY){
     memcpy(
         replication_manager.replication_id,
@@ -2044,18 +1765,6 @@ void kvs_replication_on_replica_disconnected(int connection_fd)
         return;
     }
 
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    kvs_log_message(
-        KVS_LOG_INFO,
-        "replication: eBPF summary payload_events=%llu payload_bytes=%llu "
-        "compensation_ranges=%llu compensation_bytes=%llu duplicates=%llu\n",
-        replication_manager.ebpf_stats.payload_events,
-        replication_manager.ebpf_stats.payload_bytes,
-        replication_manager.ebpf_stats.compensation_ranges,
-        replication_manager.ebpf_stats.compensation_bytes,
-        replication_manager.ebpf_stats.duplicate_events);
-    kvs_replication_ebpf_reset();
-#endif
     /* Replica 控制连接断开，取消对应的 RDMA 全量同步。 */
     if (kvs_replication_rdma_sync_close(
             &replication_manager.rdma_sync) < 0) {
@@ -2069,7 +1778,6 @@ replication_manager.full_sync_id[0] = '\0';
     kvs_replication_remove_primary_snapshot();
     kvs_replication_cache_clear();
     kvs_replication_capture_close();
-    kvs_aof_reader_close(&replication_manager.aof_reader);
 
     replication_manager.snapshot_connection_fd = -1;
     replication_manager.snapshot_stream_offset = 0;
@@ -2126,9 +1834,7 @@ void kvs_replication_destroy(void)
     }
     replication_manager.rdma_port = 0;
     replication_manager.role = KVS_ROLE_STANDALONE;           // 恢复安全默认角色
-    replication_manager.replication_offset = 0;
     kvs_snapshot_reader_close(&replication_manager.snapshot_reader); // 如果正在发送 Snapshot，关闭对应文件
-    kvs_aof_reader_close(&replication_manager.aof_reader); // 如果正在发送增量 AOF，关闭对应文件
     kvs_snapshot_writer_abort(&replication_manager.snapshot_writer,KVS_REPLICATION_REPLICA_SNAPSHOT_TEMP_PATH);
     replication_manager.snapshot_connection_fd = -1; // 销毁时解除 Snapshot 与连接的绑定
     replication_manager.snapshot_stream_offset = 0;
@@ -2138,9 +1844,6 @@ void kvs_replication_destroy(void)
     replication_manager.primary_port = 0;
     replication_manager.primary_connection_fd = -1;           // 当前不存在上游连接
     replication_manager.state = KVS_REPLICATION_STATE_DISCONNECTED;
-#ifdef KVS_EBPF_STARTUP_EXPERIMENT
-    kvs_replication_ebpf_reset();
-#endif
     replication_manager.initialized = 0;
 }
 

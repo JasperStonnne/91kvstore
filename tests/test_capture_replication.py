@@ -27,7 +27,6 @@ class Fixture(rdma.Fixture):
         self.capture_socket = root / "capture.sock"
 
     def launch(self, directory, config):
-        config = config.replace("persistence_mode=legacy_hybrid", "persistence_mode=none")
         if directory.name == "primary":
             config += f"replication_incremental_mode={self.mode}\n"
             if self.mode == "ebpf":

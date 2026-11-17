@@ -10,9 +10,6 @@ struct kvs_ebpf_failures {
     __u64 read_error;
 };
 
-/* 加载 BPF 对象、准备队列读取，并附着到当前 Primary。 */
-int kvs_ebpf_start(const char *object_path);
-
 /* 独立进程附着到指定 Primary 的复制提交点。 */
 int kvs_ebpf_start_replication(const char *object_path, pid_t primary_pid);
 

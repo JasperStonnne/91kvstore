@@ -39,10 +39,9 @@ struct kvs_rdma_connection {
 };
 static struct kvs_rdma_connection transport;
 
-/* 安装回调仅核对传给加载层的文件和边界 O，不模拟引擎数据结构。 */
-static int verify_snapshot(const char *path, long long aof_offset)
+/* 安装回调核对传给加载层的临时文件，不模拟引擎数据结构。 */
+static int verify_snapshot(const char *path)
 {
-    assert(aof_offset == 0);
     char actual[sizeof(snapshot)];
     FILE *file = fopen(path, "rb");
     assert(file != NULL);
@@ -198,7 +197,6 @@ int kvs_rdma_listener_close(kvs_rdma_listener_t **listener)
 static kvs_connector_config_t setup(void)
 {
     installed = applied = starts = 0;
-    assert(kvs_aof_open("appendonly.aof") == 0);
     assert(kvs_replication_init(KVS_ROLE_REPLICA, "127.0.0.1", 29000,
                                 verify_snapshot, apply_command) == 0);
     kvs_connector_config_t connector = {0};
@@ -219,8 +217,6 @@ static int feed(kvs_connector_config_t *connector, char *input, int length,
 static void teardown(void)
 {
     kvs_replication_destroy();
-    assert(kvs_aof_close() == 0);
-    assert(unlink("appendonly.aof") == 0);
     if (unlink("snapshot.db") < 0) assert(errno == ENOENT);
     assert(access("snapshot.db.replication.tmp", F_OK) < 0 && errno == ENOENT);
 }
@@ -236,12 +232,12 @@ static void test_session(int reordered, int disconnect_early, int oversize)
     int consumed = 0;
 
     /* 旧 TCP 全量通知必须被拒绝，且不能创建 RDMA 连接。 */
-    strcpy(input, "FULLRESYNC 0123456789abcdef0123456789abcdef01234567 0 21\r\n");
+    strcpy(input, "FULLRESYNC 0123456789abcdef0123456789abcdef01234567 21\r\n");
     assert(feed(&connector, input, (int)strlen(input), &consumed) < 0);
     assert(starts == 0);
 
     int header_length = snprintf(input, sizeof(input),
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 %zu 29747 %s 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112\r\n",
         sizeof(snapshot) - 1, sync_id);
     assert(header_length > 0);
     memcpy(input + header_length, command, sizeof(command) - 1);
@@ -305,13 +301,14 @@ static void test_control_boundaries(void)
 {
     recv_before_send = early_disconnect = partial_disconnect = oversized_chunk = 0;
     static const char *headers[] = {
-        "FULLRESYNC_RDMA short 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 -1 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 0 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 0 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 65536 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 short 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 extra\r\n"
+        "FULLRESYNC_RDMA short 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 -1 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 0 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 65536 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 short 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 extra\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n"
     };
     for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
         kvs_connector_config_t connector = setup();
@@ -331,7 +328,7 @@ static void test_control_boundaries(void)
         char input[256], output[256];
         int consumed = 0;
         int length = snprintf(input, sizeof(input),
-            "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 %zu 29747 %s 112\r\n",
+            "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112\r\n",
             sizeof(snapshot) - 1, sync_id);
         for (int prefix = 1; prefix < length; prefix++) {
             assert(feed(&connector, input, prefix, &consumed) == 0);

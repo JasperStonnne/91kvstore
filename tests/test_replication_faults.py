@@ -2,7 +2,6 @@
 """真实 SIW 全量后的 TCP 追赶/ONLINE 断线；不加载 BPF、不修改系统网络。"""
 import argparse
 import json
-import os
 import re
 import signal
 import subprocess
@@ -93,7 +92,7 @@ def mutate(writer, value, added):
     return commands
 
 
-def check_dataset(client, online_changes):
+def check_dataset(client, online_changes, empty=False):
     checked = []
     for prefix in PREFIXES:
         pairs = [("base", b"live" if online_changes and prefix == "" else b"catchup"),
@@ -103,6 +102,8 @@ def check_dataset(client, online_changes):
             pairs[2] = ("during", None)
             pairs[3] = ("live_added", b"live")
         for key, expected in pairs:
+            if empty:
+                expected = None
             actual = client.command(prefix + "GET", key)
             rdma.require(actual == expected, f"dataset differs: {prefix} {key}: {actual!r}")
             checked.append([prefix or "Array", key,
@@ -173,11 +174,9 @@ def case(fixture, mode):
         rdma.require(gate.header_ready.wait(10), "Snapshot header not received")
         gate.check()
         old_id = gate.full_sync_id
-        start = gate.metadata[0]
+        start = gate.stream_offset
         commands = mutate(writer, "catchup", "during")
         catchup = b"".join(commands)
-        source_aof = fixture.root / "primary/appendonly.aof"
-        rdma.require(source_aof.read_bytes()[start:] == catchup, "Primary catch-up bytes differ")
         fence = gate.stream_offset + len(catchup)
         live = [rdma.frame("MOD", "base", "live"), rdma.frame("DEL", "during"),
                 rdma.frame("SET", "live_added", "live")]
@@ -194,12 +193,28 @@ def case(fixture, mode):
         gate.check()
         trace("byte-boundary-reached")
         wire = bytes(gate.wire)
-        expected_suffix = commands[0] if mode == "partial-catchup" else catchup
+        expected_wire = catchup + gate.online + b"".join(live)
+        if mode == "wrong-online-offset":
+            expected_wire = catchup + f"ONLINE {fence + 1}\r\n".encode()
+        else:
+            expected_wire = expected_wire[:gate.limit]
+        rdma.require(wire == expected_wire, "forwarded bytes differ from expected stream")
+
+        applied = commands[:1] if mode == "partial-catchup" else commands[:]
         if online_case:
-            expected_suffix += live[0]
-        replica_aof = fixture.root / "replica/appendonly.aof"
+            applied.append(live[0])
+        ranges = []
+        offset = start
+        for command in applied:
+            ranges.append((offset, offset + len(command)))
+            offset += len(command)
+
+        def applied_ranges(log):
+            return [(int(first), int(last)) for first, last in re.findall(
+                r"applied range=\[(\d+),(\d+)\)", log)]
+
         if primary_crash or replica_crash:
-            fixture.wait(lambda: replica_aof.read_bytes()[start:] == expected_suffix,
+            fixture.wait(lambda: applied_ranges(replica_log.read_text(errors="replace")) == ranges,
                          "Replica did not reach chosen applied-command boundary", timeout=10)
             victim = primary if primary_crash else replica
             victim.kill()
@@ -222,22 +237,8 @@ def case(fixture, mode):
             rdma.require("enter ONLINE" not in before_log, "false ONLINE before fence")
         else:
             rdma.require(f"enter ONLINE offset={fence}" in before_log, "missing real ONLINE fence")
-        rdma.require(replica_aof.read_bytes()[start:] == expected_suffix,
+        rdma.require(applied_ranges(before_log) == ranges,
                      "Replica applied a partial command, duplicate, or unexpected suffix")
-        expected_source = catchup + (b"".join(live) if online_case else b"")
-        rdma.require(source_aof.read_bytes()[start:] == expected_source, "Primary stream differs")
-        if getattr(fixture, "require_ebpf", False):
-            source_log = (fixture.root / "primary/server.log").read_text(errors="replace")
-            rdma.require("startup attach successful" in source_log and
-                         "ONLINE source=eBPF" in source_log,
-                         "real BPF capture did not attach")
-            rdma.require("ONLINE source=AOF" not in source_log,
-                         "AOF fallback cannot count as real eBPF acceptance")
-            if online_case:
-                rdma.require("eBPF payload range=" in source_log,
-                             "no real eBPF payload observed in ONLINE case")
-            result["real_ebpf_capture_verified"] = True
-
         if replica_crash:
             with socket.socket() as probe:
                 probe.settimeout(0.3)
@@ -255,8 +256,7 @@ def case(fixture, mode):
             reader.close()
             reader = None
         result.update(snapshot_offset=start, online_fence=fence,
-                      expected_replica_offset=start + len(expected_suffix),
-                      applied_suffix_hex=expected_suffix.hex(),
+                      expected_replica_offset=offset, applied_ranges=ranges,
                       wire_hex=wire.hex(), disconnected_read_reply=refusal)
 
         if not replica_crash:
@@ -272,9 +272,6 @@ def case(fixture, mode):
             primary = fixture.start("primary")
             trace("primary-restarted")
             writer = rdma.Client(fixture.primary_port)
-            result["primary_recovered_dataset"] = check_dataset(writer, online_case)
-            rdma.require(source_aof.read_bytes()[start:] == expected_source,
-                         "Primary crash recovery changed acknowledged stream")
         else:
             fixture.wait(lambda: "Replica control connection released" in
                          primary_log.read_text(errors="replace"),
@@ -294,17 +291,18 @@ def case(fixture, mode):
         expect_online(fixture)
         trace("fresh-full-sync-online")
         reader = rdma.Client(fixture.replica_port)
-        result["recovered_dataset"] = check_dataset(reader, online_case)
+        result["recovered_dataset"] = check_dataset(reader, online_case, empty=primary_crash)
         reader.close()
         reader = None
         rdma.assert_rdma_snapshot(fixture)
         rdma.require(not (fixture.root / "replica/snapshot.db").exists(),
                      "fresh full sync created a local persistence Snapshot")
-        new_offset = fresh.metadata[0]
-        rdma.require(replica_aof.stat().st_size == new_offset, "fresh offset not aligned")
-        rdma.require(source_aof.read_bytes()[new_offset:] == replica_aof.read_bytes()[new_offset:],
-                     "fresh full-sync suffix differs")
-        result.update(fresh_full_sync_offset=new_offset, checks_complete=True)
+        expected_start = 0 if primary_crash else fence + (sum(map(len, live)) if online_case else 0)
+        rdma.require(fresh.stream_offset == expected_start, "fresh snapshot boundary differs")
+        for role in ("primary", "replica"):
+            rdma.require(not (fixture.root / role / "appendonly.aof").exists(),
+                         "pure-memory replication wrote AOF")
+        result.update(fresh_full_sync_offset=fresh.stream_offset, checks_complete=True)
     finally:
         try:
             result["before_cleanup"] = capture_owned_state(fixture, gate, result)
@@ -328,7 +326,7 @@ def case(fixture, mode):
         result["passed"] = result["checks_complete"] and result["owned_processes_stopped"] and ports_released
         (fixture.root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     rdma.require(result["passed"], f"failed case: {result}")
-    print(f"[PASS] {mode}: exact AOF, unavailable/stale-read rejection, fresh full sync", flush=True)
+    print(f"[PASS] {mode}: exact TCP bytes and applied ranges, unavailable/stale-read rejection, fresh full sync", flush=True)
     return result
 
 
@@ -336,8 +334,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path)
     parser.add_argument("--binary", type=Path)
-    parser.add_argument("--require-ebpf", action="store_true",
-                        help="require real attach and real ONLINE payload; needs BPF privilege")
     parser.add_argument("--case", choices=("all",) + MODES, default="all")
     args = parser.parse_args()
     repo = args.repo.resolve()
@@ -352,13 +348,8 @@ def main():
         for mode in MODES if args.case == "all" else (args.case,):
             directory = root / mode
             directory.mkdir()
-            class Fixture(rdma.Fixture):
-                def launch(self, directory, config):
-                    if args.require_ebpf:
-                        config = config.replace("log_level=info", "log_level=debug")
-                    return super().launch(directory, config)
-            fixture = Fixture(directory, binary)
-            fixture.require_ebpf = args.require_ebpf
+            fixture = rdma.Fixture(directory, binary)
+            fixture.log_level = "debug"
             try:
                 results.append(case(fixture, mode))
             finally:

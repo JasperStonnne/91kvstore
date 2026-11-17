@@ -29,7 +29,6 @@ static int failure_map_fd = -1;
 /* 只在同步读取期间借用调用方的目标记录，不保留队列内存指针。 */
 struct capture_read_context {
     struct kvs_ebpf_event *destination;
-    int legacy_aof;
 };
 static struct capture_read_context read_context;
 
@@ -54,7 +53,6 @@ static int receive_event(void *ctx, void *data, size_t size)
         return -EPROTONOSUPPORT;
     }
     if (source->length == 0 || source->length > sizeof(source->payload) ||
-        (context->legacy_aof && source->end > LLONG_MAX) ||
         source->end < source->start ||
         source->end - source->start != source->length)
         return -EPROTO;
@@ -123,7 +121,7 @@ void kvs_ebpf_stop(void)
 }
 
 static int kvs_ebpf_attach(const char *object_path, pid_t pid,
-                           const char *executable, const char *function, int legacy_aof)
+                           const char *executable)
 {
     if (capture_link != NULL)
         return 0;
@@ -160,7 +158,6 @@ static int kvs_ebpf_attach(const char *object_path, pid_t pid,
         error = failure_map_fd;
         goto failed;
     }
-    read_context.legacy_aof = legacy_aof;
     capture_queue = ring_buffer__new(map_fd, receive_event, &read_context, NULL);
     if (capture_queue == NULL) {
         error = -errno;
@@ -177,7 +174,7 @@ static int kvs_ebpf_attach(const char *object_path, pid_t pid,
 
     struct bpf_uprobe_opts options = {
         .sz = sizeof(options),
-        .func_name = function
+        .func_name = "kvs_replication_committed"
     };
     /* 4. 只挂指定进程；调用目标函数时由内核触发 BPF。 */
     capture_link = bpf_program__attach_uprobe_opts(
@@ -198,12 +195,6 @@ failed:
     return -1;
 }
 
-int kvs_ebpf_start(const char *object_path)
-{
-    return kvs_ebpf_attach(object_path, getpid(), "/proc/self/exe",
-                           "kvs_aof_committed", 1);
-}
-
 int kvs_ebpf_start_replication(const char *object_path, pid_t primary_pid)
 {
     if (primary_pid <= 0) {
@@ -218,6 +209,5 @@ int kvs_ebpf_start_replication(const char *object_path, pid_t primary_pid)
         errno = EINVAL;
         return -1;
     }
-    return kvs_ebpf_attach(object_path, primary_pid, executable,
-                           "kvs_replication_committed", 0);
+    return kvs_ebpf_attach(object_path, primary_pid, executable);
 }

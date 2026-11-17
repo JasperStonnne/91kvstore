@@ -2,7 +2,7 @@
 """Linux 上的真实 RDMA 全量同步验收（由 make test-rdma 调用）。
 
 Primary 与 Replica 在同一台机器的 iWARP 网卡地址上通信，不模拟 RDMA。
-TCP 仍负责握手、控制消息和 AOF 增量；快照内容必须通过 RDMA 发送。
+TCP 仍负责握手、控制消息和 复制增量；快照内容必须通过 RDMA 发送。
 自动寻找 ACTIVE iWARP 网卡；也可用 RDMA_TEST_IP 指定其 IPv4 地址。
 设备缺失或同步失败会明确报错，不回退到 TCP 全量或将跳过记为通过。
 """
@@ -144,7 +144,7 @@ class Fixture:
         config = (
             f"role={role}\nbind_ip={TEST_HOST}\nservice_port={port}\n"
             "allocator=pool\n"
-            f"log_level={self.log_level}\npersistence_mode=legacy_hybrid\n"
+            f"log_level={self.log_level}\npersistence_mode=none\n"
         )
         if role == "primary":
             config += f"rdma_port={self.rdma_port}\n"
@@ -241,7 +241,7 @@ class Fixture:
 
 
 class SnapshotGate:
-    """只代理 TCP 控制和 AOF，不接触 RDMA 快照数据。
+    """只代理 TCP 控制和复制增量，不接触 RDMA 快照数据。
 
     收到 FULLRESYNC_RDMA 时，Primary 已经生成快照并固定边界 O。
     暂停该通知，可确定性地在 O 之后写入增量，再放行真实 RDMA 全量。
@@ -263,7 +263,7 @@ class SnapshotGate:
         self.stopped = threading.Event()
         self.errors = []
         self.sockets = [self.listener]
-        self.metadata = None
+        self.snapshot_size = None
         self.forwarded_bytes = 0
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
@@ -297,20 +297,20 @@ class SnapshotGate:
             upstream.sendall(psync)
             header = self.line(upstream)
             parts = header.split()
-            require(len(parts) == 7 and parts[0] == b"FULLRESYNC_RDMA",
+            require(len(parts) == 6 and parts[0] == b"FULLRESYNC_RDMA",
                     f"expected RDMA full sync, got: {header!r}")
             require(re.fullmatch(rb"[0-9a-f]{40}", parts[1]) is not None and
-                    re.fullmatch(rb"[0-9a-f]{40}", parts[5]) is not None,
+                    re.fullmatch(rb"[0-9a-f]{40}", parts[4]) is not None,
                     f"invalid replication/full-sync ID: {header!r}")
-            require(0 < int(parts[4]) <= 65535, "invalid RDMA port")
-            self.full_sync_id = parts[5]
-            self.metadata = (int(parts[2]), int(parts[3]))
-            self.stream_offset = int(parts[6])
+            require(0 < int(parts[3]) <= 65535, "invalid RDMA port")
+            self.full_sync_id = parts[4]
+            self.snapshot_size = int(parts[2])
+            self.stream_offset = int(parts[5])
             if self.advertised_rdma_port is not None:
-                parts[4] = str(self.advertised_rdma_port).encode()
+                parts[3] = str(self.advertised_rdma_port).encode()
                 header = b" ".join(parts) + b"\r\n"
-            require(self.metadata[0] >= 0 and self.metadata[1] > 0,
-                    "invalid Snapshot offset or size")
+            require(self.snapshot_size > 0,
+                    "invalid Snapshot size")
             # 必须先暂停通知；若先发通知，Replica 会绕过 TCP 代理开始 RDMA。
             self.header_ready.set()
             require(self.release.wait(timeout=30), "Snapshot gate was never released")
@@ -323,7 +323,7 @@ class SnapshotGate:
                     continue
                 if not data:
                     break
-                # 只统计全量通知之后的 TCP 字节，稍后校验恰好是 AOF + ONLINE。
+                # 只统计全量通知之后的 TCP 字节，稍后校验恰好是 增量 + ONLINE。
                 self.forward(data, downstream)
         except Exception as exc:
             if not self.stopped.is_set():
@@ -493,14 +493,14 @@ def empty_case(fixture):
 
 
 def catchup_case(fixture):
-    """固定 O → 暂停通知 → 写入增量 → RDMA 全量 → TCP AOF 追赶。"""
+    """固定 O → 暂停通知 → 写入增量 → RDMA 全量 → TCP 增量追赶。"""
     primary = fixture.start("primary")
     fixture.assert_listener(primary)
     writer = Client(fixture.primary_port)
     gate = None
     try:
         # 32 MiB 必须跨多个 RDMA 块，最后一块不足 1 MiB。
-        # 写入后的 17 条变更必须从快照边界 O 进入 AOF 追赶。
+        # 写入后的 17 条变更必须从快照边界 O 进入增量追赶。
         payload = b"v" * (64 * 1024)
         for first in range(0, 512, 8):
             writer.sock.sendall(b"".join(
@@ -514,8 +514,8 @@ def catchup_case(fixture):
         fixture.start("replica", gate.port)
         require(gate.header_ready.wait(timeout=30), "FULLRESYNC_RDMA header not received")
         gate.check()
-        require(gate.metadata is not None, "missing Snapshot metadata")
-        _, snapshot_size = gate.metadata
+        require(gate.snapshot_size is not None, "missing Snapshot metadata")
+        snapshot_size = gate.snapshot_size
         require(snapshot_size >= len(payload) * 512, "Snapshot fixture is unexpectedly small")
         # 暂停的是 RDMA 启动通知，此时 Replica 尚未开始接收快照。
         probe = Client(fixture.replica_port)
@@ -618,7 +618,7 @@ def restart_case(fixture):
         require(gate.header_ready.wait(timeout=30),
                 "restarted Replica did not request FULLRESYNC_RDMA")
         gate.check()
-        require(gate.metadata is not None,
+        require(gate.snapshot_size is not None,
                 "missing fresh Snapshot metadata")
 
         client = Client(fixture.replica_port)
@@ -676,7 +676,7 @@ def interrupted_restart_case(fixture):
         require(gate.header_ready.wait(10), "interrupted-sync notification missing")
         gate.check()
         first_id = gate.full_sync_id
-        _, expected_size = gate.metadata
+        expected_size = gate.snapshot_size
         gate.release.set()
         replica_log = fixture.root / "replica/server.log"
         fixture.wait(lambda: "Replica wrote Snapshot chunk" in
@@ -741,7 +741,7 @@ def listener_failure_case(fixture):
     config = (
         f"role=primary\nbind_ip={TEST_HOST}\nservice_port={fixture.replica_port}\n"
         f"rdma_port={fixture.rdma_port}\n"
-        "allocator=pool\nlog_level=info\npersistence_mode=legacy_hybrid\n"
+        "allocator=pool\nlog_level=info\npersistence_mode=none\n"
     )
     process, log_path = fixture.launch(fixture.root / "invalid-primary", config)
     try:
@@ -828,92 +828,6 @@ def handshake_failure_case(fixture):
     check_failed_handshake(fixture, silent_peer=True)
 
 
-def primary_aof_write_failure_case(fixture):
-    """复用文件大小限制注入，验证有快照也不能忽略 AOF 残缺尾部。"""
-    script = fixture.binary.parent.parent / "tests/test_aof_write_failure.py"
-    completed = subprocess.run(
-        [sys.executable, "-B", str(script), "--binary", str(fixture.binary),
-         "--primary-hybrid"],
-        env=dict(os.environ, RDMA_TEST_IP=TEST_HOST),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
-    (fixture.root / "fault-runner.log").write_bytes(completed.stdout)
-    print(completed.stdout.decode(errors="replace"), end="", flush=True)
-    require(completed.returncode == 0,
-            f"Primary AOF write-failure regression exited {completed.returncode}")
-    print("[PASS] Primary hybrid partial AOF write: no false success or snapshot-only startup",
-          flush=True)
-
-
-def primary_aof_sync_failure_case(fixture):
-    """测试专用同步错误：无假成功，但完整命令仍可能在重启时恢复。"""
-    repo = fixture.binary.parent.parent
-    fault_binary = repo / "bin/test_kvstore_sync_fault"
-    require(fault_binary.is_file(),
-            f"build sync-fault test binary first: make test-rdma ({fault_binary})")
-    completed = subprocess.run(
-        [sys.executable, "-B", str(repo / "tests/test_aof_sync_failure.py"),
-         "--binary", str(fixture.binary), "--fault-binary", str(fault_binary),
-         "--primary-hybrid"],
-        env=dict(os.environ, RDMA_TEST_IP=TEST_HOST),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
-    (fixture.root / "sync-fault-runner.log").write_bytes(completed.stdout)
-    print(completed.stdout.decode(errors="replace"), end="", flush=True)
-    require(completed.returncode == 0,
-            f"Primary AOF sync-failure regression exited {completed.returncode}")
-    print("[PASS] Primary hybrid sync error: no false success; full suffix recovered",
-          flush=True)
-
-
-def primary_restart_case(fixture):
-    """Primary 本地恢复仍使用 snapshot + checkpoint O 后的 AOF，独立于传输。"""
-    primary = fixture.start("primary")
-    fixture.assert_listener(primary)
-
-    writer = Client(fixture.primary_port)
-    try:
-        require(writer.command("HSET", "base", "before") == b"OK",
-                "initial Primary write failed")
-        require(writer.command("HSET", "stable", "kept") == b"OK",
-                "stable key write failed")
-
-        require(writer.command("SAVE") == b"OK",
-                "Primary SAVE failed")
-        require((fixture.root / "primary" / "snapshot.db").is_file(),
-                "Primary SAVE did not create snapshot")
-
-        # 这两条变更发生在 SAVE 之后，必须通过 AOF 恢复。
-        require(writer.command("HMOD", "base", "after") == b"OK",
-                "post-SAVE modification failed")
-        require(writer.command("HSET", "new", "added") == b"OK",
-                "post-SAVE insertion failed")
-    finally:
-        writer.close()
-
-    aof_path = fixture.root / "primary" / "appendonly.aof"
-    original_aof = aof_path.read_bytes()
-
-    fixture.stop(primary)
-    primary = fixture.start("primary")
-    fixture.assert_listener(primary)
-
-    reader = Client(fixture.primary_port)
-    try:
-        require(reader.command("HGET", "base") == b"after",
-                "post-SAVE modification was not recovered")
-        require(reader.command("HGET", "stable") == b"kept",
-                "Snapshot data was not recovered")
-        require(reader.command("HGET", "new") == b"added",
-                "post-SAVE insertion was not recovered")
-    finally:
-        reader.close()
-
-    require(aof_path.read_bytes() == original_aof,
-            "Primary recovery unexpectedly modified AOF")
-
-    print("[PASS] Primary restart restores binary Snapshot and later AOF",
-          flush=True)
-
-
 def info_logging_case(fixture):
     """INFO 保留复制状态，隐藏逐块数据、ACK 和逐事件细节。"""
     fixture.log_level = "info"
@@ -960,9 +874,6 @@ def main():
             ("exact_chunk", exact_chunk_case),
             ("catchup", catchup_case),
             ("restart", restart_case),
-            ("primary_restart", primary_restart_case),
-            ("primary_aof_write_failure", primary_aof_write_failure_case),
-            ("primary_aof_sync_failure", primary_aof_sync_failure_case),
             ("interrupted_restart", interrupted_restart_case),
             ("listener_failure", listener_failure_case),
             ("handshake_failure", handshake_failure_case),
@@ -975,7 +886,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] RDMA acceptance scenarios: 11 passed; owned server processes stopped", flush=True)
+        print("[PASS] RDMA acceptance scenarios: 8 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

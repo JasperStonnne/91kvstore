@@ -1046,17 +1046,17 @@ bind_ip = 172.16.145.135
 service_port = 29000
 rdma_port = 29747
 log_level = info
-persistence_mode = legacy_hybrid
+persistence_mode = none
 ```
 
 | 配置项 | 含义 |
 | --- | --- |
 | role=primary | 第一台作为 Master |
 | bind_ip | 必须是 Master 自己拥有的地址 |
-| service_port=29000 | 客户端、复制控制与 TCP AOF 增量所用端口 |
+| service_port=29000 | 客户端、复制控制与 TCP 复制增量所用端口 |
 | rdma_port=29747 | 全量快照使用的独立 RDMA 端口 |
 | log_level=info | 保留同步阶段日志，方便现场确认 |
-| persistence_mode=legacy_hybrid | 当前主从要求的模式，使用二进制快照和 AOF，不代表恢复旧文本快照 |
+| persistence_mode=none | 主从使用纯内存模式，全量通过 RDMA 临时快照完成 |
 
 ### 7.8 查看第二台自己的 Slave 配置
 
@@ -1080,7 +1080,7 @@ service_port = 29001
 primary_host = 172.16.145.135
 primary_port = 29000
 log_level = info
-persistence_mode = legacy_hybrid
+persistence_mode = none
 ```
 
 | 配置项 | 含义 |
@@ -1091,7 +1091,7 @@ persistence_mode = legacy_hybrid
 | primary_host=172.16.145.135 | 连接的 Master 地址 |
 | primary_port=29000 | 连接 Master 的 service_port，不是 Slave 自己的端口 |
 | log_level=info | 观察 FULL_SYNC、CATCH_UP、ONLINE 日志 |
-| persistence_mode=legacy_hybrid | 主从模式要求；Slave 的 RDMA 端口由 Master 通知，不另配 rdma_port |
+| persistence_mode=none | 主从模式要求；Slave 的 RDMA 端口由 Master 通知，不另配 rdma_port |
 
 ## 8. 双机正式顺序：五万 → Slave ONLINE → 再五万 → 校验十万
 
@@ -1099,25 +1099,9 @@ persistence_mode = legacy_hybrid
 如果版本修好时 Master 已有十万条，再启动 Slave 并校验通过，只证明现有十万条的全量同步。
 下面从空数据重来，明确把后五万条放在 Slave ONLINE 以后，才完整展示老师要求的过程。
 
-### 8.1 清除上一轮主从测试数据
+### 8.1 确认服务已停止
 
-**操作位置：Master、Slave 各自仓库根目录分别执行；两端服务都必须停止。**
-
-```bash
-rm -f snapshot.db appendonly.aof
-```
-
-| 命令 / 参数 | 含义 |
-| --- | --- |
-| `rm` | 删除指定文件；本次你已选择旧主从测试数据不用备份 |
-| `-f` | 文件不存在时不报错 |
-| `snapshot.db` | 主从模式的二进制快照；有时 Master 尚未生成，所以不存在是正常的 |
-| `appendonly.aof` | 主从模式的 AOF；必须和配套快照一起清理，避免恢复上一轮数据 |
-
-**看到什么再继续：** 命令无错误，两台旧主从数据已清除。
-
-这条不删除单机的 snapshot.bin / commands.aof，它们也不会被 legacy_hybrid 加载。
-**只在新一轮开始前清理；本轮服务启动后不要再删。**
+两端均使用纯内存模式，重新启动时从空引擎开始。
 
 ### 8.2 只启动 Master
 
@@ -1273,7 +1257,7 @@ value 也是程序生成的具体字符串，含标记、编号、original 或 m
 | --- | --- | --- |
 | 单机 snapshot | snapshot.bin | 自定义二进制快照，保存当时的完整 key/value 和引擎等信息 |
 | 单机 aof | commands.aof | RESP 风格的长度前缀写命令流，重启时回放 |
-| 主从 legacy_hybrid | snapshot.db + appendonly.aof | 带 AOF 检查点的二进制快照与配套日志 |
+| 主从 none | 全量期间的复制临时快照 | RDMA 使用临时快照，增量使用内存复制流 |
 
 Snapshot 的记录包含引擎类型、key/value 长度和内容，文件带版本、记录数、校验等信息。
 .db 只是扩展名，不表示 SQLite；.bin 也不是另一种数据集字段。
@@ -1408,7 +1392,7 @@ Array 当前容量只有 1024，不能同时存一万个不同 key；可在容�
 | Cannot assign requested address | bind_ip 不是当前机器本机地址；hostname -I 核对，确认没有在 Master 上启动 Slave 配置 |
 | 连接被拒绝 / PING 失败 | 检查服务窗口是否启动成功，以及 IP、端口是否与当前配置一致 |
 | 进程找不到 / PID 变了 | 每次启动都可能换 PID；重新 pgrep，不照抄上次数字 |
-| SAVE 不生成 .db | 单机 snapshot 生成 snapshot.bin；主从才用 snapshot.db |
+| SAVE 不生成 .db | 单机 snapshot 生成 snapshot.bin；主从全量使用临时快照 |
 | 重启后数据全没了 | 是否换了工作目录、改错模式或误删文件；是否在 Snapshot 模式下忘记 SAVE |
 | verify 全部 missing | 先确认目标地址、端口、标记、引擎；双机再检查版本、编译产物、FULL_SYNC/ONLINE 日志 |
 | 只有 connect to primary | 不能当同步成功；应继续看到 FULL_SYNC、Snapshot installed、ONLINE |
