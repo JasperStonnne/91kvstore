@@ -1515,7 +1515,8 @@ static int kvs_replication_frame_protocol(
             goto snapshot_setup_failed;
         }
 
-        if (kvs_snapshot_store_save(KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH) < 0) {
+        if (kvs_snapshot_store_save_with_checksum(
+                KVS_REPLICATION_PRIMARY_SNAPSHOT_PATH, KVS_SNAPSHOT_CHECKSUM_FILE) < 0) {
             goto snapshot_setup_failed;
         }
 

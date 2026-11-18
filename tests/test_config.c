@@ -499,8 +499,43 @@ static void test_allocator_config(void)
 
     puts("[PASS] allocator config defaults, names and rejection");
 }
+static void test_snapshot_checksum(void)
+{
+    kvs_config_t config = load_valid(
+        "role=standalone\nservice_port=29000\npersistence_mode=snapshot\n");
+    assert(config.snapshot_checksum == KVS_SNAPSHOT_CHECKSUM_FILE);
+    const char *names[] = {"file", "record"};
+    for (int mode = 0; mode < 2; mode++) {
+        char contents[256];
+        snprintf(contents, sizeof(contents),
+                 "snapshot_checksum=%s\nrole=standalone\nservice_port=29000\n"
+                 "persistence_mode=snapshot\n", names[mode]);
+        config = load_valid(contents);
+        assert(config.snapshot_checksum == (kvs_snapshot_checksum_t)mode);
+        const char *roles[] = {"primary", "replica", "standalone", "standalone"};
+        const char *modes[] = {"none", "none", "aof", "none"};
+        const char *fields[] = {"rdma_port=29747\n",
+            "primary_host=127.0.0.1\nprimary_port=29001\n", "", ""};
+        for (size_t i = 0; i < 4; i++) {
+            snprintf(contents, sizeof(contents),
+                     "role=%s\nservice_port=29000\npersistence_mode=%s\n"
+                     "snapshot_checksum=%s\n%s", roles[i], modes[i], names[mode], fields[i]);
+            expect_invalid("checksum restricted to standalone snapshot", contents,
+                           "snapshot_checksum is only valid");
+        }
+    }
+    expect_invalid("invalid checksum", "role=standalone\nservice_port=29000\n"
+                   "persistence_mode=snapshot\nsnapshot_checksum=none\n",
+                   "snapshot_checksum must be file or record");
+    expect_invalid("duplicate checksum", "role=standalone\nservice_port=29000\n"
+                   "persistence_mode=snapshot\nsnapshot_checksum=file\nsnapshot_checksum=record\n",
+                   "duplicate field");
+    puts("snapshot checksum defaults, modes and role restrictions passed");
+}
+
 int main(void)
 {
+    test_snapshot_checksum();
     test_valid_standalone();
     test_valid_primary_and_replica();
     test_invalid_configs();

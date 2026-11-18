@@ -1,25 +1,28 @@
 #ifndef KVS_PERSISTENCE_H
 #define KVS_PERSISTENCE_H
 #include "protocol.h"
+#include "snapshot_format.h"
 int kvs_aof_open(const char *path);
 int kvs_aof_append(char **tokens, int count);
 int kvs_aof_close(void);
 int kvs_snapshot_store_save(const char *path);
 int kvs_snapshot_store_load(const char *path);
 
-/* 快照可选的检查点元数据，由上层提供和解释。 */
+/* v1/v2 的检查点元数据，供兼容读取使用。 */
 typedef struct {
     int has_offset;       /* 1：携带 O；0：不携带 O */
     long long offset;     /* has_offset 为 1 时有效 */
 } kvs_snapshot_checkpoint_t;
 
-/* 保存快照及可选检查点；checkpoint 为 NULL 时不携带 O。 */
-int kvs_snapshot_store_save_with_checkpoint(
-    const char *path,
-    const kvs_snapshot_checkpoint_t *checkpoint
-);
+/* 保存入口统一写 v3；未指定模式的入口默认整文件校验。 */
+int kvs_snapshot_store_save_with_checksum(
+    const char *path, kvs_snapshot_checksum_t checksum);
 
-/* 加载快照，同时读回检查点信息。 */
+/* 加载模式来自文件，policy 决定是否允许逐条容错。 */
+int kvs_snapshot_store_load_with_policy(
+    const char *path, kvs_snapshot_load_policy_t policy);
+
+/* 兼容读取 v1/v2 的检查点；v3 返回无检查点。 */
 int kvs_snapshot_store_load_with_checkpoint(
     const char *path,
     kvs_snapshot_checkpoint_t *checkpoint
@@ -56,7 +59,8 @@ void kvs_snapshot_writer_abort(kvs_snapshot_writer_t *writer,const char *temp_pa
  * 返回 0 表示成功，-1 表示失败。
  *
  * load：加载到已初始化的空引擎中。
- * 返回 0 表示成功，1 表示文件不存在，-1 表示损坏或其他错误。
+ * 返回 0 表示成功，record 模式可能已记录并跳过坏记录。
+ * 返回 1 表示文件不存在，-1 表示整文件/结构损坏或其他错误。
  * 加载失败后，调用方不得对外提供可能已部分加载的数据。
  */
 

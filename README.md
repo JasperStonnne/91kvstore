@@ -168,6 +168,46 @@ $11\r\nhello world\r\n
 | `snapshot` | 普通写入只更新内存；成功 `SAVE` 后保存二进制 `snapshot.bin`，重启只加载快照，不创建 AOF |
 | `aof` | 成功写回复前完成 AOF 追加和同步；重启回放 `commands.aof`，不需要 SAVE，也不生成快照 |
 
+### v3 快照与校验模式
+
+单机 `SAVE` 和 RDMA 临时快照统一写 v3，加载端兼容 v1/v2。
+四种引擎固定按 Array、RBTree、Hash、Skiplist 分段，各段的记录数位于段表，
+记录只保存键值及长度。所有整数使用大端序，CRC 使用 CRC32/ISO-HDLC。
+
+```ini
+# 仅 standalone 且 persistence_mode=snapshot 可配置，默认 file。
+snapshot_checksum = file
+# 需要尽量恢复完好记录时可改为 record。
+```
+
+v3 字节布局如下。模式编号为 `file=0`、`record=1`，空段记录数为 0。
+
+```text
+偏移 0   magic[8] = 91KVSNAP
+偏移 8   version[u32] = 3
+偏移 12  checksum_mode[u8] | reserved[3] = 0
+偏移 16  array_count[u64] | rbtree_count[u64] | hash_count[u64] | skiplist_count[u64]
+偏移 48  Array 记录 → RBTree 记录 → Hash 记录 → Skiplist 记录
+文件尾   CRC32[u32]
+
+file 每条记录
+  key_len[u32] | value_len[u32] | key | value
+record 每条记录
+  body_len[u32] | key_len[u32] | value_len[u32] | key | value | record_crc32[u32]
+```
+
+`file` 的文件尾 CRC 覆盖此前所有字节，校验失败则拒绝整份加载。
+`record` 的记录 CRC 覆盖从 `key_len` 到 `value` 末尾的 body，`body_len` 包含两个长度字段。
+此模式的文件尾保存结构 CRC，覆盖前 48 字节及依次出现的全部 `body_len` 字段。
+加载先校验结构，再逐条校验和恢复。坏记录会记录段编号（1～4）、段内记录序号（从 0 开始）
+和文件偏移，跳过后继续恢复。结构、边界或结构 CRC 损坏则拒绝整份加载。
+恢复过程中不改写输入文件，重复键和引擎插入失败仍使本次加载失败。
+
+配置决定下一次 `SAVE` 的模式，读取已有文件时按文件头标记解释。
+Primary/Replica 固定写入和严格加载 `file`，显式配置 `snapshot_checksum` 会报错。
+Replica 校验和加载成功后才发全量完成确认，失败会清空引擎、清理临时文件并取消本轮复制。
+升级为 v3 写入后，读取端需使用支持 v3 的版本。
+
 现场手动演示使用 `make all testcase` 构建 C 客户端，每次单独执行写入、读取校验、修改、删除或 SAVE；服务启动、宕机和重启由操作者控制。具体命令见[手动演示流程（HTML）](docs/MANUAL_DEMO.html)，可直接用浏览器打开。旧 `bin/testcase` 的数字模式已改为具名操作，使用 `bin/testcase --help` 查看参数。
 
 当前 Snapshot 是带版本、记录长度和校验的**二进制格式**，不是旧的 `AOF_OFFSET` 文本首行。SAVE 路径为临时文件 → io_uring 写入/文件同步 → rename → 父目录同步。rename 后目录同步失败时可能“返回错误但文件已替换”，不承诺自动回滚。AOF 错误不回复成功并停止；残缺日志拒绝恢复，不自动跳过或修剪。失败回复也不承诺相关命令绝不在重启后出现。

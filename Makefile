@@ -83,12 +83,14 @@ $(BUILD_DIR)/kvstore.o: \
 	$(INCLUDE_DIR)/rdma_transport.h \
 	$(INCLUDE_DIR)/protocol.h \
 	$(INCLUDE_DIR)/config.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/config.o: \
         $(SRC_DIR)/config/config.c \
         $(INCLUDE_DIR)/config.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
         $(INCLUDE_DIR)/role.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
@@ -138,6 +140,7 @@ $(BUILD_DIR)/kvs_skiplist.o: \
 $(BUILD_DIR)/aof.o: \
     $(PERSISTENCE_DIR)/aof.c \
     $(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/kvs_allocator.h \
     $(INCLUDE_DIR)/mapped_file.h \
     $(INCLUDE_DIR)/uring_io.h | $(BUILD_DIR)
@@ -146,12 +149,14 @@ $(BUILD_DIR)/aof.o: \
 $(BUILD_DIR)/snapshot_io.o: \
 	$(PERSISTENCE_DIR)/snapshot_io.c \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/snapshot_store.o: \
 	$(PERSISTENCE_DIR)/snapshot_store.c \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/mapped_file.h \
 	$(INCLUDE_DIR)/kvs_allocator.h \
     $(INCLUDE_DIR)/uring_io.h \
@@ -175,6 +180,7 @@ $(BUILD_DIR)/replication.o: \
 	$(INCLUDE_DIR)/replication_capture_ipc.h \
 	$(INCLUDE_DIR)/replication.h \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
@@ -372,6 +378,7 @@ $(BIN_DIR)/test_config: \
         $(TEST_DIR)/test_config.c \
         $(SRC_DIR)/config/config.c \
         $(INCLUDE_DIR)/config.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
         $(INCLUDE_DIR)/role.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
                 $(TEST_DIR)/test_config.c \
@@ -395,6 +402,7 @@ $(BIN_DIR)/test_snapshot_store: \
 	$(MEMORY_DIR)/kvs_allocator.c \
 	$(INCLUDE_DIR)/kvs_allocator.h \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/mapped_file.h \
 	$(INCLUDE_DIR)/uring_io.h \
 	$(INCLUDE_DIR)/kvstore.h \
@@ -453,6 +461,7 @@ $(BIN_DIR)/test_aof_replay: \
 	$(MEMORY_DIR)/kvs_allocator.c \
 	$(INCLUDE_DIR)/kvs_allocator.h \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/mapped_file.h \
 	$(INCLUDE_DIR)/uring_io.h \
 	$(INCLUDE_DIR)/protocol.h | $(BIN_DIR)

@@ -99,6 +99,8 @@ static kvs_role_t kvs_server_role = KVS_ROLE_STANDALONE;
 static kvs_persistence_mode_t kvs_persistence_mode =
     KVS_PERSISTENCE_NONE;
 
+static kvs_snapshot_checksum_t kvs_snapshot_checksum = KVS_SNAPSHOT_CHECKSUM_FILE;
+
 static int kvs_persistence_uses_aof(void)
 {
     return kvs_persistence_mode == KVS_PERSISTENCE_AOF;
@@ -114,7 +116,8 @@ static void kvs_close_current_persistence(void)
 static int kvs_save_current_snapshot(void)
 {
     if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
-        return kvs_snapshot_store_save("snapshot.bin");
+        return kvs_snapshot_store_save_with_checksum(
+            "snapshot.bin", kvs_snapshot_checksum);
     }
 
     errno = ENOTSUP;
@@ -1286,7 +1289,10 @@ static int kvs_install_replication_snapshot(const char *snapshot_path)
         exit(EXIT_FAILURE);
     }
 
-    if (kvs_snapshot_store_load(snapshot_path) != 0) {
+    if (kvs_snapshot_store_load_with_policy(
+            snapshot_path, KVS_SNAPSHOT_LOAD_REQUIRE_FILE) != 0) {
+        fprintf(stderr, "replication: Snapshot validation/load failed path=%s: %s\n",
+                snapshot_path, strerror(errno));
         dest_kvengine();
         if (init_kvengine() < 0) {
             fprintf(stderr,
@@ -1308,6 +1314,7 @@ static int kvs_server_run(kvs_config_t config)
        /* 初始化引擎，并按配置选择持久化恢复路径。 */
     kvs_server_role = config.role;
     kvs_persistence_mode = config.persistence_mode;
+    kvs_snapshot_checksum = config.snapshot_checksum;
 
     if (init_kvengine() < 0) {
         fprintf(stderr, "failed to initialize KV engines\n");

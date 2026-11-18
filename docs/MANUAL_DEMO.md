@@ -1259,7 +1259,7 @@ value 也是程序生成的具体字符串，含标记、编号、original 或 m
 | 单机 aof | commands.aof | RESP 风格的长度前缀写命令流，重启时回放 |
 | 主从 none | 全量期间的复制临时快照 | RDMA 使用临时快照，增量使用内存复制流 |
 
-Snapshot 的记录包含引擎类型、key/value 长度和内容，文件带版本、记录数、校验等信息。
+v3 Snapshot 按四种引擎分段，记录包含 key/value 长度和内容，文件带版本、段记录数及所选模式的校验信息。
 .db 只是扩展名，不表示 SQLite；.bin 也不是另一种数据集字段。
 真正由 persistence_mode 选择恢复方式，而不是由测试标记 demo / aof_demo 选择。
 

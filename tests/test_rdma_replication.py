@@ -428,8 +428,8 @@ def exact_chunk_case(fixture):
     """恰好 1 MiB 的快照：最终块不能多发，也不能等一个不存在的下一块。"""
     fixture.start("primary")
     writer = Client(fixture.primary_port)
-    # v2 头、检查点、单条记录和 CRC 共 53 字节（key 为 8 字节的 boundary）。
-    payload = b"z" * (RDMA_CHUNK_CAPACITY - 53)
+    # v3 头及段表 48 + 长度 8 + key 8 + 整文件 CRC 4 = 68 字节。
+    payload = b"z" * (RDMA_CHUNK_CAPACITY - 68)
     try:
         require(writer.command("SET", "boundary", payload) == b"OK", "boundary seed failed")
     finally:
@@ -854,6 +854,60 @@ def info_logging_case(fixture):
         reader.close()
     print("[PASS] INFO retains state transitions and hides per-chunk/ACK detail", flush=True)
 
+def corrupt_snapshot_case(fixture):
+    """仅破坏本测试临时文件，验证 RDMA 收齐后不会确认损坏快照。"""
+    fixture.start("primary")
+    writer = Client(fixture.primary_port)
+    gate = reader = None
+    try:
+        require(writer.command("HSET", "crc_probe", "kept") == b"OK", "seed failed")
+        gate = SnapshotGate(fixture.primary_port)
+        if gate.port == fixture.replica_port:
+            fixture.replica_port = free_port()
+        fixture.start("replica", gate.port)
+        require(gate.header_ready.wait(10), "Snapshot header missing")
+        gate.check()
+        path = primary_snapshot_path(fixture)
+        # 使用已打开文件的同一 inode，保持大小和握手信息一致。
+        with path.open("r+b") as snapshot:
+            require(snapshot.read(13) == b"91KVSNAP\0\0\0\3\0", "replication must write v3/file")
+            snapshot.seek(-1, 2)
+            original = snapshot.read(1)
+            snapshot.seek(-1, 2)
+            snapshot.write(bytes([original[0] ^ 1]))
+        gate.release.set()
+        replica_log = fixture.root / "replica/server.log"
+        fixture.wait(lambda: "Replica control connection closed" in replica_log.read_text(errors="replace"),
+                     "corrupt full sync did not fail", timeout=15)
+        primary_log = fixture.root / "primary/server.log"
+        fixture.wait(lambda: "Replica control connection released" in primary_log.read_text(errors="replace"),
+                     "Primary retained corrupt session", timeout=15)
+        replica_text = replica_log.read_text(errors="replace")
+        primary_text = primary_log.read_text(errors="replace")
+        require("Primary submitted Snapshot chunk" in primary_text and
+                "Snapshot validation/load failed" in replica_text,
+                "RDMA Snapshot did not reach strict validation/load")
+        require("Snapshot installed" not in replica_text and "enter ONLINE" not in replica_text,
+                "corrupt Snapshot was installed")
+        require("RDMA Snapshot fully acknowledged" not in primary_text,
+                "Primary received false load-completion confirmation")
+        require(not (fixture.root / "replica/snapshot.db.replication.tmp").exists(),
+                "Replica kept corrupt temporary file")
+        require(not primary_snapshot_path(fixture).exists(), "Primary kept corrupt temporary file")
+        reader = Client(fixture.replica_port)
+        require(reader.command("PING") == b"PONG", "Replica PING unavailable")
+        reader.sock.sendall(frame("HGET", "crc_probe"))
+        require(reader.file.readline() == b"-LOADING replica synchronization in progress\r\n",
+                "corrupt Replica served reads")
+        print("[PASS] real RDMA corrupt v3/file Snapshot rejected; no load ACK/ONLINE; temp files cleaned", flush=True)
+    finally:
+        if reader is not None:
+            reader.close()
+        writer.close()
+        if gate is not None:
+            gate.close()
+
+
 def main():
     global TEST_HOST
     parser = argparse.ArgumentParser(description=__doc__)
@@ -871,6 +925,7 @@ def main():
         for name, case in (
             ("info_logging", info_logging_case),
             ("empty", empty_case),
+            ("corrupt_snapshot", corrupt_snapshot_case),
             ("exact_chunk", exact_chunk_case),
             ("catchup", catchup_case),
             ("restart", restart_case),
@@ -886,7 +941,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] RDMA acceptance scenarios: 8 passed; owned server processes stopped", flush=True)
+        print("[PASS] RDMA acceptance scenarios: 9 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

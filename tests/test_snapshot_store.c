@@ -2,6 +2,7 @@
 #include "persistence.h"
 #include "kvs_allocator.h"
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -174,109 +175,6 @@ static void test_save_failure_preserves_old_snapshot(const char *path)
     puts("snapshot write failure preserves old snapshot");
 }
 
-static void test_checkpoint_roundtrip(const char *path)
-{
-    assert(kvs_hash_set(
-        &global_hash, "checkpoint_probe", "preserved") == 0);
-
-    const long long offsets[] = {
-        0,
-        (1LL << 40) + 123
-    };
-
-    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
-        kvs_snapshot_checkpoint_t written = {
-            .has_offset = 1,
-            .offset = offsets[i]
-        };
-
-        assert(kvs_snapshot_store_save_with_checkpoint(
-            path, &written) == 0);
-
-        destroy_engines();
-        create_engines();
-
-        kvs_snapshot_checkpoint_t loaded = {
-            .has_offset = -1,
-            .offset = -1
-        };
-
-        assert(kvs_snapshot_store_load_with_checkpoint(
-            path, &loaded) == 0);
-
-        assert(loaded.has_offset == 1);
-        assert(loaded.offset == written.offset);
-        expect_value(
-            kvs_hash_get(&global_hash, "checkpoint_probe"),
-            "preserved");
-    }
-
-    /* 普通保存不携带 O，不能残留上一次的检查点。 */
-    assert(kvs_snapshot_store_save(path) == 0);
-    destroy_engines();
-    create_engines();
-
-    kvs_snapshot_checkpoint_t loaded = {
-        .has_offset = -1,
-        .offset = -1
-    };
-
-    assert(kvs_snapshot_store_load_with_checkpoint(
-        path, &loaded) == 0);
-    assert(loaded.has_offset == 0);
-    assert(loaded.offset == 0);
-    expect_value(
-        kvs_hash_get(&global_hash, "checkpoint_probe"),
-        "preserved");
-
-    puts("snapshot checkpoint roundtrip tests passed");
-}
-
-static void test_checkpoint_corruption(const char *path)
-{
-    kvs_snapshot_checkpoint_t written = {
-        .has_offset = 1,
-        .offset = 123
-    };
-    assert(kvs_snapshot_store_save_with_checkpoint(
-        path, &written) == 0);
-
-    int fd = open(path, O_RDWR);
-    assert(fd >= 0);
-
-    /* v2 的 O 位于第 24～31 字节，修改最低字节。 */
-    unsigned char original;
-    assert(pread(fd, &original, 1, 31) == 1);
-
-    unsigned char damaged = original ^ 1u;
-    assert(pwrite(fd, &damaged, 1, 31) == 1);
-
-    destroy_engines();
-    create_engines();
-
-    kvs_snapshot_checkpoint_t loaded = {
-        .has_offset = -1,
-        .offset = -1
-    };
-
-    assert(kvs_snapshot_store_load_with_checkpoint(
-        path, &loaded) == -1);
-    expect_empty();
-    assert(loaded.has_offset == -1);
-    assert(loaded.offset == -1);
-
-    /* 恢复原字节后，应能正常加载并读回 O。 */
-    assert(pwrite(fd, &original, 1, 31) == 1);
-    assert(close(fd) == 0);
-
-    assert(kvs_snapshot_store_load_with_checkpoint(
-        path, &loaded) == 0);
-    assert(loaded.has_offset == 1);
-    assert(loaded.offset == 123);
-
-    puts("snapshot checkpoint corruption test passed");
-}
-
 static void test_v1_compatibility(const char *path)
 {
     /* 固定 v1 文件：Hash 引擎中的 name=v1，包含原格式 CRC。 */
@@ -363,6 +261,248 @@ static void test_fixed_snapshot_boundaries(const char *path)
     puts("snapshot all truncation positions and CRC-valid structural boundaries passed");
 }
 
+static void fixture_u32(unsigned char *bytes, uint32_t value)
+{
+    for (unsigned int i = 0; i < 4; i++) {
+        bytes[i] = (unsigned char)(value >> (24 - i * 8));
+    }
+}
+
+static void fixture_write(const char *path, const unsigned char *bytes, size_t length)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert(fd >= 0);
+    assert(write(fd, bytes, length) == (ssize_t)length);
+    assert(close(fd) == 0);
+}
+
+/* 固定 v2 布局独立生成，避免用新写入器充当兼容性证据。 */
+static void test_v2_compatibility(const char *path)
+{
+    const uint64_t offsets[] = {0, (UINT64_C(1) << 40) + 123};
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        unsigned char bytes[51] = "91KVSNAP";
+        fixture_u32(bytes + 8, 2);
+        fixture_u32(bytes + 12, 1);
+        bytes[23] = 1;
+        for (unsigned int j = 0; j < 8; j++) {
+            bytes[24 + j] = (unsigned char)(offsets[i] >> (56 - j * 8));
+        }
+        bytes[32] = KVS_SNAPSHOT_ENGINE_HASH;
+        fixture_u32(bytes + 33, 4);
+        fixture_u32(bytes + 37, 2);
+        memcpy(bytes + 41, "namev2", 6);
+        fixture_u32(bytes + 47, fixture_crc(bytes, 47));
+        destroy_engines();
+        create_engines();
+        fixture_write(path, bytes, sizeof(bytes));
+        kvs_snapshot_checkpoint_t loaded = {.has_offset = -1, .offset = -1};
+        assert(kvs_snapshot_store_load_with_checkpoint(path, &loaded) == 0);
+        assert(loaded.has_offset == 1 && loaded.offset == (long long)offsets[i]);
+        expect_value(kvs_hash_get(&global_hash, "name"), "v2");
+
+        destroy_engines();
+        create_engines();
+        bytes[31] ^= 1;
+        fixture_write(path, bytes, sizeof(bytes));
+        assert(kvs_snapshot_store_load(path) == -1);
+        expect_empty();
+        bytes[31] ^= 1;
+        fixture_write(path, bytes, sizeof(bytes));
+        assert(kvs_snapshot_store_load_with_policy(path, KVS_SNAPSHOT_LOAD_REQUIRE_FILE) == 0);
+    }
+    destroy_engines();
+    create_engines();
+    puts("snapshot v2 checkpoint compatibility and corruption passed");
+}
+
+/* 每个引擎各一条，同名 key 用于核对固定四段的归属。 */
+static void test_v3_modes(const char *path)
+{
+    char *values[] = {"Array", "Tree", "Hash", "Skiplist"};
+    for (int mode = KVS_SNAPSHOT_CHECKSUM_FILE; mode <= KVS_SNAPSHOT_CHECKSUM_RECORD; mode++) {
+        destroy_engines();
+        create_engines();
+        assert(kvs_array_set(&global_array, "name", values[0]) == 0);
+        assert(kvs_rbtree_set(&global_rbtree, "name", values[1]) == 0);
+        assert(kvs_hash_set(&global_hash, "name", values[2]) == 0);
+        assert(kvs_skiplist_set(&global_skiplist, "name", values[3]) == 0);
+        assert(kvs_snapshot_store_save_with_checksum(path, (kvs_snapshot_checksum_t)mode) == 0);
+        unsigned char bytes[256];
+        int fd = open(path, O_RDONLY);
+        assert(fd >= 0);
+        ssize_t length = read(fd, bytes, sizeof(bytes));
+        assert(length > 52 && close(fd) == 0);
+        assert(bytes[11] == 3 && bytes[12] == mode);
+        size_t starts[4];
+        size_t position = 48;
+        uint32_t structure = 0xffffffffu;
+        /* fixture_crc 返回完成后的值，可用串接结构字节独立校验。 */
+        unsigned char structure_bytes[64];
+        memcpy(structure_bytes, bytes, 48);
+        for (size_t section = 0; section < 4; section++) {
+            assert(bytes[23 + section * 8] == 1);
+            starts[section] = position;
+            size_t body_length = 8 + 4 + strlen(values[section]);
+            if (mode == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+                unsigned char expected[4];
+                fixture_u32(expected, (uint32_t)body_length);
+                assert(memcmp(bytes + position, expected, 4) == 0);
+                memcpy(structure_bytes + 48 + section * 4, bytes + position, 4);
+                position += 4;
+                uint32_t checksum = fixture_crc(bytes + position, body_length);
+                fixture_u32(expected, checksum);
+                assert(memcmp(bytes + position + body_length, expected, 4) == 0);
+            }
+            assert(bytes[position + 3] == 4);
+            assert(memcmp(bytes + position + 8, "name", 4) == 0);
+            assert(memcmp(bytes + position + 12, values[section], strlen(values[section])) == 0);
+            position += body_length;
+            if (mode == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+                position += 4;
+            }
+        }
+        assert(position + 4 == (size_t)length);
+        structure = fixture_crc(structure_bytes, sizeof(structure_bytes));
+        unsigned char expected[4];
+        uint32_t checksum = structure;
+        if (mode == KVS_SNAPSHOT_CHECKSUM_FILE) {
+            checksum = fixture_crc(bytes, (size_t)length - 4);
+        }
+        fixture_u32(expected, checksum);
+        assert(memcmp(expected, bytes + length - 4, 4) == 0);
+
+        /* 每一个截断位置均拒绝，且不开始恢复。 */
+        destroy_engines();
+        create_engines();
+        for (size_t cut = 0; cut < (size_t)length; cut++) {
+            fixture_write(path, bytes, cut);
+            assert(kvs_snapshot_store_load(path) == -1);
+            expect_empty();
+        }
+        fixture_write(path, bytes, (size_t)length);
+        if (mode == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+            assert(kvs_snapshot_store_load_with_policy(path, KVS_SNAPSHOT_LOAD_REQUIRE_FILE) == -1);
+            expect_empty();
+        }
+        assert(kvs_snapshot_store_load(path) == 0);
+        expect_value(kvs_array_get(&global_array, "name"), values[0]);
+        expect_value(kvs_rbtree_get(&global_rbtree, "name"), values[1]);
+        expect_value(kvs_hash_get(&global_hash, "name"), values[2]);
+        expect_value(kvs_skiplist_get(&global_skiplist, "name"), values[3]);
+
+        /* 首、中、末记录内容损坏：record 仅跳过本条，file 全拒绝。 */
+        for (size_t section = 0; section < 4; section++) {
+            size_t value_offset = starts[section] + 12;
+            if (mode == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+                value_offset += 4;
+            }
+            bytes[value_offset] ^= 1;
+            destroy_engines();
+            create_engines();
+            fixture_write(path, bytes, (size_t)length);
+            if (mode == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+                assert(kvs_snapshot_store_load(path) == 0);
+                const char *actual[] = {
+                    kvs_array_get(&global_array, "name"), kvs_rbtree_get(&global_rbtree, "name"),
+                    kvs_hash_get(&global_hash, "name"), kvs_skiplist_get(&global_skiplist, "name")
+                };
+                for (size_t other = 0; other < 4; other++) {
+                    if (section == other) {
+                        assert(actual[other] == NULL);
+                    } else {
+                        expect_value(actual[other], values[other]);
+                    }
+                }
+            } else {
+                assert(kvs_snapshot_store_load(path) == -1);
+                expect_empty();
+            }
+            bytes[value_offset] ^= 1;
+        }
+        destroy_engines();
+        create_engines();
+        /* 文件头、段表、可信边界和尾部校验损坏，全份拒绝。 */
+        const size_t positions[] = {0, 8, 12, 13, 23, 31, 39, 47, 48, (size_t)length - 1};
+        for (size_t i = 0; i < sizeof(positions) / sizeof(positions[0]); i++) {
+            bytes[positions[i]] ^= 1;
+            fixture_write(path, bytes, (size_t)length);
+            assert(kvs_snapshot_store_load(path) == -1);
+            expect_empty();
+            bytes[positions[i]] ^= 1;
+        }
+        /* 额外尾字节也属于结构破坏。 */
+        bytes[length] = 0;
+        fixture_write(path, bytes, (size_t)length + 1);
+        assert(kvs_snapshot_store_load(path) == -1);
+        expect_empty();
+
+        if (mode == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+            /* 内部长度损坏可跳过：不能用坏 key_len 找下一条。 */
+            bytes[starts[1] + 4] = 0xff;
+            fixture_write(path, bytes, (size_t)length);
+            assert(kvs_snapshot_store_load(path) == 0);
+            assert(kvs_rbtree_get(&global_rbtree, "name") == NULL);
+            expect_value(kvs_hash_get(&global_hash, "name"), "Hash");
+            bytes[starts[1] + 4] = 0;
+
+            /* CRC 自身损坏也只跳过本条。 */
+            destroy_engines();
+            create_engines();
+            size_t body_length = 8 + 4 + strlen(values[1]);
+            size_t checksum_offset = starts[1] + 4 + body_length;
+            bytes[checksum_offset] ^= 1;
+            fixture_write(path, bytes, (size_t)length);
+            assert(kvs_snapshot_store_load(path) == 0);
+            assert(kvs_rbtree_get(&global_rbtree, "name") == NULL);
+            expect_value(kvs_skiplist_get(&global_skiplist, "name"), "Skiplist");
+            bytes[checksum_offset] ^= 1;
+
+            /* CRC 正确但内部长度或 NUL 不合法，仍应跳过。 */
+            const size_t invalid_body_positions[] = {starts[1] + 4, starts[1] + 12};
+            for (size_t i = 0; i < 2; i++) {
+                destroy_engines();
+                create_engines();
+                size_t bad = invalid_body_positions[i];
+                unsigned char saved = bytes[bad];
+                bytes[bad] = 0;
+                if (i == 0) {
+                    bytes[bad] = 0xff;
+                }
+                fixture_u32(bytes + checksum_offset,
+                            fixture_crc(bytes + starts[1] + 4, body_length));
+                fixture_write(path, bytes, (size_t)length);
+                assert(kvs_snapshot_store_load(path) == 0);
+                assert(kvs_rbtree_get(&global_rbtree, "name") == NULL);
+                expect_value(kvs_hash_get(&global_hash, "name"), "Hash");
+                bytes[bad] = saved;
+            }
+            fixture_u32(bytes + checksum_offset,
+                        fixture_crc(bytes + starts[1] + 4, body_length));
+        } else {
+            /* 重算正确文件 CRC，仍由结构解析拒绝超长字段。 */
+            bytes[48] = 0xff;
+            fixture_u32(bytes + length - 4, fixture_crc(bytes, (size_t)length - 4));
+            fixture_write(path, bytes, (size_t)length);
+            assert(kvs_snapshot_store_load(path) == -1);
+            expect_empty();
+        }
+    }
+    destroy_engines();
+    create_engines();
+    for (int mode = KVS_SNAPSHOT_CHECKSUM_FILE; mode <= KVS_SNAPSHOT_CHECKSUM_RECORD; mode++) {
+        assert(kvs_snapshot_store_save_with_checksum(path, (kvs_snapshot_checksum_t)mode) == 0);
+        struct stat info;
+        assert(stat(path, &info) == 0 && info.st_size == 52);
+        assert(kvs_snapshot_store_load(path) == 0);
+        expect_empty();
+    }
+    errno = 0;
+    assert(kvs_snapshot_store_save_with_checksum(path, (kvs_snapshot_checksum_t)99) == -1);
+    assert(errno == EINVAL);
+    puts("snapshot v3 file/record layout, skip, strict policy and structural rejection passed");
+}
+
 int main(void)
 {
     assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
@@ -432,9 +572,9 @@ int main(void)
     expect_value(kvs_skiplist_get(&global_skiplist, "name"), "Skiplist");
 
     assert(kvs_rbtree_get(&global_rbtree, "deleted") == NULL);
-    test_checkpoint_roundtrip(path);
     test_rejects_corruption(path);
-    test_checkpoint_corruption(path);
+    test_v2_compatibility(path);
+    test_v3_modes(path);
     test_fixed_snapshot_boundaries(path);
     destroy_engines();
 

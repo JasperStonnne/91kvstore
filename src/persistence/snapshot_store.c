@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,10 @@
 
 #define SNAPSHOT_VERSION_V1 1u
 #define SNAPSHOT_VERSION_V2 2u
+#define SNAPSHOT_VERSION_V3 3u
+#define SNAPSHOT_SECTION_COUNT 4u
+/* magic 8 + version 4 + mode 1 + reserved 3 + 四段计数 32。 */
+#define SNAPSHOT_HEADER_V3_SIZE 48u
 
 /* v1：标识 8 + 版本 4 + 记录数 8。 */
 #define SNAPSHOT_HEADER_V1_SIZE 20u
@@ -67,14 +72,12 @@ typedef struct {
     /* 下一批数据应写到文件的哪个字节位置。 */
     off_t next_file_offset;
 
-    /* 本次保存需要写入文件头的可选检查点。 */
-    kvs_snapshot_checkpoint_t checkpoint;
+    kvs_snapshot_checksum_t checksum;
 } snapshot_writer_t;
 
 /* foreach 回调共用的信息。 */
 typedef struct {
     snapshot_writer_t *writer;   /* 本次 SAVE 的写入对象。 */
-    kvs_snapshot_engine_t engine;
     uint32_t *crc;
 } snapshot_write_context_t;
 
@@ -469,235 +472,116 @@ static int snapshot_count_item(
     return 0;
 }
 
-/* 累计四种引擎的记录总数。 */
-static int snapshot_count_records(uint64_t *count)
-{
-    if (count == NULL) {
-        return -1;
-    }
-
-    *count = 0;
-
-    if (kvs_array_foreach(
-            &global_array, snapshot_count_item, count) < 0) {
-        return -1;
-    }
-
-    if (kvs_rbtree_foreach(
-            &global_rbtree, snapshot_count_item, count) < 0) {
-        return -1;
-    }
-
-    if (kvs_hash_foreach(
-            &global_hash, snapshot_count_item, count) < 0) {
-        return -1;
-    }
-
-    if (kvs_skiplist_foreach(
-            &global_skiplist, snapshot_count_item, count) < 0) {
-        return -1;
-    }
-
-    return 0;
-}
-
-/* 编码文件头，追加到缓冲区，并更新 CRC。 */
-static int snapshot_write_header(
-    snapshot_writer_t *writer,
-    uint64_t record_count,
-    uint32_t *crc)
-{
-    if (writer == NULL || crc == NULL) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    const kvs_snapshot_checkpoint_t *checkpoint =
-        &writer->checkpoint;
-
-    if ((checkpoint->has_offset != 0 &&
-         checkpoint->has_offset != 1) ||
-        (checkpoint->has_offset && checkpoint->offset < 0)) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    uint32_t flags = checkpoint->has_offset
-        ? SNAPSHOT_FLAG_HAS_OFFSET : 0;
-
-    uint64_t offset = checkpoint->has_offset
-        ? (uint64_t)checkpoint->offset : 0;
-
-    unsigned char header[SNAPSHOT_HEADER_V2_SIZE] = {0};
-
-    memcpy(header, SNAPSHOT_MAGIC, SNAPSHOT_MAGIC_SIZE);
-    encode_u32_be(header + 8, SNAPSHOT_VERSION_V2);
-    encode_u32_be(header + 12, flags);
-    encode_u64_be(header + 16, record_count);
-    encode_u64_be(header + 24, offset);
-
-    if (snapshot_writer_append(
-            writer, header, sizeof(header)) < 0) {
-        return -1;
-    }
-
-    *crc = snapshot_crc32_update(*crc, header, sizeof(header));
-    return 0;
-}
-
-/* 编码一条记录：记录头、key、value，并依次追加到缓冲区。 */
-static int snapshot_write_record(
-    snapshot_writer_t *writer,
+/* 四个固定分段共用现有引擎遍历入口。 */
+static int snapshot_foreach(
     kvs_snapshot_engine_t engine,
-    const char *key,
-    const char *value,
-    uint32_t *crc)
-{
-    if (key == NULL || value == NULL || crc == NULL) {
-        return -1;
-    }
-
-    if (engine < KVS_SNAPSHOT_ENGINE_ARRAY ||
-        engine > KVS_SNAPSHOT_ENGINE_SKIPLIST) {
-        return -1;
-    }
-
-    size_t key_length = strlen(key);
-    size_t value_length = strlen(value);
-
-    if (key_length > UINT32_MAX || value_length > UINT32_MAX) {
-        return -1;
-    }
-
-    /* 记录头格式保持不变。 */
-    unsigned char header[SNAPSHOT_RECORD_HEADER_SIZE];
-
-    header[0] = (unsigned char)engine;
-    encode_u32_be(header + 1, (uint32_t)key_length);
-    encode_u32_be(header + 5, (uint32_t)value_length);
-
-    /* 按文件格式要求的顺序追加：记录头 → key → value。 */
-    if (snapshot_writer_append(
-            writer, header, sizeof(header)) < 0) {
-        return -1;
-    }
-
-    if (snapshot_writer_append(
-            writer, (const unsigned char *)key, key_length) < 0) {
-        return -1;
-    }
-
-    if (snapshot_writer_append(
-            writer, (const unsigned char *)value, value_length) < 0) {
-        return -1;
-    }
-
-    /* CRC 仍覆盖同样的字节，顺序也保持不变。 */
-    *crc = snapshot_crc32_update(*crc, header, sizeof(header));
-    *crc = snapshot_crc32_update(
-        *crc, (const unsigned char *)key, key_length);
-    *crc = snapshot_crc32_update(
-        *crc, (const unsigned char *)value, value_length);
-
-    return 0;
-}
-/* foreach 回调：将当前键值对写入文件。 */
-static int snapshot_write_item(
-    const char *key,
-    const char *value,
+    int (*visit)(const char *, const char *, void *),
     void *context)
 {
-    if (context == NULL) {
+    switch (engine) {
+    case KVS_SNAPSHOT_ENGINE_ARRAY:
+        return kvs_array_foreach(&global_array, visit, context);
+    case KVS_SNAPSHOT_ENGINE_RBTREE:
+        return kvs_rbtree_foreach(&global_rbtree, visit, context);
+    case KVS_SNAPSHOT_ENGINE_HASH:
+        return kvs_hash_foreach(&global_hash, visit, context);
+    case KVS_SNAPSHOT_ENGINE_SKIPLIST:
+        return kvs_skiplist_foreach(&global_skiplist, visit, context);
+    default:
+        errno = EINVAL;
         return -1;
     }
+}
 
+/* 头部和段表只保存固定顺序的记录数，不为每条记录重复编码引擎。 */
+static int snapshot_v3_write_header(snapshot_writer_t *writer, uint32_t *crc)
+{
+    unsigned char header[SNAPSHOT_HEADER_V3_SIZE] = {0};
+    memcpy(header, SNAPSHOT_MAGIC, SNAPSHOT_MAGIC_SIZE);
+    encode_u32_be(header + 8, SNAPSHOT_VERSION_V3);
+    header[12] = (unsigned char)writer->checksum;
+
+    for (unsigned int section = 0; section < SNAPSHOT_SECTION_COUNT; section++) {
+        uint64_t count = 0;
+        if (snapshot_foreach((kvs_snapshot_engine_t)(section + 1),
+                             snapshot_count_item, &count) < 0) {
+            return -1;
+        }
+        encode_u64_be(header + 16 + section * 8, count);
+    }
+    *crc = snapshot_crc32_update(*crc, header, sizeof(header));
+    return snapshot_writer_append(writer, header, sizeof(header));
+}
+
+/* body 始终为两个长度和键值；record 模式再加可信边界和本条 CRC。 */
+static int snapshot_v3_write_record(
+    const char *key, const char *value, void *context)
+{
     snapshot_write_context_t *ctx = context;
-
-    return snapshot_write_record(
-        ctx->writer,
-        ctx->engine,
-        key,
-        value,
-        ctx->crc
-    );
-}
-
-/* 依次写入四种引擎的全部记录。 */
-static int snapshot_write_records(
-    snapshot_writer_t *writer,
-    uint32_t *crc)
-{
-    if (crc == NULL) {
+    snapshot_writer_t *writer = ctx->writer;
+    size_t key_length = strlen(key);
+    size_t value_length = strlen(value);
+    uint64_t body_length = UINT64_C(8) + key_length + value_length;
+    if (key_length > UINT32_MAX || value_length > UINT32_MAX ||
+        (writer->checksum == KVS_SNAPSHOT_CHECKSUM_RECORD && body_length > UINT32_MAX)) {
+        errno = EOVERFLOW;
         return -1;
     }
 
-    snapshot_write_context_t context = {
-        .writer = writer,
-        .engine = KVS_SNAPSHOT_ENGINE_ARRAY,
-        .crc = crc
-    };
-
-    if (kvs_array_foreach(
-            &global_array, snapshot_write_item, &context) < 0) {
-        return -1;
+    unsigned char lengths[8];
+    encode_u32_be(lengths, (uint32_t)key_length);
+    encode_u32_be(lengths + 4, (uint32_t)value_length);
+    if (writer->checksum == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+        unsigned char boundary[4];
+        encode_u32_be(boundary, (uint32_t)body_length);
+        *ctx->crc = snapshot_crc32_update(*ctx->crc, boundary, sizeof(boundary));
+        if (snapshot_writer_append(writer, boundary, sizeof(boundary)) < 0) {
+            return -1;
+        }
     }
 
-    context.engine = KVS_SNAPSHOT_ENGINE_RBTREE;
-    if (kvs_rbtree_foreach(
-            &global_rbtree, snapshot_write_item, &context) < 0) {
-        return -1;
-    }
-
-    context.engine = KVS_SNAPSHOT_ENGINE_HASH;
-    if (kvs_hash_foreach(
-            &global_hash, snapshot_write_item, &context) < 0) {
-        return -1;
-    }
-
-    context.engine = KVS_SNAPSHOT_ENGINE_SKIPLIST;
-    if (kvs_skiplist_foreach(
-            &global_skiplist, snapshot_write_item, &context) < 0) {
-        return -1;
-    }
-
-    return 0;
-}
-
-/*
- * 编码并写出完整快照。
- * 文件同步、关闭和 rename 仍由外层 SAVE 负责。
- */
-static int snapshot_write_contents(snapshot_writer_t *writer)
-{
-    uint64_t record_count = 0;
-
-    if (snapshot_count_records(&record_count) < 0) {
+    if (snapshot_writer_append(writer, lengths, sizeof(lengths)) < 0 ||
+        snapshot_writer_append(writer, (const unsigned char *)key, key_length) < 0 ||
+        snapshot_writer_append(writer, (const unsigned char *)value, value_length) < 0) {
         return -1;
     }
 
     uint32_t crc = UINT32_C(0xffffffff);
+    if (writer->checksum == KVS_SNAPSHOT_CHECKSUM_FILE) {
+        crc = *ctx->crc;
+    }
+    crc = snapshot_crc32_update(crc, lengths, sizeof(lengths));
+    crc = snapshot_crc32_update(crc, (const unsigned char *)key, key_length);
+    crc = snapshot_crc32_update(crc, (const unsigned char *)value, value_length);
 
-    /* 文件头和记录依次进入同一个缓冲区。 */
-    if (snapshot_write_header(writer, record_count, &crc) < 0) {
+    if (writer->checksum == KVS_SNAPSHOT_CHECKSUM_FILE) {
+        *ctx->crc = crc;
+        return 0;
+    }
+    unsigned char checksum[4];
+    encode_u32_be(checksum, crc ^ UINT32_C(0xffffffff));
+    return snapshot_writer_append(writer, checksum, sizeof(checksum));
+}
+
+/* 同一个调度线程内先计数再遍历，不在快照中途让出客户端写入。 */
+static int snapshot_write_contents(snapshot_writer_t *writer)
+{
+    uint32_t crc = UINT32_C(0xffffffff);
+    if (snapshot_v3_write_header(writer, &crc) < 0) {
         return -1;
     }
-
-    if (snapshot_write_records(writer, &crc) < 0) {
+    snapshot_write_context_t context = {.writer = writer, .crc = &crc};
+    for (unsigned int section = 0; section < SNAPSHOT_SECTION_COUNT; section++) {
+        if (snapshot_foreach((kvs_snapshot_engine_t)(section + 1),
+                             snapshot_v3_write_record, &context) < 0) {
+            return -1;
+        }
+    }
+    unsigned char checksum[4];
+    encode_u32_be(checksum, crc ^ UINT32_C(0xffffffff));
+    if (snapshot_writer_append(writer, checksum, sizeof(checksum)) < 0) {
         return -1;
     }
-
-    /* 最后追加校验值，格式保持不变。 */
-    uint32_t checksum = crc ^ UINT32_C(0xffffffff);
-    unsigned char checksum_bytes[SNAPSHOT_CHECKSUM_SIZE];
-
-    encode_u32_be(checksum_bytes, checksum);
-
-    if (snapshot_writer_append(
-            writer, checksum_bytes, sizeof(checksum_bytes)) < 0) {
-        return -1;
-    }
-
-    /* 把最后未满一批的数据也写出去。 */
     return snapshot_writer_flush(writer);
 }
 
@@ -995,26 +879,11 @@ static int snapshot_insert_record(
         return -1;
     }
 }
-/* 第二遍：读取一条记录并恢复到对应引擎。 */
-static int snapshot_load_record(snapshot_read_cursor_t *cursor)
+/* 两种格式共用字符串分配、插入及释放，错误仍由调用方清空引擎。 */
+static int snapshot_load_fields(
+    snapshot_read_cursor_t *cursor, kvs_snapshot_engine_t engine,
+    uint32_t key_length, uint32_t value_length)
 {
-    /* 记录头直接借用映射，不复制。 */
-    const unsigned char *record_header = NULL;
-    if (snapshot_cursor_take(
-            cursor, &record_header, SNAPSHOT_RECORD_HEADER_SIZE) < 0) {
-        return -1;
-    }
-
-    unsigned char engine = record_header[0];
-    if (engine < KVS_SNAPSHOT_ENGINE_ARRAY ||
-        engine > KVS_SNAPSHOT_ENGINE_SKIPLIST) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    uint32_t key_length = decode_u32_be(record_header + 1);
-    uint32_t value_length = decode_u32_be(record_header + 5);
-
     /* key/value 转换为现有引擎需要的临时C字符串。 */
     char *key = snapshot_read_field(cursor, key_length);
     if (key == NULL) {
@@ -1036,7 +905,7 @@ static int snapshot_load_record(snapshot_read_cursor_t *cursor)
      * 引擎成功插入时会保存自己的key/value副本。
      */
     int result = snapshot_insert_record(
-        (kvs_snapshot_engine_t)engine, key, value);
+        engine, key, value);
 
     /* 无论插入成功与否，这两个临时字符串都需要释放。 */
     int saved_errno = errno;
@@ -1052,6 +921,243 @@ static int snapshot_load_record(snapshot_read_cursor_t *cursor)
     return result == 0 ? 0 : -1;
 }
 
+/* 第二遍：读取一条记录并恢复到对应引擎。 */
+static int snapshot_load_record(snapshot_read_cursor_t *cursor)
+{
+    /* 记录头直接借用映射，不复制。 */
+    const unsigned char *record_header = NULL;
+    if (snapshot_cursor_take(
+            cursor, &record_header, SNAPSHOT_RECORD_HEADER_SIZE) < 0) {
+        return -1;
+    }
+
+    unsigned char engine = record_header[0];
+    if (engine < KVS_SNAPSHOT_ENGINE_ARRAY ||
+        engine > KVS_SNAPSHOT_ENGINE_SKIPLIST) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint32_t key_length = decode_u32_be(record_header + 1);
+    uint32_t value_length = decode_u32_be(record_header + 5);
+
+    return snapshot_load_fields(cursor, (kvs_snapshot_engine_t)engine,
+                                key_length, value_length);
+}
+
+
+/* v3 单独解析，旧版本继续使用原来的逐条引擎编号读取器。 */
+typedef struct {
+    kvs_snapshot_checksum_t checksum;
+    uint64_t counts[SNAPSHOT_SECTION_COUNT];
+} snapshot_v3_header_t;
+
+typedef struct {
+    const unsigned char *body;
+    size_t length;
+    uint32_t checksum;
+} snapshot_v3_record_t;
+
+static int snapshot_v3_read_header(
+    snapshot_read_cursor_t *cursor, snapshot_v3_header_t *header)
+{
+    const unsigned char *bytes;
+    if (snapshot_cursor_take(cursor, &bytes, SNAPSHOT_HEADER_V3_SIZE) < 0) {
+        return -1;
+    }
+    if (memcmp(bytes, SNAPSHOT_MAGIC, SNAPSHOT_MAGIC_SIZE) != 0 ||
+        decode_u32_be(bytes + 8) != SNAPSHOT_VERSION_V3 ||
+        bytes[12] > KVS_SNAPSHOT_CHECKSUM_RECORD ||
+        bytes[13] != 0 || bytes[14] != 0 || bytes[15] != 0 ||
+        cursor->length - cursor->offset < SNAPSHOT_CHECKSUM_SIZE) {
+        errno = EINVAL;
+        return -1;
+    }
+    header->checksum = (kvs_snapshot_checksum_t)bytes[12];
+    size_t minimum_record_size = 8;
+    if (header->checksum == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+        minimum_record_size = 16;
+    }
+    uint64_t budget = (cursor->length - cursor->offset - SNAPSHOT_CHECKSUM_SIZE) /
+                      minimum_record_size;
+    for (unsigned int section = 0; section < SNAPSHOT_SECTION_COUNT; section++) {
+        header->counts[section] = decode_u64_be(bytes + 16 + section * 8);
+        if (header->counts[section] > budget) {
+            errno = EINVAL;
+            return -1;
+        }
+        budget -= header->counts[section];
+    }
+    return 0;
+}
+
+/* 只确定边界，不信任 record 模式 body 内部可能损坏的两个长度。 */
+static int snapshot_v3_read_record(
+    snapshot_read_cursor_t *cursor, kvs_snapshot_checksum_t mode,
+    snapshot_v3_record_t *record, uint32_t *structure_crc)
+{
+    const unsigned char *lengths;
+    if (mode == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+        if (snapshot_cursor_take(cursor, &lengths, 4) < 0) {
+            return -1;
+        }
+        *structure_crc = snapshot_crc32_update(*structure_crc, lengths, 4);
+        record->length = decode_u32_be(lengths);
+        if (record->length < 8 ||
+            snapshot_cursor_take(cursor, &record->body, record->length) < 0 ||
+            snapshot_cursor_take(cursor, &lengths, 4) < 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        record->checksum = decode_u32_be(lengths);
+        return 0;
+    }
+
+    if (snapshot_cursor_take(cursor, &lengths, 8) < 0) {
+        return -1;
+    }
+    uint64_t body_length = UINT64_C(8) + decode_u32_be(lengths) +
+                           decode_u32_be(lengths + 4);
+    if (body_length > SIZE_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    record->body = lengths;
+    record->length = (size_t)body_length;
+    const unsigned char *payload;
+    return snapshot_cursor_take(cursor, &payload, record->length - 8);
+}
+
+/* 在完整 body 边界内检查长度和 NUL，成功后才允许引擎复制键值。 */
+static int snapshot_v3_check_body(const snapshot_v3_record_t *record)
+{
+    uint32_t key_length = decode_u32_be(record->body);
+    uint32_t value_length = decode_u32_be(record->body + 4);
+    if (UINT64_C(8) + key_length + value_length != record->length ||
+        memchr(record->body + 8, '\0', record->length - 8) != NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* 第一遍只检查结构和整文件边界，绝不向引擎写入。 */
+static int snapshot_v3_validate(
+    snapshot_read_cursor_t *cursor, kvs_snapshot_load_policy_t policy)
+{
+    snapshot_v3_header_t header;
+    if (snapshot_v3_read_header(cursor, &header) < 0) {
+        return -1;
+    }
+    if (policy == KVS_SNAPSHOT_LOAD_REQUIRE_FILE &&
+        header.checksum != KVS_SNAPSHOT_CHECKSUM_FILE) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint32_t crc = snapshot_crc32_update(UINT32_C(0xffffffff),
+                                        cursor->data, cursor->offset);
+    for (unsigned int section = 0; section < SNAPSHOT_SECTION_COUNT; section++) {
+        for (uint64_t index = 0; index < header.counts[section]; index++) {
+            snapshot_v3_record_t record = {0};
+            if (snapshot_v3_read_record(cursor, header.checksum, &record, &crc) < 0) {
+                return -1;
+            }
+            if (header.checksum == KVS_SNAPSHOT_CHECKSUM_FILE) {
+                if (snapshot_v3_check_body(&record) < 0) {
+                    return -1;
+                }
+                crc = snapshot_crc32_update(crc, record.body, record.length);
+            }
+        }
+    }
+    const unsigned char *checksum;
+    if (snapshot_cursor_take(cursor, &checksum, 4) < 0) {
+        return -1;
+    }
+    if (cursor->offset != cursor->length ||
+        decode_u32_be(checksum) != (crc ^ UINT32_C(0xffffffff))) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* 第二遍：沿已校验的外层边界读取，坏记录不会改变下一条的位置。 */
+static int snapshot_v3_load(snapshot_read_cursor_t *cursor)
+{
+    snapshot_v3_header_t header;
+    if (snapshot_v3_read_header(cursor, &header) < 0) {
+        return -1;
+    }
+    uint32_t unused_crc = UINT32_C(0xffffffff);
+    for (unsigned int section = 0; section < SNAPSHOT_SECTION_COUNT; section++) {
+        for (uint64_t index = 0; index < header.counts[section]; index++) {
+            size_t offset = cursor->offset;
+            snapshot_v3_record_t record = {0};
+            if (snapshot_v3_read_record(cursor, header.checksum, &record, &unused_crc) < 0) {
+                return -1;
+            }
+            if (header.checksum == KVS_SNAPSHOT_CHECKSUM_RECORD) {
+                uint32_t actual = snapshot_crc32_update(UINT32_C(0xffffffff),
+                                                       record.body, record.length);
+                if ((actual ^ UINT32_C(0xffffffff)) != record.checksum ||
+                    snapshot_v3_check_body(&record) < 0) {
+                    fprintf(stderr, "snapshot: skipped corrupt record section=%u "
+                                    "record=%" PRIu64 " offset=%zu\n",
+                            section + 1, index, offset);
+                    continue;
+                }
+            }
+            snapshot_read_cursor_t body = {
+                .data = record.body, .length = record.length, .offset = 8
+            };
+            if (snapshot_load_fields(&body, (kvs_snapshot_engine_t)(section + 1),
+                                     decode_u32_be(record.body),
+                                     decode_u32_be(record.body + 4)) < 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* 保持 v1/v2 的整文件校验和检查点兼容。 */
+static int snapshot_legacy_load(snapshot_read_cursor_t *cursor)
+{
+    if (snapshot_validate(cursor) < 0) {
+        return -1;
+    }
+    cursor->offset = 0;
+    uint64_t record_count = 0;
+    uint32_t crc = UINT32_C(0xffffffff);
+    if (snapshot_read_header(cursor, &record_count, &crc) < 0) {
+        return -1;
+    }
+    for (uint64_t i = 0; i < record_count; i++) {
+        if (snapshot_load_record(cursor) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int snapshot_load_contents(
+    snapshot_read_cursor_t *cursor, kvs_snapshot_load_policy_t policy)
+{
+    if (cursor->length < 12) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (decode_u32_be(cursor->data + 8) != SNAPSHOT_VERSION_V3) {
+        return snapshot_legacy_load(cursor);
+    }
+    if (snapshot_v3_validate(cursor, policy) < 0) {
+        return -1;
+    }
+    cursor->offset = 0;
+    return snapshot_v3_load(cursor);
+}
+
 
 /* ============================================================
  * 六、对外接口
@@ -1062,11 +1168,12 @@ static int snapshot_load_record(snapshot_read_cursor_t *cursor)
  * rename 之前失败保留旧文件。
  * rename 之后若同步失败，返回失败，但正式文件可能已被替换。
  */
-int kvs_snapshot_store_save_with_checkpoint(
-    const char *path,
-    const kvs_snapshot_checkpoint_t *checkpoint)
+int kvs_snapshot_store_save_with_checksum(
+    const char *path, kvs_snapshot_checksum_t checksum)
 {
-    if (path == NULL || path[0] == '\0') {
+    if (path == NULL || path[0] == '\0' ||
+        (checksum != KVS_SNAPSHOT_CHECKSUM_FILE &&
+         checksum != KVS_SNAPSHOT_CHECKSUM_RECORD)) {
         errno = EINVAL;
         return -1;
     }
@@ -1103,9 +1210,7 @@ int kvs_snapshot_store_save_with_checkpoint(
     /* 本次 SAVE 共用一个 writer，初始时不持有资源。 */
     snapshot_writer_t writer = {0};
 
-    if (checkpoint != NULL) {
-        writer.checkpoint = *checkpoint;
-    }
+    writer.checksum = checksum;
 
     /* 1. 在正式文件旁边创建唯一临时文件。 */
     file_fd = mkstemp(temp_path);
@@ -1189,7 +1294,7 @@ done:
 
 int kvs_snapshot_store_save(const char *path)
 {
-    return kvs_snapshot_store_save_with_checkpoint(path, NULL);
+    return kvs_snapshot_store_save_with_checksum(path, KVS_SNAPSHOT_CHECKSUM_FILE);
 }
 
 /*
@@ -1197,8 +1302,8 @@ int kvs_snapshot_store_save(const char *path)
  * 返回 0：成功；1：文件不存在；-1：失败。
  * 失败后，调用方必须清空可能已部分恢复的数据。
  */
-int kvs_snapshot_store_load_with_checkpoint(
-    const char *path,
+static int snapshot_store_load(
+    const char *path, kvs_snapshot_load_policy_t policy,
     kvs_snapshot_checkpoint_t *checkpoint)
 {
     if (path == NULL || path[0] == '\0') {
@@ -1219,33 +1324,9 @@ int kvs_snapshot_store_load_with_checkpoint(
         .offset = 0
     };
 
-    int result = -1;
+    int result = snapshot_load_contents(&cursor, policy);
     int saved_errno;
 
-    /* 第一遍：校验完整文件，不修改引擎。 */
-    if (snapshot_validate(&cursor) < 0) {
-        goto done;
-    }
-
-    /* 第二遍：重新从头解析，再恢复数据。 */
-    cursor.offset = 0;
-
-    uint64_t record_count = 0;
-    uint32_t crc = UINT32_C(0xffffffff);
-
-    if (snapshot_read_header(&cursor, &record_count, &crc) < 0) {
-        goto done;
-    }
-
-    for (uint64_t i = 0; i < record_count; ++i) {
-        if (snapshot_load_record(&cursor) < 0) {
-            goto done;
-        }
-    }
-
-    result = 0;
-
-done:
     /* 保留原始错误，避免释放资源时覆盖。 */
     saved_errno = errno;
 
@@ -1262,7 +1343,24 @@ done:
     errno = saved_errno;
     return result;
 }
+
 int kvs_snapshot_store_load(const char *path)
 {
-    return kvs_snapshot_store_load_with_checkpoint(path, NULL);
+    return kvs_snapshot_store_load_with_policy(path, KVS_SNAPSHOT_LOAD_AUTO);
+}
+
+int kvs_snapshot_store_load_with_policy(
+    const char *path, kvs_snapshot_load_policy_t policy)
+{
+    if (policy != KVS_SNAPSHOT_LOAD_AUTO && policy != KVS_SNAPSHOT_LOAD_REQUIRE_FILE) {
+        errno = EINVAL;
+        return -1;
+    }
+    return snapshot_store_load(path, policy, NULL);
+}
+
+int kvs_snapshot_store_load_with_checkpoint(
+    const char *path, kvs_snapshot_checkpoint_t *checkpoint)
+{
+    return snapshot_store_load(path, KVS_SNAPSHOT_LOAD_AUTO, checkpoint);
 }
