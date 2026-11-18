@@ -339,10 +339,12 @@ static int run_testcase(testcase_context_t *test, const testcase_entry_t *entry,
                         long start, long count)
 {
     double began = now();
-    /* 成功数、缺失数、回复或内容不一致数、连接/协议/服务端错误数。 */
+    /* 当前每个用例尝试一条命令，计数包含返回错误的最后一次调用。 */
+    long attempted = 0;
     long passed = 0, missing = 0, mismatched = 0, errors = 0;
     for (long i = start; i < start + count; ++i) {
         /* write 时调用 testcase_write；verify 时调用 testcase_verify。 */
+        attempted++;
         case_result_t result = entry->run(test, i);
         if (result == CASE_ERROR) {
             fprintf(stderr, "FAIL testcase=%s index=%ld\n", entry->name, i);
@@ -364,8 +366,12 @@ static int run_testcase(testcase_context_t *test, const testcase_entry_t *entry,
     }
     /* 必须指定的全部条数都通过且没有错误，最后才能打印 PASS、返回 0。 */
     int success = passed == count && !errors;
-    printf("%s op=%s expected=%ld passed=%ld missing=%ld mismatched=%ld errors=%ld seconds=%.3f\n",
-           success ? "PASS" : "FAIL", entry->name, count, passed, missing, mismatched, errors, now() - began);
+    double seconds = now() - began;
+    double qps = seconds > 0 ? passed / seconds : 0;
+    printf("%s op=%s expected=%ld passed=%ld missing=%ld mismatched=%ld errors=%ld "
+           "attempted=%ld seconds=%.9f qps=%.3f\n",
+           success ? "PASS" : "FAIL", entry->name, count, passed, missing, mismatched,
+           errors, attempted, seconds, qps);
     return success ? 0 : 1;
 }
 
