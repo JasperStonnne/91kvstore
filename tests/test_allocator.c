@@ -1,7 +1,160 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include "kvs_allocator.h"
+/* 仅本单测覆盖 munmap；按指定 slab 注入失败，其余调用交给内核。 */
+static void *fail_unmap_address;
+static unsigned int fail_unmap_count;
+static unsigned int unmap_failures;
+
+int munmap(void *address, size_t length)
+{
+    if (address == fail_unmap_address && fail_unmap_count > 0) {
+        assert(length == 64u * 1024u);
+        fail_unmap_count--;
+        unmap_failures++;
+        errno = ENOMEM;
+        return -1;
+    }
+    return (int)syscall(SYS_munmap, address, length);
+}
+
+static uintptr_t slab_address(void *block)
+{
+    return (uintptr_t)block & ~((uintptr_t)(64u * 1024u) - 1);
+}
+
+/* 4096 规格下 45 个对象填满三个 slab，按申请顺序记录尾、中、头。 */
+static void allocate_three_slabs(unsigned char **blocks, uintptr_t *regions)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < 45; i++) {
+        blocks[i] = kvs_allocator_alloc(4096);
+        assert(blocks[i] != NULL);
+        blocks[i][0] = (unsigned char)i;
+        blocks[i][4095] = (unsigned char)(i + 100);
+        uintptr_t region = slab_address(blocks[i]);
+        if (count == 0 || regions[count - 1] != region) {
+            assert(count < 3);
+            regions[count++] = region;
+        }
+    }
+    assert(count == 3);
+}
+
+static void free_region(unsigned char **blocks, uintptr_t region)
+{
+    for (size_t i = 0; i < 45; i++) {
+        if (blocks[i] != NULL && slab_address(blocks[i]) == region) {
+            kvs_allocator_free(blocks[i]);
+            blocks[i] = NULL;
+        }
+    }
+}
+
+static void check_survivors(unsigned char **blocks, size_t expected_slabs)
+{
+    size_t live = 0;
+    for (size_t i = 0; i < 45; i++) {
+        if (blocks[i] != NULL) {
+            assert(blocks[i][0] == (unsigned char)i);
+            assert(blocks[i][4095] == (unsigned char)(i + 100));
+            live++;
+        }
+    }
+    kvs_pool_stats_t stats;
+    assert(kvs_allocator_pool_stats(&stats) == 0);
+    assert(stats.live_objects == live);
+    assert(stats.slab_count == expected_slabs);
+    assert(stats.large_count == 0);
+    assert(stats.mapped_bytes == expected_slabs * 64u * 1024u);
+}
+
+static void test_empty_slab_reclaim(void)
+{
+    const size_t orders[][3] = {{1, 2, 0}, {0, 1, 2}, {2, 0, 1}};
+    for (size_t round = 0; round < 3; round++) {
+        assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
+        unsigned char *blocks[45];
+        uintptr_t regions[3];
+        allocate_three_slabs(blocks, regions);
+        check_survivors(blocks, 3);
+        for (size_t step = 0; step < 3; step++) {
+            free_region(blocks, regions[orders[round][step]]);
+            check_survivors(blocks, 2 - step);
+        }
+        /* 完全回收后重新申请、写入并释放，池仍能正常工作。 */
+        unsigned char *again = kvs_allocator_alloc(4096);
+        assert(again != NULL);
+        again[4095] = 7;
+        assert(again[4095] == 7);
+        kvs_allocator_free(again);
+        check_survivors(blocks, 0);
+        assert(kvs_allocator_destroy() == 0);
+    }
+    puts("[PASS] allocator empty head/middle/tail slabs reclaimed; survivors and reallocation valid");
+}
+
+static void test_slab_unmap_failure(void)
+{
+    /* 每个链表位置都验证失败后恢复链接、随后复用及再次成功释放。 */
+    for (size_t victim = 0; victim < 3; victim++) {
+        assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
+        unsigned char *blocks[45];
+        uintptr_t regions[3];
+        allocate_three_slabs(blocks, regions);
+        fail_unmap_address = (void *)regions[victim];
+        fail_unmap_count = 1;
+        unsigned int before = unmap_failures;
+        free_region(blocks, regions[victim]);
+        assert(unmap_failures == before + 1 && fail_unmap_count == 0);
+        check_survivors(blocks, 3);
+        assert(kvs_allocator_destroy() == -1); /* 其他两个 slab 仍有存活对象。 */
+        unsigned char *reused = kvs_allocator_alloc(4096);
+        assert(reused != NULL && slab_address(reused) == regions[victim]);
+        reused[4095] = 9;
+        assert(reused[4095] == 9);
+        kvs_allocator_free(reused);
+        check_survivors(blocks, 2);
+        for (size_t other = 0; other < 3; other++) {
+            if (other != victim) {
+                free_region(blocks, regions[other]);
+            }
+        }
+        check_survivors(blocks, 0);
+        assert(kvs_allocator_destroy() == 0);
+    }
+
+    /* 销毁时已成功释放头节点、随后中间节点失败，也能保持可用。 */
+    assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
+    unsigned char *blocks[45];
+    uintptr_t regions[3];
+    allocate_three_slabs(blocks, regions);
+    for (size_t i = 0; i < 3; i++) {
+        fail_unmap_address = (void *)regions[i];
+        fail_unmap_count = 1;
+        free_region(blocks, regions[i]);
+        assert(fail_unmap_count == 0);
+    }
+    check_survivors(blocks, 3);
+    fail_unmap_address = (void *)regions[1];
+    fail_unmap_count = 1;
+    assert(kvs_allocator_destroy() == -1);
+    assert(fail_unmap_count == 0);
+    check_survivors(blocks, 2);
+    void *reused = kvs_allocator_alloc(4096);
+    assert(reused != NULL && slab_address(reused) == regions[1]);
+    kvs_allocator_free(reused);
+    check_survivors(blocks, 1);
+    assert(kvs_allocator_destroy() == 0);
+    fail_unmap_address = NULL;
+    puts("[PASS] allocator munmap failure restores head/middle/tail links and partial destroy is retryable");
+}
+
 static void test_pool_multiple_slabs(void)
 {
     assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
@@ -201,22 +354,21 @@ static void test_pool_stats(void)
     kvs_allocator_free(small);
     kvs_allocator_free(large);
 
-    /* 对象已释放；大对象区域已归还，空 slab 仍保留。 */
+    /* 对象已释放，小对象 slab 和大对象映射都已归还。 */
     assert(kvs_allocator_pool_stats(&stats) == 0);
     assert(stats.live_objects == 0);
-    assert(stats.slab_count == 1);
+    assert(stats.slab_count == 0);
     assert(stats.large_count == 0);
-    assert(stats.mapped_bytes > 0);
-    size_t retained_bytes = stats.mapped_bytes;
+    assert(stats.mapped_bytes == 0);
 
-    /* 同规格再次申请，不应增加保留的 slab 和映射空间。 */
+    /* 同规格再次申请会重新创建 slab，仍可正常读写和释放。 */
     small = kvs_allocator_alloc(25);
     assert(small != NULL);
 
     assert(kvs_allocator_pool_stats(&stats) == 0);
     assert(stats.live_objects == 1);
     assert(stats.slab_count == 1);
-    assert(stats.mapped_bytes == retained_bytes);
+    assert(stats.mapped_bytes == 64u * 1024u);
 
     kvs_allocator_free(small);
     assert(kvs_allocator_destroy() == 0);
@@ -262,6 +414,8 @@ int main(void)
     test_pool_mixed_objects();
     test_pool_boundaries();
     test_pool_stats();
+    test_empty_slab_reclaim();
+    test_slab_unmap_failure();
     puts("[PASS] allocator lifecycle");
     return 0;
 }

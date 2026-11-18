@@ -31,6 +31,7 @@ typedef struct kvs_slab {
     unsigned char *bitmap;
     unsigned char *data;
 
+    struct kvs_slab *prev;
     struct kvs_slab *next;
 } kvs_slab_t;
 
@@ -315,6 +316,7 @@ static kvs_slab_t *slab_create(size_t block_size)
     slab->free_list = NULL;
     slab->bitmap = (unsigned char *)slab + sizeof(*slab);
     slab->data = (unsigned char *)slab + offset;
+    slab->prev = NULL;
     slab->next = NULL;
 
     /* 初始时，所有块都是空闲状态。 */
@@ -360,10 +362,44 @@ static void *pool_alloc_small(size_t size)
 
         /* 创建完整后，才挂入这个规格池。 */
         slab->next = pool->slabs;
+        if (pool->slabs != NULL) {
+            pool->slabs->prev = slab;
+        }
         pool->slabs = slab;
     }
 
     return slab_alloc_block(slab);
+}
+
+/* 只接收空 slab；解除映射失败时恢复原链表，保留复用和重试能力。 */
+static int slab_release(kvs_slab_t *slab)
+{
+    kvs_size_class_t *pool = find_size_class(slab->block_size);
+    kvs_slab_t *prev = slab->prev;
+    kvs_slab_t *next = slab->next;
+
+    if (prev != NULL) {
+        prev->next = next;
+    } else {
+        pool->slabs = next;
+    }
+    if (next != NULL) {
+        next->prev = prev;
+    }
+
+    /* 成功后不再访问 slab，后续链表操作只使用预先保存的邻居。 */
+    if (munmap(slab, KVS_SLAB_SIZE) == 0) {
+        return 0;
+    }
+    if (prev != NULL) {
+        prev->next = slab;
+    } else {
+        pool->slabs = slab;
+    }
+    if (next != NULL) {
+        next->prev = slab;
+    }
+    return -1;
 }
 
 /* 成功返回 0；发现块位置或状态不正确时返回 -1。 */
@@ -407,6 +443,10 @@ static int pool_free_small(void *ptr)
     slab->free_list = block;
     slab->used_count--;
 
+    if (slab->used_count == 0) {
+        /* block 已归还；munmap 失败则保留空 slab，供复用或 destroy 重试。 */
+        slab_release(slab);
+    }
     return 0;
 }
 
@@ -429,16 +469,9 @@ static int pool_destroy(void)
     /* 所有 block 都已归还，可以释放各个 slab。 */
     for (size_t i = 0; i < SIZE_CLASS_COUNT; i++) {
         while (pools[i].slabs != NULL) {
-            kvs_slab_t *slab = pools[i].slabs;
-
-            /* 必须在 munmap 前保存 next，释放后不能再读 slab。 */
-            kvs_slab_t *next = slab->next;
-
-            if (munmap(slab, KVS_SLAB_SIZE) != 0) {
+            if (slab_release(pools[i].slabs) != 0) {
                 return -1;
             }
-
-            pools[i].slabs = next;
         }
     }
 
@@ -539,7 +572,7 @@ int kvs_allocator_pool_stats(kvs_pool_stats_t *stats)
 
     kvs_pool_stats_t result = {0};
 
-    /* 汇总小对象：对象释放后，空 slab 目前仍会保留。 */
+    /* 汇总仍保留的 slab，包含解除映射失败后暂存的空 slab。 */
     for (size_t i = 0; i < SIZE_CLASS_COUNT; i++) {
         kvs_slab_t *slab = pools[i].slabs;
 

@@ -195,10 +195,11 @@ static void test_hash_backend(kvs_allocator_backend_t backend)
     assert(kvs_hash_del(&hash, "missing") < 0);
     assert(hash.count == 0);
 
-    /* 同规格重新插入，不应增加保留的 slab 和映射空间。 */
+    /* 记录全部删除后，小对象 slab 已释放；重新插入会创建新 slab。 */
     kvs_pool_stats_t before;
     if (backend == KVS_ALLOCATOR_POOL) {
         assert(kvs_allocator_pool_stats(&before) == 0);
+        assert(before.slab_count == 0);
     }
 
     assert(kvs_hash_set(&hash, "name", "Jasper") == 0);
@@ -208,9 +209,20 @@ static void test_hash_backend(kvs_allocator_backend_t backend)
     if (backend == KVS_ALLOCATOR_POOL) {
         kvs_pool_stats_t after;
         assert(kvs_allocator_pool_stats(&after) == 0);
-        assert(after.slab_count == before.slab_count);
-        assert(after.mapped_bytes == before.mapped_bytes);
+        assert(after.slab_count > before.slab_count);
+        assert(after.mapped_bytes > before.mapped_bytes);
     }
+
+    assert(kvs_hash_del(&hash, "name") == 0);
+    expect_pool(backend, 1, 1);
+    if (backend == KVS_ALLOCATOR_POOL) {
+        kvs_pool_stats_t reclaimed;
+        assert(kvs_allocator_pool_stats(&reclaimed) == 0);
+        assert(reclaimed.slab_count == before.slab_count);
+        assert(reclaimed.mapped_bytes == before.mapped_bytes);
+    }
+    assert(kvs_hash_set(&hash, "name", "Jasper") == 0);
+    expect_value(&hash, "name", "Jasper");
 
     /* 保留多条记录，让 Hash 销毁负责遍历回收。 */
     for (int i = 0; i < 128; i++) {
