@@ -2,7 +2,10 @@
 #define KVS_PERSISTENCE_H
 #include "protocol.h"
 #include "snapshot_format.h"
+#include "aof_format.h"
+/* 默认入口兼容纯 RESP 日志；配置由上层传给显式模式入口。 */
 int kvs_aof_open(const char *path);
+int kvs_aof_open_with_checksum(const char *path, kvs_aof_checksum_t checksum);
 int kvs_aof_append(char **tokens, int count);
 int kvs_aof_close(void);
 int kvs_snapshot_store_save(const char *path);
@@ -35,7 +38,11 @@ typedef int (*aof_replay_handler)(
     int response_capacity
 );
 
+/* offset 均以命令区起点为零，file 模式先校验整份文件再回放。 */
 int kvs_aof_replay(const char *path,long long offset,aof_replay_handler handler);
+int kvs_aof_replay_with_checksum(
+    const char *path, kvs_aof_checksum_t checksum,
+    long long offset, aof_replay_handler handler);
 typedef struct {
     int fd;                  // 当前打开的 Snapshot 文件
     long long remaining;    // 还剩多少字节没有读取

@@ -8,6 +8,7 @@
 #include <sys/stat.h>    // fstat、struct stat、S_ISREG
 #include <sys/syscall.h> // SYS_close，绕过 NtyCo 的 close hook
 #include <stdint.h>
+#include <sys/mman.h>
 #include "mapped_file.h"
 #include "uring_io.h"
 #include"persistence.h"
@@ -27,6 +28,9 @@ typedef struct {
      * 打开已有文件时，从文件末尾继续。
      */
     off_t offset;
+    kvs_aof_checksum_t checksum;
+    uint32_t crc;
+    int failed;
 
     /* 保存期间复用的 io_uring 队列。 */
     kvs_uring_io_t io;
@@ -49,59 +53,220 @@ static int kvs_aof_file_close(int fd)
 
     return (int)syscall(SYS_close,fd);
 }
-/*
-return: 0-success,-1-error
-*/
-int kvs_aof_open(const char *path)
+/* file 模式缓存头部和命令区的 CRC 中间状态，旧尾部不参与下一次追加。 */
+typedef struct {
+    size_t command_start;
+    size_t command_end;
+    uint32_t crc;
+} aof_layout_t;
+
+static int aof_valid_checksum(kvs_aof_checksum_t checksum)
 {
-    if (path == NULL || path[0] == '\0') {
+    return checksum == KVS_AOF_CHECKSUM_NONE || checksum == KVS_AOF_CHECKSUM_FILE;
+}
+
+static void aof_encode_u32(unsigned char *bytes, uint32_t value)
+{
+    for (unsigned int i = 0; i < 4; i++) {
+        bytes[i] = (unsigned char)(value >> (24 - i * 8));
+    }
+}
+
+static uint32_t aof_decode_u32(const unsigned char *bytes)
+{
+    return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+           ((uint32_t)bytes[2] << 8) | bytes[3];
+}
+
+static void aof_encode_u64(unsigned char *bytes, uint64_t value)
+{
+    for (unsigned int i = 0; i < 8; i++) {
+        bytes[i] = (unsigned char)(value >> (56 - i * 8));
+    }
+}
+
+static uint64_t aof_decode_u64(const unsigned char *bytes)
+{
+    uint64_t value = 0;
+    for (unsigned int i = 0; i < 8; i++) {
+        value = (value << 8) | bytes[i];
+    }
+    return value;
+}
+
+static uint32_t aof_crc32_update(uint32_t crc, const void *data, size_t length)
+{
+    const unsigned char *bytes = data;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= bytes[i];
+        for (unsigned int bit = 0; bit < 8; bit++) {
+            if (crc & 1u) {
+                crc = (crc >> 1) ^ UINT32_C(0xedb88320);
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+/* 尾部长度参与最终 CRC，返回值不改变缓存的命令区 CRC。 */
+static void aof_encode_trailer(unsigned char *trailer, uint64_t command_bytes,
+                               uint32_t prefix_crc)
+{
+    aof_encode_u64(trailer, command_bytes);
+    uint32_t crc = aof_crc32_update(prefix_crc, trailer, 8);
+    aof_encode_u32(trailer + 8, crc ^ UINT32_C(0xffffffff));
+}
+
+/* 校验配置与格式、尾部长度及完整 CRC；恢复和重新打开追加复用此入口。 */
+static int aof_inspect(const kvs_mapped_file_t *file, kvs_aof_checksum_t checksum,
+                       aof_layout_t *layout)
+{
+    int has_header = file->length >= 8 && memcmp(file->data, KVS_AOF_MAGIC, 8) == 0;
+    if (checksum == KVS_AOF_CHECKSUM_NONE) {
+        if (has_header) {
+            fprintf(stderr, "aof: aof_checksum=none requires raw RESP; found file-checksum format\n");
+            errno = EINVAL;
+            return -1;
+        }
+        *layout = (aof_layout_t){.command_end = file->length};
+        return 0;
+    }
+    if (!has_header || file->length < KVS_AOF_HEADER_SIZE + KVS_AOF_TRAILER_SIZE) {
+        fprintf(stderr, "aof: aof_checksum=file requires a complete 91KVAOF1 header and trailer\n");
         errno = EINVAL;
         return -1;
     }
+    if (aof_decode_u32(file->data + 8) != KVS_AOF_VERSION ||
+        aof_decode_u32(file->data + 12) != 0) {
+        fprintf(stderr, "aof: invalid file-checksum version or reserved field\n");
+        errno = EINVAL;
+        return -1;
+    }
+    size_t command_end = file->length - KVS_AOF_TRAILER_SIZE;
+    const unsigned char *trailer = file->data + command_end;
+    if (aof_decode_u64(trailer) != command_end - KVS_AOF_HEADER_SIZE) {
+        fprintf(stderr, "aof: command length does not match file-checksum trailer\n");
+        errno = EINVAL;
+        return -1;
+    }
+    uint32_t crc = aof_crc32_update(UINT32_C(0xffffffff), file->data, command_end);
+    uint32_t actual = aof_crc32_update(crc, trailer, 8) ^ UINT32_C(0xffffffff);
+    if (actual != aof_decode_u32(trailer + 8)) {
+        fprintf(stderr, "aof: whole-file CRC32 mismatch\n");
+        errno = EINVAL;
+        return -1;
+    }
+    *layout = (aof_layout_t){
+        .command_start = KVS_AOF_HEADER_SIZE, .command_end = command_end, .crc = crc
+    };
+    return 0;
+}
 
-    /* 不能重复打开，否则会丢失已有文件和队列的资源。 */
+/* 校验即将用于追加的同一个 fd，避免重新按路径打开另一个 inode。 */
+static int aof_inspect_fd(int fd, size_t length, kvs_aof_checksum_t checksum,
+                          aof_layout_t *layout)
+{
+    kvs_mapped_file_t file = {.length = length};
+    if (length > 0) {
+        void *data = mmap(NULL, length, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (data == MAP_FAILED) {
+            return -1;
+        }
+        file.data = data;
+    }
+    int result = aof_inspect(&file, checksum, layout);
+    int saved_errno = errno;
+    if (kvs_mapped_file_close(&file) < 0 && result == 0) {
+        result = -1;
+        saved_errno = errno;
+    }
+    errno = saved_errno;
+    return result;
+}
+
+/* 新文件先持久化合法的空文件，已有的零字节 file 日志按损坏拒绝。 */
+static int aof_initialize_file(int fd, kvs_uring_io_t *io, aof_layout_t *layout)
+{
+    unsigned char bytes[KVS_AOF_HEADER_SIZE + KVS_AOF_TRAILER_SIZE] = {0};
+    memcpy(bytes, KVS_AOF_MAGIC, 8);
+    aof_encode_u32(bytes + 8, KVS_AOF_VERSION);
+    uint32_t crc = aof_crc32_update(UINT32_C(0xffffffff), bytes, KVS_AOF_HEADER_SIZE);
+    aof_encode_trailer(bytes + KVS_AOF_HEADER_SIZE, 0, crc);
+    kvs_uring_write_t request = {.data = bytes, .length = sizeof(bytes), .offset = 0};
+    if (kvs_uring_io_write_batch(io, fd, &request, 1) < 0 ||
+        kvs_uring_io_sync(io, fd) < 0) {
+        return -1;
+    }
+    *layout = (aof_layout_t){
+        .command_start = KVS_AOF_HEADER_SIZE, .command_end = KVS_AOF_HEADER_SIZE, .crc = crc
+    };
+    return 0;
+}
+
+int kvs_aof_open_with_checksum(const char *path, kvs_aof_checksum_t checksum)
+{
+    if (path == NULL || path[0] == '\0' || !aof_valid_checksum(checksum)) {
+        errno = EINVAL;
+        return -1;
+    }
     if (aof_writer.fd >= 0 || aof_writer.io.initialized) {
         errno = EALREADY;
         return -1;
     }
 
-    /*
-     * 文件不存在时创建；存在时保留原内容。
-     * 不使用 O_TRUNC，也不使用 O_APPEND。
-     */
-    int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
+    /* O_EXCL 区分新文件和已有空文件，已有文件始终保留原内容。 */
+    int created = 1;
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    if (fd < 0 && errno == EEXIST) {
+        created = 0;
+        fd = open(path, O_RDWR | O_CLOEXEC);
+    }
     if (fd < 0) {
         return -1;
     }
-
-    /* 取得已有文件的长度，作为下一次写入的位置。 */
-    struct stat file_info;
-    if (fstat(fd, &file_info) < 0) {
-        int saved_errno = errno;
-        kvs_aof_file_close(fd);
-        errno = saved_errno;
-        return -1;
+    int result = -1;
+    struct stat info;
+    aof_layout_t layout = {0};
+    if (fstat(fd, &info) < 0) {
+        goto done;
     }
-
-    /* AOF 应当是普通文件。 */
-    if (!S_ISREG(file_info.st_mode) || file_info.st_size < 0) {
-        kvs_aof_file_close(fd);
+    if (!S_ISREG(info.st_mode) || info.st_size < 0 ||
+        (uintmax_t)info.st_size > SIZE_MAX) {
         errno = EINVAL;
-        return -1;
+        goto done;
     }
-
-    /* 为后续追加和同步创建队列，整个打开期间复用。 */
+    if (!created && aof_inspect_fd(fd, (size_t)info.st_size, checksum, &layout) < 0) {
+        goto done;
+    }
     if (kvs_uring_io_init(&aof_writer.io) < 0) {
+        goto done;
+    }
+    if (created && checksum == KVS_AOF_CHECKSUM_FILE &&
+        aof_initialize_file(fd, &aof_writer.io, &layout) < 0) {
+        goto done;
+    }
+    aof_writer.fd = fd;
+    aof_writer.offset = (off_t)layout.command_end;
+    aof_writer.checksum = checksum;
+    aof_writer.crc = layout.crc;
+    aof_writer.failed = 0;
+    result = 0;
+
+done:
+    if (result < 0) {
         int saved_errno = errno;
+        kvs_uring_io_close(&aof_writer.io);
         kvs_aof_file_close(fd);
         errno = saved_errno;
-        return -1;
     }
+    return result;
+}
 
-    /* 资源全部准备成功后，才将文件标记为已打开。 */
-    aof_writer.fd = fd;
-    aof_writer.offset = file_info.st_size;
-    return 0;
+int kvs_aof_open(const char *path)
+{
+    return kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_NONE);
 }
 
 int kvs_aof_close(void)
@@ -126,6 +291,9 @@ int kvs_aof_close(void)
      */
     aof_writer.fd = -1;
     aof_writer.offset = 0;
+    aof_writer.crc = 0;
+    aof_writer.failed = 0;
+    aof_writer.checksum = KVS_AOF_CHECKSUM_NONE;
 
     errno = saved_errno;
     return close_result;
@@ -133,103 +301,85 @@ int kvs_aof_close(void)
 
 int kvs_aof_append(char **tokens, int count)
 {
-    if (aof_writer.fd < 0 ||
-        !aof_writer.io.initialized ||
-        tokens == NULL ||
+    if (aof_writer.fd < 0 || !aof_writer.io.initialized || tokens == NULL ||
         (count != 2 && count != 3)) {
         errno = EINVAL;
         return -1;
     }
-
-    /* 1. 保留原来的编码过程：命令名、key、可选的 value。 */
+    if (aof_writer.failed) {
+        errno = EIO;
+        return -1;
+    }
     kvs_slice_t fields[3];
-
     for (int i = 0; i < count; i++) {
         if (tokens[i] == NULL) {
             errno = EINVAL;
             return -1;
         }
-
         fields[i].data = tokens[i];
         fields[i].length = strlen(tokens[i]);
     }
-
-    size_t required = 0;
-    if (kvs_encoded_command_size(
-            fields, (size_t)count, &required) != 0) {
+    size_t required;
+    if (kvs_encoded_command_size(fields, (size_t)count, &required) != 0) {
         return -1;
     }
-
-    char *encoded = kvs_malloc(required);
-    if (encoded == NULL) {
-        return -1;
+    size_t trailer_size = 0;
+    if (aof_writer.checksum == KVS_AOF_CHECKSUM_FILE) {
+        trailer_size = KVS_AOF_TRAILER_SIZE;
     }
-
-    size_t encoded_length = 0;
-    if (kvs_encode_command(
-            fields,
-            (size_t)count,
-            encoded,
-            required,
-            &encoded_length) != 0) {
-        kvs_free(encoded);
-        return -1;
-    }
-
-    /* 2. 提前检查写完后的 offset 是否溢出。 */
-    off_t next_offset;
-    if (__builtin_add_overflow(
-            aof_writer.offset, encoded_length, &next_offset)) {
-        kvs_free(encoded);
+    size_t capacity;
+    off_t next_offset, file_end;
+    if (__builtin_add_overflow(required, trailer_size, &capacity) ||
+        __builtin_add_overflow(aof_writer.offset, required, &next_offset) ||
+        __builtin_add_overflow(next_offset, trailer_size, &file_end)) {
         errno = EOVERFLOW;
         return -1;
     }
-
-    /* 3. 指定源数据的内存地址和目标文件位置。 */
+    char *encoded = kvs_malloc(capacity);
+    if (encoded == NULL) {
+        return -1;
+    }
+    int result = -1;
+    size_t encoded_length;
+    if (kvs_encode_command(fields, (size_t)count, encoded, required, &encoded_length) != 0) {
+        goto done;
+    }
+    uint32_t next_crc = aof_writer.crc;
+    if (aof_writer.checksum == KVS_AOF_CHECKSUM_FILE) {
+        /* 缓存状态只包括头部和命令，追加只计算新命令字节。 */
+        next_crc = aof_crc32_update(aof_writer.crc, encoded, encoded_length);
+        aof_encode_trailer((unsigned char *)encoded + encoded_length,
+                           (uint64_t)(next_offset - KVS_AOF_HEADER_SIZE), next_crc);
+    }
     kvs_uring_write_t request = {
-        .data = encoded,
-        .length = encoded_length,
-        .offset = aof_writer.offset
+        .data = encoded, .length = encoded_length + trailer_size, .offset = aof_writer.offset
     };
-
-    int write_result = kvs_uring_io_write_batch(
-        &aof_writer.io,
-        aof_writer.fd,
-        &request,
-        1
-    );
-
-    if (write_result < 0) {
-        int saved_errno = errno;
-        kvs_free(encoded);
-        errno = saved_errno;
-        return -1;
+    /* offset 指向旧文件尾起点，新命令和新尾部作为一个连续缓冲写入。 */
+    if (kvs_uring_io_write_batch(&aof_writer.io, aof_writer.fd, &request, 1) < 0 ||
+        kvs_uring_io_sync(&aof_writer.io, aof_writer.fd) < 0) {
+        /* file 模式 I/O 失败后必须关闭并重新校验，不能沿旧状态继续追加。 */
+        aof_writer.failed = aof_writer.checksum == KVS_AOF_CHECKSUM_FILE;
+        goto done;
     }
-
-    /* 4. 保留每条命令同步成功后才返回成功的规则。 */
-    if (kvs_uring_io_sync(
-            &aof_writer.io, aof_writer.fd) < 0) {
-        int saved_errno = errno;
-        kvs_free(encoded);
-        errno = saved_errno;
-        return -1;
-    }
-
-    /* 5. 写入和同步都成功，更新下一条命令的写入位置。 */
     aof_writer.offset = next_offset;
+    aof_writer.crc = next_crc;
+    result = 0;
 
-    /* 完整命令保留到提交成功后，再释放缓冲区。 */
-    int saved_errno = errno;
-    kvs_free(encoded);
-    errno = saved_errno;
-    return 0;
+done:
+    {
+        int saved_errno = errno;
+        kvs_free(encoded);
+        errno = saved_errno;
+    }
+    return result;
 }
-int kvs_aof_replay(
-    const char *path,
+
+int kvs_aof_replay_with_checksum(
+    const char *path, kvs_aof_checksum_t checksum,
     long long offset,
     aof_replay_handler handler)
 {
-    if (path == NULL || handler == NULL || offset < 0) {
+    if (path == NULL || handler == NULL || offset < 0 || !aof_valid_checksum(checksum)) {
         errno = EINVAL;
         return -1;
     }
@@ -244,20 +394,20 @@ int kvs_aof_replay(
     int replay_result = 0;
     int saved_errno;
 
-    /*
-     * position 表示下一条命令在文件中的起始位置。
-     * offset 在文件范围内时，可以安全地转换成 size_t。
-     * offset 到达或超过末尾时，不回放任何命令，保持原有行为。
-     */
-    size_t position = file.length;
-
-    if ((uintmax_t)offset < (uintmax_t)file.length) {
-        position = (size_t)offset;
+    aof_layout_t layout;
+    if (aof_inspect(&file, checksum, &layout) < 0) {
+        replay_result = -1;
+        goto done;
+    }
+    /* offset 是命令字节位置；校验覆盖整文件，不受回放起点影响。 */
+    size_t position = layout.command_end;
+    if ((uintmax_t)offset < layout.command_end - layout.command_start) {
+        position = layout.command_start + (size_t)offset;
     }
 
-    while (position < file.length) {
+    while (position < layout.command_end) {
         /* 从当前位置到文件末尾，还有多少字节。 */
-        size_t remaining = file.length - position;
+        size_t remaining = layout.command_end - position;
 
         /*
          * fields 借用映射中的字段内容，不复制命令字节。
@@ -316,6 +466,7 @@ int kvs_aof_replay(
         position += parsed_bytes;
     }
 
+done:
     /* 无论恢复成功还是失败，都要解除映射。 */
     saved_errno = errno;
 
@@ -326,4 +477,9 @@ int kvs_aof_replay(
 
     errno = saved_errno;
     return replay_result;
+}
+
+int kvs_aof_replay(const char *path, long long offset, aof_replay_handler handler)
+{
+    return kvs_aof_replay_with_checksum(path, KVS_AOF_CHECKSUM_NONE, offset, handler);
 }

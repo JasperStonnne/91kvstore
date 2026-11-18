@@ -1332,8 +1332,9 @@ static int kvs_server_run(kvs_config_t config)
 
         /* 返回 1 表示文件不存在，保留空引擎继续启动。 */
     } else if (kvs_persistence_mode == KVS_PERSISTENCE_AOF) {
-        if (kvs_aof_replay(
+        if (kvs_aof_replay_with_checksum(
                 "commands.aof",
+                config.aof_checksum,
                 0,
                 kvs_recovery_fields_protocol
             ) < 0) {
@@ -1342,7 +1343,7 @@ static int kvs_server_run(kvs_config_t config)
             return 1;
         }
 
-        if (kvs_aof_open("commands.aof") < 0) {
+        if (kvs_aof_open_with_checksum("commands.aof", config.aof_checksum) < 0) {
             fprintf(stderr, "failed to open standalone AOF\n");
             dest_kvengine();
             return 1;

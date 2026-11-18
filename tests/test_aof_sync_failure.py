@@ -14,7 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from test_aof_restart import encode_command
+from test_aof_restart import encode_command, encode_aof
 from test_snapshot_restart import command
 from test_standalone import choose_port, wait_for_server
 
@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--binary", type=Path, default=project / "bin/kvstore")
     parser.add_argument("--fault-binary", type=Path,
                         default=project / "bin/test_kvstore_sync_fault")
+    parser.add_argument("--checksum", choices=("none", "file"), default="none")
     args = parser.parse_args()
     binary, fault_binary = args.binary.resolve(), args.fault_binary.resolve()
     root = Path(tempfile.mkdtemp(prefix="91kv-aof-sync-failure-"))
@@ -34,14 +35,15 @@ def main():
     config = directory / "server.conf"
     host, aof_name = "127.0.0.1", "commands.aof"
     config.write_text("role=standalone\nbind_ip=127.0.0.1\n"
-                      f"service_port={port}\nallocator=pool\npersistence_mode=aof\n")
+                      f"service_port={port}\nallocator=pool\npersistence_mode=aof\n"
+                      f"aof_checksum={args.checksum}\n")
     aof, trigger = directory / aof_name, root / "inject-next-sync"
 
     env = dict(os.environ, KVS_TEST_AOF_PATH=str(aof),
                KVS_TEST_SYNC_TRIGGER=str(trigger))
     owned = []
     result = {
-        "mode": "standalone/aof",
+        "mode": "standalone/aof", "checksum": args.checksum,
         "injection": "one selected sync function returns EIO before real fsync",
         "normal_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "fault_binary_sha256": hashlib.sha256(fault_binary.read_bytes()).hexdigest(),
@@ -58,7 +60,7 @@ def main():
         assert command(port, b"HSET", b"base", b"committed") == b"OK"
         assert command(port, b"HGET", b"base") == b"committed"
         committed = aof.read_bytes()
-        assert committed == encode_command(b"HSET", b"base", b"committed")
+        assert committed == encode_aof(encode_command(b"HSET", b"base", b"committed"), args.checksum)
         (root / "committed-aof.backup").write_bytes(committed)
         trigger.write_text("inject only the next sync of this temporary AOF\n")
 
@@ -78,15 +80,17 @@ def main():
         output, _ = process.communicate(timeout=5)
         (root / "fault.log").write_bytes(output)
         after = aof.read_bytes()
+        expected_after = encode_aof(
+            encode_command(b"HSET", b"base", b"committed") + request, args.checksum)
         result.update(
             client_reply_hex=bytes(reply).hex(), fault_exit=process.returncode,
             committed_aof_bytes=len(committed), aof_bytes_after_failure=len(after),
-            failed_command_fully_present=after == committed + request)
+            failed_command_fully_present=after == expected_after)
         assert not reply, f"sync failure received a response: {reply!r}"
         assert process.returncode == 1, f"unexpected fault exit: {process.returncode}"
         assert output.count(b"test: injected AOF sync EIO") == 1, output
         assert b"failed to append AOF" in output, output
-        assert after == committed + request, "expected full command before failed sync"
+        assert after == expected_after, "expected full command before failed sync"
 
         # 不修剪 AOF，用没有故障包装器的正式程序直接重启。
         normal = subprocess.Popen(

@@ -1,4 +1,8 @@
 #include <assert.h>
+#include <stdint.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -181,6 +185,172 @@ static void test_append(void)
     puts("[PASS] AOF append allocation failure and cleanup");
 }
 
+/* 独立构造格式字节，校验测试不借用生产编码或 CRC 函数。 */
+static unsigned int fixture_crc32(const unsigned char *bytes, size_t length)
+{
+    unsigned int crc = 0xffffffffu;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= bytes[i];
+        for (unsigned int bit = 0; bit < 8; bit++) {
+            crc = (crc >> 1) ^ ((crc & 1u) ? 0xedb88320u : 0);
+        }
+    }
+    return crc ^ 0xffffffffu;
+}
+
+static size_t checked_fixture(unsigned char *bytes, const char *commands, size_t length)
+{
+    memcpy(bytes, "91KVAOF1\0\0\0\1\0\0\0\0", 16);
+    memcpy(bytes + 16, commands, length);
+    for (unsigned int i = 0; i < 8; i++) {
+        bytes[16 + length + i] = (unsigned char)((uint64_t)length >> (56 - i * 8));
+    }
+    unsigned int crc = fixture_crc32(bytes, 24 + length);
+    for (unsigned int i = 0; i < 4; i++) {
+        bytes[24 + length + i] = (unsigned char)(crc >> (24 - i * 8));
+    }
+    return length + 28;
+}
+
+static void expect_checked_replay(const char *path, long long offset,
+                                  int result, const char *values)
+{
+    seen_count = 0;
+    memset(seen_values, 0, sizeof(seen_values));
+    assert(kvs_aof_replay_with_checksum(path, KVS_AOF_CHECKSUM_FILE,
+                                       offset, record_command) == result);
+    assert(seen_count == strlen(values));
+    assert(memcmp(seen_values, values, seen_count) == 0);
+}
+
+static void test_checked_file(const char *path)
+{
+    unsigned char bytes[256];
+    size_t length = checked_fixture(bytes, valid_log, sizeof(valid_log) - 1);
+    write_fixture(path, (const char *)bytes, length);
+    expect_checked_replay(path, 0, 0, "12");
+    expect_checked_replay(path, sizeof(FIRST_COMMAND) - 1, 0, "2");
+    expect_checked_replay(path, sizeof(valid_log), 0, "");
+    expect_replay(path, 0, -1, "");
+    assert(kvs_aof_open(path) == -1);
+    expect_file_unchanged(path, (const char *)bytes, length);
+
+    /* 每一个截断位置，包括零字节，都在调用回放函数前拒绝。 */
+    for (size_t cut = 0; cut < length; cut++) {
+        write_fixture(path, (const char *)bytes, cut);
+        expect_checked_replay(path, 0, -1, "");
+        expect_file_unchanged(path, (const char *)bytes, cut);
+    }
+    const size_t corrupt_positions[] = {
+        0, 8, 12, 16 + sizeof(FIRST_COMMAND) - 4, length - 12, length - 1
+    };
+    for (size_t i = 0; i < sizeof(corrupt_positions) / sizeof(corrupt_positions[0]); i++) {
+        size_t position = corrupt_positions[i];
+        bytes[position] ^= 1;
+        write_fixture(path, (const char *)bytes, length);
+        expect_checked_replay(path, 0, -1, "");
+        expect_checked_replay(path, 10000, -1, "");
+        assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == -1);
+        expect_file_unchanged(path, (const char *)bytes, length);
+        bytes[position] ^= 1;
+    }
+    bytes[length] = 'x';
+    write_fixture(path, (const char *)bytes, length + 1);
+    expect_checked_replay(path, 0, -1, "");
+
+    /* 双向格式不匹配均拒绝，不改写原文件。 */
+    write_fixture(path, valid_log, sizeof(valid_log) - 1);
+    expect_checked_replay(path, 0, -1, "");
+    assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == -1);
+    expect_file_unchanged(path, valid_log, sizeof(valid_log) - 1);
+
+    /* CRC 正确仍须检查 RESP 和命令回调结果。 */
+    length = checked_fixture(bytes, invalid_log, sizeof(invalid_log) - 1);
+    write_fixture(path, (const char *)bytes, length);
+    expect_checked_replay(path, 0, -1, "1");
+    length = checked_fixture(bytes, valid_log, sizeof(valid_log) - 1);
+    write_fixture(path, (const char *)bytes, length);
+    reject_command = 1;
+    expect_checked_replay(path, 0, -1, "1");
+    reject_command = 0;
+    length = checked_fixture(bytes, FIRST_COMMAND FIRST_COMMAND,
+                              sizeof(FIRST_COMMAND FIRST_COMMAND) - 1);
+    write_fixture(path, (const char *)bytes, length);
+    expect_checked_replay(path, 0, 0, "11");
+
+    /* 合法空容器有 28 字节，已有零字节文件不被当成新容器。 */
+    length = checked_fixture(bytes, "", 0);
+    write_fixture(path, (const char *)bytes, length);
+    expect_checked_replay(path, 0, 0, "");
+    assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == 0);
+    assert(kvs_aof_close() == 0);
+    expect_file_unchanged(path, (const char *)bytes, length);
+    write_fixture(path, "", 0);
+    assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == -1);
+    assert(unlink(path) == 0);
+    expect_checked_replay(path, 0, 0, "");
+    assert(kvs_aof_open_with_checksum(path, (kvs_aof_checksum_t)99) == -1);
+    assert(access(path, F_OK) != 0);
+    puts("[PASS] AOF file layout, pre-replay CRC, truncation, format mismatch and ordered replay");
+}
+
+static void test_checked_append(const char *path)
+{
+    unsigned char expected[256];
+    char *first[] = {"HSET", "k", "1"};
+    char *second[] = {"HSET", "k", "2"};
+    size_t length = checked_fixture(expected, "", 0);
+    assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == 0);
+    expect_file_unchanged(path, (const char *)expected, length);
+    assert(kvs_aof_append(first, 3) == 0);
+    assert(kvs_aof_close() == 0);
+    length = checked_fixture(expected, FIRST_COMMAND, sizeof(FIRST_COMMAND) - 1);
+    expect_file_unchanged(path, (const char *)expected, length);
+
+    /* 重新打开时从已有命令重建 CRC，申请失败不污染下次追加。 */
+    assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == 0);
+    fail_alloc = 1;
+    assert(kvs_aof_append(second, 3) == -1);
+    fail_alloc = 0;
+    expect_file_unchanged(path, (const char *)expected, length);
+    assert(kvs_aof_append(second, 3) == 0);
+    assert(kvs_aof_close() == 0);
+    length = checked_fixture(expected, valid_log, sizeof(valid_log) - 1);
+    expect_file_unchanged(path, (const char *)expected, length);
+    expect_checked_replay(path, 0, 0, "12");
+
+    /* 同一引擎有依赖的命令仍按文件顺序执行，不做单条跳过。 */
+    assert(unlink(path) == 0);
+    puts("[PASS] AOF file append overwrites trailer; reopen CRC and allocation failure verified");
+}
+
+static void test_checked_partial_write(const char *path)
+{
+    assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == 0);
+    struct rlimit saved_limit;
+    assert(getrlimit(RLIMIT_FSIZE, &saved_limit) == 0);
+    struct sigaction saved_action;
+    struct sigaction ignored = {.sa_handler = SIG_IGN};
+    assert(sigemptyset(&ignored.sa_mask) == 0);
+    assert(sigaction(SIGXFSZ, &ignored, &saved_action) == 0);
+    struct rlimit limited = saved_limit;
+    limited.rlim_cur = 16 + 8;
+    assert(setrlimit(RLIMIT_FSIZE, &limited) == 0);
+    char *fields[] = {"HSET", "k", "1"};
+    int result = kvs_aof_append(fields, 3);
+    int error = errno;
+    assert(setrlimit(RLIMIT_FSIZE, &saved_limit) == 0);
+    assert(sigaction(SIGXFSZ, &saved_action, NULL) == 0);
+    assert(result == -1 && error == EFBIG);
+    errno = 0;
+    assert(kvs_aof_append(fields, 3) == -1 && errno == EIO);
+    assert(kvs_aof_close() == 0);
+    expect_checked_replay(path, 0, -1, "");
+    assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == -1);
+    assert(unlink(path) == 0);
+    puts("[PASS] AOF file partial write invalidates writer; reopen rejects damaged trailer");
+}
+
 int main(void)
 {
     assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
@@ -240,6 +410,9 @@ int main(void)
     test_fixed_recovery_boundaries(path);
     assert(unlink(path) == 0);
 
+    test_checked_file(path);
+    test_checked_append(path);
+    test_checked_partial_write(path);
     puts("AOF replay tests passed");
     /* 所有测试对象释放后，才销毁 allocator。 */
     kvs_pool_stats_t stats;

@@ -5,6 +5,7 @@
 #include <sys/un.h>
 #include "log.h"
 #include "snapshot_format.h"
+#include "aof_format.h"
 #include "role.h"
 #include "kvs_allocator.h"
 
@@ -48,6 +49,7 @@ typedef struct {
     kvs_log_level_t log_level;
     kvs_persistence_mode_t persistence_mode;
     kvs_snapshot_checksum_t snapshot_checksum;
+    kvs_aof_checksum_t aof_checksum;
     kvs_replication_incremental_mode_t replication_incremental_mode;
     char replication_capture_socket[sizeof(((struct sockaddr_un *)0)->sun_path)];
     /* 保存启动时选择的内存分配后端。 */

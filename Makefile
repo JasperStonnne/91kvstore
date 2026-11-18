@@ -83,6 +83,7 @@ $(BUILD_DIR)/kvstore.o: \
 	$(INCLUDE_DIR)/rdma_transport.h \
 	$(INCLUDE_DIR)/protocol.h \
 	$(INCLUDE_DIR)/config.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -90,6 +91,7 @@ $(BUILD_DIR)/kvstore.o: \
 $(BUILD_DIR)/config.o: \
         $(SRC_DIR)/config/config.c \
         $(INCLUDE_DIR)/config.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
         $(INCLUDE_DIR)/role.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -140,6 +142,7 @@ $(BUILD_DIR)/kvs_skiplist.o: \
 $(BUILD_DIR)/aof.o: \
     $(PERSISTENCE_DIR)/aof.c \
     $(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/kvs_allocator.h \
     $(INCLUDE_DIR)/mapped_file.h \
@@ -149,6 +152,7 @@ $(BUILD_DIR)/aof.o: \
 $(BUILD_DIR)/snapshot_io.o: \
 	$(PERSISTENCE_DIR)/snapshot_io.c \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -156,6 +160,7 @@ $(BUILD_DIR)/snapshot_io.o: \
 $(BUILD_DIR)/snapshot_store.o: \
 	$(PERSISTENCE_DIR)/snapshot_store.c \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/mapped_file.h \
 	$(INCLUDE_DIR)/kvs_allocator.h \
@@ -180,6 +185,7 @@ $(BUILD_DIR)/replication.o: \
 	$(INCLUDE_DIR)/replication_capture_ipc.h \
 	$(INCLUDE_DIR)/replication.h \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/server.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -335,6 +341,7 @@ test-integration: $(BIN_DIR)/kvstore
 .PHONY: test-aof-write-failure
 test-aof-write-failure: $(BIN_DIR)/kvstore
 	python3 -B $(TEST_DIR)/test_aof_write_failure.py
+	python3 -B $(TEST_DIR)/test_aof_write_failure.py --checksum file
 
 # 只有测试程序链接同步故障包装器；正式 kvstore 不包含该开关。
 $(BIN_DIR)/test_kvstore_sync_fault: $(OBJS) $(TEST_DIR)/aof_sync_fault.c \
@@ -345,6 +352,7 @@ $(BIN_DIR)/test_kvstore_sync_fault: $(OBJS) $(TEST_DIR)/aof_sync_fault.c \
 .PHONY: test-aof-sync-failure
 test-aof-sync-failure: $(BIN_DIR)/kvstore $(BIN_DIR)/test_kvstore_sync_fault
 	python3 -B $(TEST_DIR)/test_aof_sync_failure.py
+	python3 -B $(TEST_DIR)/test_aof_sync_failure.py --checksum file
 
 # 独立的 Snapshot 测试程序；正式程序不链接故障包装器。
 $(BIN_DIR)/test_kvstore_snapshot_fault: $(OBJS) $(TEST_DIR)/snapshot_save_fault.c \
@@ -378,6 +386,7 @@ $(BIN_DIR)/test_config: \
         $(TEST_DIR)/test_config.c \
         $(SRC_DIR)/config/config.c \
         $(INCLUDE_DIR)/config.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
         $(INCLUDE_DIR)/role.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
@@ -402,6 +411,7 @@ $(BIN_DIR)/test_snapshot_store: \
 	$(MEMORY_DIR)/kvs_allocator.c \
 	$(INCLUDE_DIR)/kvs_allocator.h \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/mapped_file.h \
 	$(INCLUDE_DIR)/uring_io.h \
@@ -430,6 +440,7 @@ test-integration: test-snapshot-restart
 
 test-aof-restart: $(BIN_DIR)/kvstore
 	python3 -B $(TEST_DIR)/test_aof_restart.py
+	python3 -B $(TEST_DIR)/test_aof_checksum.py
 
 test-integration: test-aof-restart
 
@@ -461,6 +472,7 @@ $(BIN_DIR)/test_aof_replay: \
 	$(MEMORY_DIR)/kvs_allocator.c \
 	$(INCLUDE_DIR)/kvs_allocator.h \
 	$(INCLUDE_DIR)/persistence.h \
+	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
 	$(INCLUDE_DIR)/mapped_file.h \
 	$(INCLUDE_DIR)/uring_io.h \

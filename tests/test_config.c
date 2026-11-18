@@ -533,8 +533,43 @@ static void test_snapshot_checksum(void)
     puts("snapshot checksum defaults, modes and role restrictions passed");
 }
 
+static void test_aof_checksum(void)
+{
+    kvs_config_t config = load_valid(
+        "role=standalone\nservice_port=29000\npersistence_mode=aof\n");
+    assert(config.aof_checksum == KVS_AOF_CHECKSUM_NONE);
+    const char *names[] = {"none", "file"};
+    for (int mode = 0; mode < 2; mode++) {
+        char contents[256];
+        snprintf(contents, sizeof(contents),
+                 "aof_checksum=%s\nrole=standalone\nservice_port=29000\n"
+                 "persistence_mode=aof\n", names[mode]);
+        config = load_valid(contents);
+        assert(config.aof_checksum == (kvs_aof_checksum_t)mode);
+        const char *roles[] = {"primary", "replica", "standalone", "standalone"};
+        const char *modes[] = {"none", "none", "snapshot", "none"};
+        const char *fields[] = {"rdma_port=29747\n",
+            "primary_host=127.0.0.1\nprimary_port=29001\n", "", ""};
+        for (size_t i = 0; i < 4; i++) {
+            snprintf(contents, sizeof(contents),
+                     "role=%s\nservice_port=29000\npersistence_mode=%s\n"
+                     "aof_checksum=%s\n%s", roles[i], modes[i], names[mode], fields[i]);
+            expect_invalid("checksum restricted to standalone aof", contents,
+                           "aof_checksum is only valid");
+        }
+    }
+    expect_invalid("invalid AOF checksum", "role=standalone\nservice_port=29000\n"
+                   "persistence_mode=aof\naof_checksum=record\n",
+                   "aof_checksum must be none or file");
+    expect_invalid("duplicate AOF checksum", "role=standalone\nservice_port=29000\n"
+                   "persistence_mode=aof\naof_checksum=none\naof_checksum=file\n",
+                   "duplicate field");
+    puts("aof checksum defaults, modes and role restrictions passed");
+}
+
 int main(void)
 {
+    test_aof_checksum();
     test_snapshot_checksum();
     test_valid_standalone();
     test_valid_primary_and_replica();

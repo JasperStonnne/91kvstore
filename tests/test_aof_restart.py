@@ -1,3 +1,4 @@
+import zlib
 import shutil
 import socket
 import subprocess
@@ -17,6 +18,14 @@ def encode_command(*fields):
             + field + b"\r\n"
         )
     return request
+
+
+def encode_aof(commands, checksum):
+    if checksum == "none":
+        return commands
+    header = b"91KVAOF1" + (1).to_bytes(4, "big") + b"\0" * 4
+    data = header + commands + len(commands).to_bytes(8, "big")
+    return data + zlib.crc32(data).to_bytes(4, "big")
 
 
 def expect_error(port, *fields):

@@ -21,6 +21,7 @@ enum config_field {
     FIELD_LOG_LEVEL,
     FIELD_PERSISTENCE_MODE,
     FIELD_SNAPSHOT_CHECKSUM,
+    FIELD_AOF_CHECKSUM,
     FIELD_REPLICATION_PORT,
     FIELD_PRIMARY_HOST,
     FIELD_PRIMARY_PORT,
@@ -38,6 +39,7 @@ static const char *const field_names[FIELD_COUNT] = {
     "log_level",
     "persistence_mode",
     "snapshot_checksum",
+    "aof_checksum",
     "replication_port",
     "primary_host",
     "primary_port",
@@ -252,6 +254,17 @@ static int parse_field(
         }
         return 0;
 
+    case FIELD_AOF_CHECKSUM:
+        if (strcmp(value, "none") == 0) {
+            parsed->aof_checksum = KVS_AOF_CHECKSUM_NONE;
+        } else if (strcmp(value, "file") == 0) {
+            parsed->aof_checksum = KVS_AOF_CHECKSUM_FILE;
+        } else {
+            return config_error(error, error_capacity, path, line_number,
+                                "aof_checksum must be none or file");
+        }
+        return 0;
+
     case FIELD_REPLICATION_INCREMENTAL_MODE:
         if (strcmp(value, "socket") == 0) {
             parsed->replication_incremental_mode = KVS_REPLICATION_INCREMENTAL_SOCKET;
@@ -369,6 +382,14 @@ static int validate_config(
         return config_error(error, error_capacity, path,
                             field_lines[FIELD_SNAPSHOT_CHECKSUM],
                             "snapshot_checksum is only valid for standalone snapshot mode");
+    }
+
+    if (seen[FIELD_AOF_CHECKSUM] &&
+        (parsed->role != KVS_ROLE_STANDALONE ||
+         parsed->persistence_mode != KVS_PERSISTENCE_AOF)) {
+        return config_error(error, error_capacity, path,
+                            field_lines[FIELD_AOF_CHECKSUM],
+                            "aof_checksum is only valid for standalone aof mode");
     }
 
     if (seen[FIELD_RDMA_PORT]) {
@@ -521,6 +542,7 @@ int kvs_config_load(
     FILE *file;
     kvs_config_t parsed = {0};
     parsed.snapshot_checksum = KVS_SNAPSHOT_CHECKSUM_FILE;
+    parsed.aof_checksum = KVS_AOF_CHECKSUM_NONE;
     bool seen[FIELD_COUNT] = {false};
     size_t field_lines[FIELD_COUNT] = {0};
     char *line = NULL;

@@ -15,7 +15,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from test_aof_restart import encode_command
+from test_aof_restart import encode_command, encode_aof
 from test_snapshot_restart import command
 from test_standalone import choose_port, wait_for_server
 
@@ -28,6 +28,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
                         default=Path(__file__).resolve().parent.parent / "bin/kvstore")
+    parser.add_argument("--checksum", choices=("none", "file"), default="none")
     args = parser.parse_args()
     binary = args.binary.resolve()
     host = "127.0.0.1"
@@ -36,12 +37,13 @@ def main():
     aof_name = "commands.aof"
     config_text = (
         "role=standalone\nbind_ip=127.0.0.1\n"
-        f"service_port={port}\nallocator=pool\npersistence_mode=aof\n")
+        f"service_port={port}\nallocator=pool\npersistence_mode=aof\n"
+        f"aof_checksum={args.checksum}\n")
 
     owned = []
     parent_limits = resource.getrlimit(resource.RLIMIT_FSIZE)
     result = {"binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-              "port": port, "mode": "standalone/aof", "checks_complete": False}
+              "port": port, "mode": "standalone/aof", "checksum": args.checksum, "checks_complete": False}
     print(f"[INFO] evidence retained: {root}", flush=True)
 
     def launch(directory, inject=False):
@@ -65,12 +67,13 @@ def main():
         assert command(port, b"HGET", b"base") == b"committed"
         aof = directory / aof_name
         committed = aof.read_bytes()
-        assert committed == encode_command(b"HSET", b"base", b"committed")
+        assert committed == encode_aof(encode_command(b"HSET", b"base", b"committed"), args.checksum)
         (root / "committed-aof.backup").write_bytes(committed)
 
         # 只允许下一条命令写出 8 字节，迫使剩余写入返回错误。
         _, hard_limit = resource.prlimit(process.pid, resource.RLIMIT_FSIZE)
-        limit = len(committed) + 8
+        append_offset = len(committed) - (12 if args.checksum == "file" else 0)
+        limit = append_offset + 8
         resource.prlimit(process.pid, resource.RLIMIT_FSIZE, (limit, hard_limit))
         request = encode_command(b"HMOD", b"base", b"uncommitted_change")
         reply = bytearray()
@@ -95,7 +98,9 @@ def main():
         assert not reply, f"failed write received response: {reply!r}"
         assert process.returncode == 1, f"unexpected exit: {process.returncode}"
         assert b"failed to append AOF" in output, output
-        assert damaged == committed + request[:8], "unexpected AOF bytes after short write"
+        expected = bytearray(committed)
+        expected[append_offset:append_offset + 8] = request[:8]
+        assert damaged == expected, "unexpected AOF bytes after short write"
 
         # 新进程没有注入限制，仍应因残缺 AOF 而拒绝启动，且不得自动修文件。
         restarted = subprocess.run(
@@ -151,7 +156,7 @@ def main():
 
     assert result["owned_processes_stopped"] and result["service_port_released"], result
     assert result["parent_limits_unchanged"], result
-    print("[PASS] AOF partial write: no success response, exit 1, committed prefix intact",
+    print(f"[PASS] AOF {args.checksum} partial write: no success response, exit 1, command prefix intact",
           flush=True)
     print("[PASS] damaged AOF rejected unchanged; complete baseline restores committed value",
           flush=True)

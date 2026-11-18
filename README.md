@@ -208,6 +208,46 @@ Primary/Replica 固定写入和严格加载 `file`，显式配置 `snapshot_chec
 Replica 校验和加载成功后才发全量完成确认，失败会清空引擎、清理临时文件并取消本轮复制。
 升级为 v3 写入后，读取端需使用支持 v3 的版本。
 
+### AOF 校验模式
+
+`standalone + persistence_mode=aof` 可显式配置 `aof_checksum = none | file`，默认 `none`。
+配置层把枚举传给 AOF 的打开和恢复入口，AOF 模块自行持有本次打开所需的模式和 CRC 状态。
+
+```ini
+role = standalone
+bind_ip = 127.0.0.1
+service_port = 29002
+persistence_mode = aof
+aof_checksum = file
+```
+
+`none` 延续纯 RESP 命令流，启动时按顺序解析并回放。
+`file` 使用以下容器，整数采用大端序，CRC 使用 CRC32/ISO-HDLC。
+
+```text
+偏移 0   magic[8] = 91KVAOF1
+偏移 8   version[u32] = 1
+偏移 12  reserved[u32] = 0
+偏移 16  RESP 命令 1 | RESP 命令 2 | ……
+文件尾   command_bytes[u64] | file_crc32[u32]
+```
+
+CRC 覆盖头部、全部命令和 `command_bytes`，空容器为 28 字节。
+恢复先检查完整头尾、长度和 CRC，全部通过后才按命令顺序回放。
+语法错误和命令执行失败仍使恢复失败。
+
+追加位置指向旧文件尾起点，每次写入一段连续的“新命令＋新文件尾”，同步成功后才推进
+内存里的写入位置和 CRC。缓存的 CRC 只包含头部和命令区，追加时处理新命令与新尾部的
+8 字节长度；重新打开时校验现有文件并重建该状态。
+
+`file` 写入或同步失败后停止当前写入器，服务沿用报错退出的行为。
+覆盖尾部期间失败可能留下损坏文件，重启整份拒绝；完整命令和正确尾部已写入而同步返回
+错误时，普通重启仍可能恢复这条未确认命令。恢复不自动修剪、跳过或改写原日志。
+
+配置与已有格式必须匹配。已有纯 RESP 日志用 `none`，带 `91KVAOF1` 头的日志用 `file`。
+更改配置不会自动转换已有文件。`file` 仅在路径尚不存在时初始化新容器，已有零字节文件
+按缺少头尾拒绝恢复。Primary/Replica 的配置中出现 `aof_checksum` 会报错。
+
 现场手动演示使用 `make all testcase` 构建 C 客户端，每次单独执行写入、读取校验、修改、删除或 SAVE；服务启动、宕机和重启由操作者控制。具体命令见[手动演示流程（HTML）](docs/MANUAL_DEMO.html)，可直接用浏览器打开。旧 `bin/testcase` 的数字模式已改为具名操作，使用 `bin/testcase --help` 查看参数。
 
 当前 Snapshot 是带版本、记录长度和校验的**二进制格式**，不是旧的 `AOF_OFFSET` 文本首行。SAVE 路径为临时文件 → io_uring 写入/文件同步 → rename → 父目录同步。rename 后目录同步失败时可能“返回错误但文件已替换”，不承诺自动回滚。AOF 错误不回复成功并停止；残缺日志拒绝恢复，不自动跳过或修剪。失败回复也不承诺相关命令绝不在重启后出现。
