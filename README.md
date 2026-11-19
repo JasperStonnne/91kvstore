@@ -41,8 +41,21 @@ cd "$RUN_DIR"
 
 ### 可选 eBPF 增量采集
 
-使用 Clang 和 libbpf 开发包构建 `make ebpf-capture`，生成
-`bin/kvstore-ebpf-capture` 和 `build/ebpf_capture.bpf.o`。启动参数见下方主从复制配置。
+Ubuntu/Debian 先安装可选采集程序的编译依赖：
+
+```bash
+sudo apt install -y clang libbpf-dev libelf-dev zlib1g-dev
+make ebpf-capture
+```
+
+生成 `bin/kvstore-ebpf-capture` 和 `build/ebpf_capture.bpf.o`，启动参数见下方主从复制配置。
+
+性能复现使用 `-O2 -g`，在仓库根目录强制重编译项目、NtyCo 和对照工具，避免复用默认构建的旧对象：
+
+```bash
+make -B -j4 CFLAGS='-std=gnu11 -Wall -Wextra -O2 -g' \
+    all ebpf-capture benchmark-tools
+```
 
 ### 2. 写入与读取
 
@@ -337,48 +350,109 @@ RDMA_TEST_IP=172.16.145.135 python3 -B tests/test_capture_replication.py .
 
 详见[四引擎分配与释放路径核对](docs/performance/REPORT.md#分配覆盖范围只读源码核对)。这三方案比较不是只替换固定大小节点。
 
-百万条三轮中，pool 四阶段合计耗时低于 system，但装满 RSS 更高（275.043 对 237.117 MiB），不能称为全面省内存。删除后 RSS 保留不等于泄漏。VmSize 是虚拟地址空间，另表列出，不混作物理内存。[结果和口径](docs/performance/REPORT.md)。
+空 slab 在最后一个对象释放后摘链并 `munmap`，大对象仍单独解除映射。2026-11-19 的 `-O2 -g` 百万条三轮实测：pool 起始 / 写满 / 删除核对后 RSS 为 2.660 / 274.930 / 2.680 MiB，结束比起始高 20 KiB；写满仍高于 system 的 237.066 MiB，不能称为全面省内存。删除后 RSS 保留不等于泄漏。VmSize 与物理 RSS 分开记录。[本批结果和口径](docs/performance/2026-11-19.md#分配器百万条-rss)；[历史分配覆盖与结果](docs/performance/REPORT.md)。
 
 ## 测试
 
-测试分层，不要求每个单元用例都灌一万条。以下命令在仓库根目录执行，可能编译测试程序；本次仅核实入口和既有记录，没有运行它们。
+测试分层，不要求每个单元用例都灌一万条。以下命令在仓库根目录执行，可能编译测试程序。本批性能测量前已完成 `-O2 -g` 正确性回归，包括单元/消毒器、真实 RDMA、单机持久化恢复、双机 10 万条与故障测试；真实 BPF 小负载专项由交互式 sudo 终端补跑通过。该验收不代替下述持续负载测试：修复前真实 eBPF 性能组三轮出现缓存溢出/事件缺口；修复后的正式三轮结果见下方对比。
 
 | 入口 | 目标与规模 | 环境/判据 |
 | --- | --- | --- |
-| `make test-unit` | 协议、引擎、文件、配置、复制边界及模拟 eBPF | 单机 Linux；无真实 BPF 附着，不需 sudo；包含 ASan/UBSan 测试程序 |
+| `make test-unit` | 协议、引擎、文件、配置、复制边界及采集事件 | 单机 Linux；无真实 BPF 附着，不需 sudo；包含 ASan/UBSan 测试程序 |
 | `RDMA_TEST_IP=实际地址 make test` | 完整普通回归，含真实 RDMA | 单机 ACTIVE iWARP 与 io_uring；无设备明确失败，不是全都无需 RDMA |
 | `make test-functional-bulk` | 10000 个不同 key × 8 个操作阶段 | 单机；写/读/MOD/存在/删除及未命中逐条断言，Array 1000、其余各3000 |
 | `make test-persistence-100k` | Snapshot/AOF 各10万条 | 单机、独立临时目录；默认在成功边界 SIGKILL 后逐条读回；不是断电测试 |
 | `make test-clients` | redis-cli/hiredis/benchmark 已列支持场景 | 可选依赖缺失标 SKIP，默认 PING 标 UNSUPPORTED，两者不计 PASS |
 | `make test-clients-strict` | 严格客户端对照 | 任意 SKIP 或默认 PING 未支持均非零；当前不能期望全绿 |
 | `tests/test_capture_replication.py` | 真实 RDMA 与两种增量模式字节对账 | 先普通用户构建，再以批准的 BPF 权限运行；需要 ACTIVE iWARP |
+| `make test-capture-faults` | 独立采集缓存/IPC、缺口、溢出、退出和重新全量 | 真实 RDMA + 文件事件替身；含末条事件丢失且无后续写入，不证明真实内核压力下不丢事件 |
 | `tests/test_two_vm_100k.py` | 先5万、从机同步后再5万，两端各10万读回 | 双VM、同程序/依赖指纹；客户端本身不启动/清理服务，必须落实实例归属及超时 |
 
 详细的依赖、执行步骤、资源要求、正确性判据、历史通过范围及未验证项见[测试方案](docs/performance/TESTING.md)和[复现说明](docs/performance/REPRODUCING.md)。完整 `make test` 不含所有大数据、可选客户端或真实 BPF 专项；SKIP 不等于 PASS。新机器全套安装/构建未在本阶段重新验证。
 
 ## 性能结果
 
-2026-11-09—10；基线 `719836e9`，使用现有默认未优化主程序。两台 aarch64 Linux VM 各4 vCPU、约8 GiB，共享 Mac，软件 SIW。正式成绩与诊断分开；每项三轮，取中位数；波动为 `(max-min)/median × 100%`。不同客户端、数据集和同步承诺不混算。
+### 2026-11-19：最新正式数据
 
-| 场景 | 三轮中位数 | 波动 | 口径 |
-| --- | ---: | ---: | --- |
-| 单机 HGET c1/P16 追加长轮次 | 483447.66 次/秒 | 0.31% | 本机128B热点，redis-benchmark 工具完成吞吐；非随机百万条、非逐响应内容校验 |
-| Snapshot 10万条写入 | 3.275 秒 | 1.19% | 写内存；另需成功 SAVE（中位0.171秒） |
-| AOF 10万条写入 | 20.527 秒 | 2.02% | 成功回复前追加/同步，与 Snapshot 写入不是同耐久性比较 |
-| allocator system / pool / jemalloc | 202.766 / 182.998 / 179.696 秒 | 3.43 / 5.17 / 2.90% | 百万条四阶段合计，含生成、客户端、协议和网络 |
-| 双机 ONLINE 后第二批5万 | 4021.56 条/秒 | 1.32% | 现有串行 Python 客户端整阶段；无 AOF 对照，不能宣称 eBPF 加速 |
+修复后版本为 `846c87d`，修复前为 `0e25dd7`，项目与 NtyCo 均以 `-O2 -g` 构建。两台 aarch64 VM 各 4 vCPU、约 8 GiB，共享 Mac；全量复制走软件 SIW RDMA，增量走 TCP。表中取三轮中位数，波动为 `(max-min)/median × 100%`；SAVE 的 1k 档仅一个完整样本。P1、Pipeline 与实时复制为修复后重测，SAVE、RSS 和传输沿用 `0e25dd7` 的正式结果。
 
-![单机热点 HGET：三轮点及中位数，左图对数轴保留P64退化，右图为独立长轮次](docs/performance/figures/single-hget.svg)
+本轮通过 TCP_NODELAY 消除 Pipeline 小回复固定等待，将复制输出/IPC 单次上限统一为 64 KiB、重试缩至 1ms、内核 ring 扩至 16 MiB，并补充失败计数日志。用户态缓存仍为 8 MiB，缺口/溢出仍明确失败；组合修复未逐开关隔离归因。
 
-P64 中位仅1546.94次/秒，未隐藏。诊断只观察到等待线索，**未证明 delayed ACK 或 NtyCo 是根因**；没有生成或虚构火焰图。
+**SAVE：100 万条唯一 Hash 记录，key 32B / value 128B，pool、整文件校验。** 总耗时含串行写入与同步 SAVE，计时后各核对 100 万条。
 
-![百万条 allocator 起始、装满和删除后的RSS；三轮中位数及原始点](docs/performance/figures/allocator-rss.svg)
+| 每多少条 SAVE | 总耗时(s) | SAVE 累计(s) | 写 QPS | 轮次 |
+| --- | ---: | ---: | ---: | ---: |
+| 100 万 | 288.68 | 2.81 | 3,464.05 | 3 |
+| 10 万 | 296.41 | 15.09 | 3,373.69 | 3 |
+| 1 万 | 417.41 | 146.22 | 2,395.71 | 3 |
+| 1 千 | 1713.18 | 1451.45 | 583.71 | 1 |
 
-双机正式三轮两端各10万条逐条匹配、快照 SHA 相同，既有日志补偿均为0；热身有3段/837字节补偿且最终一致。末轮客户端和数据验证通过，但外部收尾检查误判正常退出，Primary 编排退出1、Replica编排退出0，**不能写整个流程全绿**。
+![SAVE 频率耗时分解（沿用基线）](docs/performance/figures/20261119-save-frequency.svg)
 
-纯 RDMA 吞吐、精确初始化耗时、逐请求复制延迟、ONLINE 独立计数未测。没有逐条增量 ACK，不保证端到端 exactly-once。重启耗时止于**端口可连接**，全量恢复校验另计；软件 SIW 成绩不推导硬件 RDMA 性能。
+**P1：最新三轮中位数，每轮 10 万次、32B 热点键 / 128B 值覆盖写。** Redis 7.0.15 关闭 RDB；AOF 显式 `appendfsync always`、关闭自动 rewrite，与 kvstore 成功回复前同步的承诺对齐，kvstore 使用 `aof_checksum=none`。ECHO 为独立网络/协议参考程序。
 
-[总报告：四类结果、全部轮次和其余图表](docs/performance/REPORT.md) · [复现命令与边界](docs/performance/REPRODUCING.md) · [数值数据](docs/performance/data/measurements.json) · [原始证据哈希索引](docs/performance/data/evidence-index.json)
+| P1 场景 | QPS | P50 RTT(ms) | P99 RTT(ms) | 服务端 CPU/单核 | QPS 波动 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| echo | 17,953.32 | 0.055 | 0.087 | 31.2% | 11.19% |
+| kv-none | 17,803.10 | 0.055 | 0.079 | 31.3% | 1.66% |
+| kv-aof | 2,790.18 | 0.351 | 0.487 | 22.0% | 4.82% |
+| redis-none | 19,029.50 | 0.055 | 0.071 | 27.3% | 4.96% |
+| redis-aof | 3,661.39 | 0.263 | 0.391 | 15.4% | 0.55% |
+
+**Pipeline：c1、每端每档3×10万请求、热点覆盖、无持久化。**
+
+| P | kv 前 QPS | kv 后 QPS | kv 提升 | Redis 前 QPS | Redis 后 QPS | 新 kv/Redis |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 | 241.19 | 169,491.53 | 702.73× | 170,940.17 | 173,611.12 | 97.63% |
+| 20 | 482.32 | 231,481.47 | 479.93× | 295,858.00 | 316,455.69 | 73.15% |
+| 40 | 964.90 | 316,455.69 | 327.97× | 534,759.31 | 549,450.56 | 57.59% |
+| 80 | 1,933.00 | 364,963.53 | 188.81× | 840,336.12 | 869,565.19 | 41.97% |
+| 160 | 3,869.37 | 401,606.44 | 103.79× | 1,265,822.75 | 1,408,450.62 | 28.51% |
+
+![Pipeline 修复前后与 Redis](docs/performance/figures/20261119-pipeline.svg)
+
+**三分配器：同一四引擎百万条，写入、读回、删除、未命中核对均通过。** RSS 单位 MiB，状态取五次采样中位数，再取三轮中位数；结束时服务仍运行，无强制 trim/decay 调优。
+
+| 分配器 | 起始 RSS | 写满 RSS | 删除核对后 RSS | 结束−起始 |
+| --- | ---: | ---: | ---: | ---: |
+| system | 2.344 | 237.066 | 237.066 | +234.723 |
+| pool | 2.660 | 274.930 | 2.680 | +0.020 |
+| jemalloc | 4.738 | 245.512 | 6.527 | +1.789 |
+
+![三分配器百万条 RSS（沿用基线）](docs/performance/figures/20261119-allocator-rss.svg)
+
+**双机实时复制：c1/P1、3×10万请求/模式。**
+
+| 模式 | 前 Primary QPS | 后 Primary QPS | 后通过轮数 | 前可见性 P99(ms) | 后可见性 P99(ms) | 后 QPS 波动 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 33,079.72 | 17,787.26 | 3/3 | — | — | 0.84% |
+| socket | 32,216.49 | 29,154.52 | 3/3 | 51.477 | 3.219 | 1.23% |
+| ebpf | 3/3 失败，无有效复制成绩 | 25,667.35 | 3/3 | — | 5.557 | 2.07% |
+
+三模式各三轮均通过；复制模式核对 ONLINE、最终标记及每轮 1000 次可见性探针，eBPF 三轮 oversize/ring_full/read_error 均为零。
+
+`none`、`socket` 吞吐中位数分别下降 46.23% / 9.51%；旧 `none` 波动 46.82%，本轮 0.84%。差异原因尚未隔离定位，不能概括为所有模式吞吐均提升；逐轮原值见完整报告。
+
+短时快速 Pipeline 样本受计时粒度与调度噪声限制；P/QPS 是批周期，非单条执行时间。复制QPS计量Primary回复，另核对ONLINE、最终标记和每轮1000次可见性探针；完整CPU、延迟、失败计数与每轮数据见报告。组合修复未逐开关隔离归因，旧eBPF缺口也不能追认一定由ring_full造成。
+
+![双机实时复制修复前后](docs/performance/figures/20261119-replication.svg)
+
+**相同 168,000,052 字节真实快照：热缓存、1 MiB 分块 / window=1、接收进内存，12 次正式文件传输均通过长度/CRC。** 只计首块到末 ACK，不含准备、CRC、落盘或加载。
+
+| 方向 | sendfile(MiB/s) | RDMA(MiB/s) | iperf3 单流 30 秒(Gb/s) |
+| --- | ---: | ---: | ---: |
+| 135→136 | 146.52 | 82.87 | 0.461 |
+| 136→135 | 137.38 | 84.66 | 0.450 |
+
+iperf3 是独立负载参考，不能将其数值当作所有传输的链路上限。软件 SIW 结果不推导物理 RNIC 性能。
+
+![双向传输速度（沿用基线）](docs/performance/figures/20261119-transfer.svg)
+
+135 原校时设置已恢复，测试实例、采集进程及 socket 已清理。
+
+[2026-11-19 完整报告：修复前基线、修复后对比及逐轮结果](docs/performance/2026-11-19.md) · [原始数值与环境](docs/performance/data/measurements-2026-11-19.json) · [工具与复现入口](tests/README_BENCHMARK_TOOLS.md)
+
+[2026-11-09—10 历史结果与图表](docs/performance/REPORT.md)。历史版本的客户端、数据集和构建条件不同，不与本批数值混算。
 
 ## 项目结构
 
@@ -389,7 +463,7 @@ P64 中位仅1546.94次/秒，未隐藏。诊断只观察到等待线索，**未
 ├── src/
 │   ├── engines/             四种内存引擎
 │   ├── memory/              内存池
-│   ├── network/                    NtyCo TCP / 缓冲区
+│   ├── network/             NtyCo TCP / 缓冲区
 │   ├── persistence/         AOF / Snapshot
 │   ├── protocol/            长度前缀编解码
 │   ├── replication/         主从复制

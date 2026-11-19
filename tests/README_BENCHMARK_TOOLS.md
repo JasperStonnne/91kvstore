@@ -1,6 +1,6 @@
 # 性能对照工具与正确性预检
 
-这些程序只增加测试入口，不修改服务端业务命令、持久化或复制逻辑。正式性能结果需要另行运行矩阵；下面的小负载结果只用于确认工具可用。
+这些程序只增加测试入口，不修改服务端业务命令、持久化或复制逻辑。2026-11-19 正式矩阵已完成测量：SAVE、单机 QPS/Pipeline、RSS、socket 复制与文件传输取得有效结果；真实 eBPF 持续负载三轮均失败，不能记作有效复制 QPS。完整数据、失败与限制见[本批报告](../docs/performance/2026-11-19.md)。小负载预检仅用于确认工具可用，不替代压力测试。
 
 ## 构建与外部工具
 
@@ -29,7 +29,7 @@ bin/benchmark_echo 127.0.0.1 6390
   -h 127.0.0.1 -p 6390 -c 1 -P 1 -n 100000 ECHO payload
 ```
 
-独立 ECHO 程序复用项目 NtyCo 网络、RESP 解析、输出缓冲与 pool 分配器，原样返回一个 bulk 参数。它不执行存储引擎操作，不将该结果当作 HSET QPS。Pipeline 深度使用 `1 / 10 / 20 / 40 / 80 / 160`。默认 redis-benchmark 的 inline PING 是已有的不支持项，使用显式 RESP 命令。
+独立 ECHO 程序复用项目 NtyCo 网络、RESP 解析、输出缓冲与 pool 分配器，原样返回一个 bulk 参数。它不执行存储引擎操作，不将该结果当作 HSET QPS。P1 为 ECHO、kvstore none/aof、Redis 无 AOF/AOF always 五组；Pipeline 为两端无 AOF、深度 `10 / 20 / 40 / 80 / 160`。本批两端每档均为 10 万请求、3 轮，正式前预热至少 1 万次，向完整批次取整。kvstore HSET / Redis SET 都覆盖同一个 32B 键、128B 值，不能当作唯一键插入吞吐。默认 redis-benchmark 的 inline PING 是已有的不支持项，使用显式 RESP 命令。具体命令数组和服务配置保留在[数据文件](../docs/performance/data/measurements-2026-11-19.json)的 `provenance` 中；时钟异常的旧批次不计成绩。
 
 ## RDMA / sendfile 相同负载对照
 
@@ -59,8 +59,11 @@ iperf3 只作为链路参考，单独记录：
 
 ```sh
 python3 -B tests/benchmark_save_frequency.py --entries 1000000 \
-  --save-every 1000000 100000 10000 1000 --rounds 3 \
+  --save-every 1000000 100000 10000 --rounds 3 \
   --output /tmp/91kv-save-frequency-results
+# 1k 档单独一轮；本批实际由原排程调整，完整保留已验完的首轮 1k。
+python3 -B tests/benchmark_save_frequency.py --entries 1000000 \
+  --save-every 1000 --rounds 1 --output /tmp/91kv-save-frequency-1k
 ```
 
 每次运行新建独立目录及 snapshot/file/pool 配置，使用固定 32 字节 key、128 字节 value 的 Hash 负载和一条持久连接。计时包含数据生成、串行写入及同步 SAVE；记录每次 SAVE 耗时/大小、总耗时、写 QPS 与累计快照字节。区间顺序按轮次轮转。最后不足一个区间也执行 SAVE。计时后重启并逐条核对所有键，保留配置、二进制/脚本哈希、快照和 JSON；失败返回非零，不能把失败轮算作性能样本。输出目录必须事先不存在。
@@ -83,4 +86,21 @@ sudo -v
 RDMA_TEST_IP=172.16.145.135 python3 -B tests/test_capture_replication.py .
 ```
 
-本轮只运行正确性验收与小负载预检，百万条 SAVE 和正式性能矩阵尚未运行。
+本批测量还使用既有 `tests/benchmark_memory.py` 完成三分配器各三轮百万条四阶段核对；双机每种模式各三轮 c1/P1、10 万条热点覆盖写，并另测 1,000 次可见性探针。所有文件传输使用同一份真实百万条快照、两端 SHA-256 一致，每方向每路径热身一次、正式三轮；iperf3 每方向 3 × 30 秒单流。结果均取中位数，SAVE 1k 单轮除外。
+
+正式计时已结束：交互式特权助手已清理三个采集实例及 socket，恢复 135 的 NTP 与 VMware 周期校时。未调整 136 原有工作区，测试用独立副本；未为性能测试修改服务端、扩容缓存或限速生产者。完整测量报告保留 eBPF 缓存溢出/事件缺口、Pipeline 退化和时钟诊断，不写成整批全绿。
+
+## 2026-11-19 修复后正式重测
+
+修复提交 `846c87d` 已合并到 main 并推送两个远端。基于更新后的 main 全量以 `-O2 -g` 重编译，仅重跑单机 QPS/Pipeline（45/45）和双机实时复制（9/9）；真实 eBPF 三轮通过，oversize/ring_full/read_error 均零。SAVE、百万条三分配器 RSS、RDMA/sendfile/iperf3 沿用修复前样本。
+
+报告保留修复前后中位数、波动及全部原始轮次，包括本轮 none/socket 吞吐下降；未把失败轮 Primary 回复当成成功复制吞吐。新样本与脚本、二进制 SHA、校时暂停/恢复信息位于 `measurements-2026-11-19.json` 的 `retune` 字段，旧顶层数据保持原样。原始参数、配置与日志在 135 `/home/jaspersao/dev/91kvstore-performance-fix-20261119`。
+
+五张新图使用实际 JSON 离线生成，不启动服务、不重跑测试，需已有 matplotlib：
+
+```bash
+python3 -B docs/performance/plot_results.py \
+  --data docs/performance/data/measurements-2026-11-19.json
+```
+
+未指定 `--data` 时仍生成历史五图；新图以 `20261119-` 前缀命名，避免覆盖历史图。
