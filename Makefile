@@ -632,3 +632,27 @@ test-clients-strict: $(BIN_DIR)/kvstore
 test-acceptance:
 	$(MAKE) --no-print-directory test-functional-bulk
 	$(MAKE) --no-print-directory test-persistence-100k
+
+# 性能对照工具复用现有网络和 RDMA 实现，作为独立测试程序构建。
+.PHONY: benchmark-tools
+benchmark-tools: $(BIN_DIR)/benchmark_echo $(BIN_DIR)/benchmark_transfer
+
+$(BIN_DIR)/benchmark_echo: $(TEST_DIR)/benchmark_echo.c \
+    $(BUILD_DIR)/ntyco.o $(BUILD_DIR)/buffer.o $(BUILD_DIR)/codec.o \
+    $(BUILD_DIR)/kvs_allocator.o $(BUILD_DIR)/log.o $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c %.o,$^) $(LDFLAGS) -lntyco -lpthread -ldl -o $@
+
+$(BIN_DIR)/benchmark_transfer: $(TEST_DIR)/benchmark_transfer.c \
+    $(NETWORK_DIR)/rdma_transport.c $(INCLUDE_DIR)/rdma_transport.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c,$^) $(RDMA_LIBS) -o $@
+
+# 独立进程故障回归使用文件事件源替身，正式采集二进制继续链接 libbpf。
+$(BIN_DIR)/test_capture_mock: $(TEST_DIR)/mock_ebpf_capture.c \
+    $(REPLICATION_DIR)/ebpf_capture_main.c $(INCLUDE_DIR)/ebpf_capture.h \
+    $(INCLUDE_DIR)/ebpf_event.h $(INCLUDE_DIR)/replication_capture_ipc.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c,$^) -o $@
+
+.PHONY: test-capture-faults
+test-capture-faults: $(BIN_DIR)/kvstore $(BIN_DIR)/test_capture_mock
+	python3 -B $(TEST_DIR)/test_capture_replication.py . --mock-collector $(abspath $(BIN_DIR)/test_capture_mock)
+	python3 -B $(TEST_DIR)/test_capture_faults.py .
