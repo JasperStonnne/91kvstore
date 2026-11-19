@@ -4,7 +4,7 @@
 
 /* 当前阶段的固定容量；超限时计数并由 AOF 补偿，禁止截断复制。 */
 #define KVS_EBPF_MAX_PAYLOAD 4096
-#define KVS_EBPF_RING_BYTES (1024 * 1024)
+#define KVS_EBPF_RING_BYTES (16u * 1024u * 1024u)
 
 /*
  * v1 事件只在 BPF 与 Primary 用户态之间传递。

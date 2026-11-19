@@ -33,6 +33,12 @@ int kvs_ebpf_read(struct kvs_ebpf_event *event)
     return 1;
 }
 
+int kvs_ebpf_get_failures(struct kvs_ebpf_failures *failures)
+{
+    *failures = (struct kvs_ebpf_failures){0};
+    return 0;
+}
+
 void kvs_ebpf_stop(void)
 {
     if (source_fd >= 0) {

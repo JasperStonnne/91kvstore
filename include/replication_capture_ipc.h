@@ -8,7 +8,7 @@
 #include <sys/un.h>
 
 /* 同机 SOCK_SEQPACKET 接口。一个请求只对应一个响应。 */
-#define KVS_CAPTURE_READ_BYTES 4096
+#define KVS_CAPTURE_READ_BYTES (64u * 1024u)
 #define KVS_CAPTURE_READ_ERROR (-1)
 #define KVS_CAPTURE_READ 0u
 #define KVS_CAPTURE_BEGIN 1u

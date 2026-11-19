@@ -90,6 +90,39 @@ def cache_cases(repo, root):
             assert not address.exists()
 
 
+def bulk_cache_read(repo, root):
+    """64 KiB IPC packet crossing the cache wrap; preserve every byte."""
+    directory = root / "cache-bulk"
+    directory.mkdir()
+    process, events, address, log = collector(repo, directory, os.getpid())
+    start = 8 * 1024 * 1024 - 32768
+    payload = bytes(range(256)) * 256
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as peer:
+            peer.settimeout(10)
+            peer.connect(str(address))
+            peer.sendall(REQUEST.pack(start, 0, 1))
+            assert struct.unpack("=i", peer.recv(4))[0] == 0
+            for index in range(0, len(payload), 4096):
+                append(events, start + index, payload[index:index + 4096])
+            # Leave a distinct tail to verify the next request offset.
+            append(events, start + len(payload), b"marker")
+            wait(lambda: f"end={start + len(payload) + 6} valid=1" in log.read_text(),
+                 "collector consumed full 64 KiB payload and marker")
+            peer.sendall(REQUEST.pack(start, 65536, 0))
+            response = peer.recv(65540)
+            assert struct.unpack("=i", response[:4])[0] == 65536
+            assert response[4:] == payload
+            peer.sendall(REQUEST.pack(start + 65536, 65536, 0))
+            response = peer.recv(65540)
+            assert response == struct.pack("=i", 6) + b"marker"
+        print("[PASS] collector IPC full 64 KiB packet, cache wrap and next offset", flush=True)
+    finally:
+        stop_server(process)
+        assert not address.exists()
+        assert "failure_count oversize=0 ring_full=0 read_error=0" in log.read_text()
+
+
 def session_fault(repo, root, fault):
     directory = root / fault
     directory.mkdir()
@@ -206,6 +239,7 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="91kv-capture-faults-"))
     print(f"Evidence: {root}", flush=True)
     cache_cases(repo, root)
+    bulk_cache_read(repo, root)
     socket_overflow(repo, root)
     for fault in ("tail-loss", "gap", "collector-exit"):
         session_fault(repo, root, fault)

@@ -8,6 +8,7 @@
 #include "log.h"
 #include "protocol.h"
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include<errno.h>
 #include <string.h>
 #include <time.h>
@@ -15,7 +16,8 @@
 #include <unistd.h>
 #define NTYCO_MAX_LISTENER_COUNT 2
 #define NTYCO_MAX_CONNECTOR_COUNT 1 // 当前一台 Replica 只连接一个 Primary
-#define NTYCO_STREAM_RETRY_INTERVAL_MS 50
+#define NTYCO_STREAM_RETRY_INTERVAL_MS 1
+#define NTYCO_STREAM_READ_BYTES (64 * 1024)
 /* 待发送回复达到 64 KiB 时，先发送这一批。 */
 #define NTYCO_REPLY_BATCH_THRESHOLD (64 * 1024)
 
@@ -55,6 +57,17 @@ typedef struct{
 
 #define NTYCO_IDENTIFICATION_TIMEOUT_MS 5000
 #define NTYCO_IDENTIFICATION_RETRY_MS 10
+
+/* 客户端和复制连接都立即发送短回复，避免批次末尾等待 TCP 合并。 */
+static int ntyco_set_nodelay(int fd)
+{
+    int enabled = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) < 0) {
+        kvs_log_message(KVS_LOG_ERROR, "set TCP_NODELAY fd=%d: %s\n", fd, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
 
 static long long ntyco_monotonic_ms(void)
 {
@@ -397,11 +410,14 @@ void server_reader(void *arg) {
 			}
 
 			if(stream_handler!=NULL){
+                if (kvs_output_buffer_ensure_space(&output, NTYCO_STREAM_READ_BYTES) < 0) {
+                    goto connection_closed;
+                }
 				while(1){
 					int stream_length=stream_handler(
 						fd,
 						output.data,
-						BUFFER_LENGTH
+						NTYCO_STREAM_READ_BYTES
 					);
 				/*
 				* -2 不是错误，只表示长期复制流当前没有新数据。
@@ -436,7 +452,7 @@ void server_reader(void *arg) {
 					nty_coroutine_yield(co);
 					continue;
 				}
-					if(stream_length<0){
+					if(stream_length<0 || stream_length>NTYCO_STREAM_READ_BYTES){
 						goto connection_closed;
 					}
 
@@ -496,6 +512,11 @@ static void ntyco_connector(void *arg)
 	int fd=nty_socket(AF_INET,SOCK_STREAM,0);              // 创建一个受 NtyCo 调度的 TCP socket
     if(fd<0){
         fprintf(stderr,"failed to create primary connection socket\n");
+        return;
+    }
+
+    if (ntyco_set_nodelay(fd) < 0) {
+        nty_close(fd);
         return;
     }
 
@@ -588,6 +609,10 @@ void server(void *arg) {
 		if(cli_fd<0){
 			continue;
 		}
+        if (ntyco_set_nodelay(cli_fd) < 0) {
+            nty_close(cli_fd);
+            continue;
+        }
 		long long identification_deadline_ms = 0;
 
         if (context->replication_handler != NULL) {

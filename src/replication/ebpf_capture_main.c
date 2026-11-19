@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 #define KVS_EBPF_CACHE_BYTES (8u * 1024u * 1024u)
 
@@ -185,6 +186,25 @@ static int capture_cache_serve(struct capture_cache *cache, int peer,
     return 0;
 }
 
+/* 周期及退出时输出累计内核丢事件计数；不把读计数失败伪装成零。 */
+static void capture_report_failures(const struct capture_cache *cache)
+{
+    if (cache->data != NULL) {
+        fprintf(stderr, "capture cache start=%" PRIu64 " end=%" PRIu64
+                        " valid=%d\n", cache->start, cache->end, cache->valid);
+    }
+    struct kvs_ebpf_failures failures;
+    int result = kvs_ebpf_get_failures(&failures);
+    if (result < 0) {
+        fprintf(stderr, "capture failure_count unavailable: %s\n", strerror(-result));
+        return;
+    }
+    fprintf(stderr, "capture failure_count oversize=%" PRIu64
+                    " ring_full=%" PRIu64 " read_error=%" PRIu64 "\n",
+            (uint64_t)failures.oversize, (uint64_t)failures.ring_full,
+            (uint64_t)failures.read_error);
+}
+
 static volatile sig_atomic_t stopping;
 
 static void stop_capture(int signo)
@@ -262,7 +282,13 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "replication uprobe attached to Primary %ld\n", pid);
     int status = EXIT_SUCCESS;
+    time_t last_report = -1;
     while (!stopping) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec != last_report) {
+            capture_report_failures(&cache);
+            last_report = now.tv_sec;
+        }
         if (listener >= 0 && peer < 0) {
             peer = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (peer >= 0) {
@@ -300,7 +326,7 @@ int main(int argc, char **argv)
                 break;
             }
             struct pollfd wakeup = { .fd = peer >= 0 ? peer : listener, .events = POLLIN };
-            poll(&wakeup, 1, 10);
+            poll(&wakeup, 1, 1);
             continue;
         }
 
@@ -328,6 +354,7 @@ int main(int argc, char **argv)
         }
     }
 
+    capture_report_failures(&cache);
     if (cache.valid) {
         fprintf(stderr, "capture cache retained [%" PRIu64 ",%" PRIu64 ")\n",
                 cache.start, cache.end);
