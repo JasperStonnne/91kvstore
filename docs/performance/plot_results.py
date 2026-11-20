@@ -106,12 +106,80 @@ def plot_formal(data, target, preview):
     print('Generated five 2026-11-19 SVG figures from measured JSON only.')
 
 
+
+def plot_direct(data, target, preview):
+    """Compare one direct eBPF run with retained historical medians; no benchmarking."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    assert data['measurement_passed'] and data['cleanup_verified']
+    historical = data['historical']['comparisons']
+    direct = data['direct']
+    target.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update({'font.family':'DejaVu Sans', 'font.size':10,
+        'axes.spines.top':False, 'axes.spines.right':False, 'svg.fonttype':'none',
+        'svg.hashsalt':'91kv-20261120-direct'})
+    colors=['#64748b','#2563eb','#e68619']
+    labels=['socket\n3 historical rounds','eBPF via .sock\n3 historical rounds','eBPF direct TCP\n1 new round']
+    groups=[[v['qps'] for v in h['round_values']] for h in historical]+[[direct['qps']]]
+    fig, axes=plt.subplots(1,2,figsize=(13.2,5.4))
+    for i, values in enumerate(groups):
+        middle=stats.median(values)
+        axes[0].bar(i,middle,color=colors[i],width=.62)
+        axes[0].scatter([i+(j-(len(values)-1)/2)*.07 for j in range(len(values))],values,
+                        color='#111827',s=24,marker='D' if i==2 else 'o',zorder=3)
+        axes[0].text(i,middle+800,f'{middle:,.2f}',ha='center',fontsize=10)
+    axes[0].set(xticks=range(3),xticklabels=labels,ylabel='Primary successful replies/s',ylim=(0,35000))
+    axes[0].set_title('Throughput: 100,000 measured HSET requests')
+    for mode in range(3):
+        values=[]
+        for field in ('p50','p99'):
+            values.append([v['visibility_'+field+'_ms'] for v in historical[mode]['round_values']]
+                          if mode<2 else [direct['visibility'][field]])
+        positions=[x+(mode-1)*.25 for x in range(2)]
+        mids=[stats.median(v) for v in values]
+        axes[1].bar(positions,mids,width=.22,color=colors[mode],label=labels[mode].replace('\n',' / '))
+        for x, vals, middle in zip(positions,values,mids):
+            axes[1].scatter([x+(j-(len(vals)-1)/2)*.035 for j in range(len(vals))],vals,
+                            color='#111827',s=17,marker='D' if mode==2 else 'o',zorder=3)
+            axes[1].text(x,middle+.12,f'{middle:.3f}',ha='center',fontsize=9)
+    axes[1].set(xticks=range(2),xticklabels=['P50','P99'],ylabel='Submit-to-visible latency (ms)',ylim=(0,7.2))
+    axes[1].set_title('Separate 1,000 serial visibility probes per round')
+    axes[1].legend(frameon=False,fontsize=8,loc='upper left')
+    for ax in axes:
+        ax.set_axisbelow(True);ax.grid(axis='y',alpha=.2)
+    title='Direct eBPF: one new round vs historical references'
+    fig.suptitle(title,fontsize=16,fontweight='bold',x=.06,ha='left')
+    note=('c1 / P1; 32 B hot key / 128 B value; pool; no persistence; -O2 -g. Bars: medians; dots: raw rounds.\n'
+          '2026-11-19 references retained; direct run: 2026-11-20. No concurrent control rerun or causal claim.\n'
+          'Visibility probes are outside throughput timing and include write/read RTT plus 1 ms polling; not one-way latency.')
+    fig.text(.06,.025,note,fontsize=9,va='bottom')
+    fig.tight_layout(rect=(.01,.18,.99,.91))
+    dest=target/'20261120-direct-ebpf.svg'
+    fig.savefig(dest,metadata={'Date':None,'Title':title,'Description':note})
+    dest.write_text('\n'.join(line.rstrip() for line in dest.read_text().splitlines())+'\n')
+    ET.parse(dest)
+    if preview:
+        preview.mkdir(parents=True,exist_ok=True)
+        fig.savefig(preview/'20261120-direct-ebpf.png',dpi=150)
+    plt.close(fig)
+    print('Generated direct eBPF comparison from stored JSON only; no service or test executed.')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--preview-dir', type=Path, help='optional local PNG QA copies')
+    parser.add_argument('--direct-data', type=Path, help='single direct eBPF rerun JSON with historical references')
     parser.add_argument('--data', type=Path, help='formal matrix JSON containing retune results')
     parser.add_argument('--figures-dir', type=Path, help='optional SVG destination')
     args = parser.parse_args()
+    if args.direct_data:
+        if args.data:
+            parser.error('--data and --direct-data are mutually exclusive')
+        with tempfile.TemporaryDirectory(prefix='91kv-direct-plot-') as cache:
+            os.environ['MPLCONFIGDIR'] = cache
+            os.environ['XDG_CACHE_HOME'] = cache
+            plot_direct(json.loads(args.direct_data.read_text()), args.figures_dir or Path(__file__).resolve().parent/'figures', args.preview_dir)
+        return
     if args.data:
         with tempfile.TemporaryDirectory(prefix='91kv-formal-plot-') as cache:
             os.environ['MPLCONFIGDIR'] = cache

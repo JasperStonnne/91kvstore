@@ -3,6 +3,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <limits.h>
+#include <string.h>
+
+static char state_path[PATH_MAX];
 
 static int source_fd = -1;
 static off_t position;
@@ -10,6 +15,10 @@ static off_t position;
 int kvs_ebpf_start_replication(const char *path, pid_t primary_pid)
 {
     (void)primary_pid;
+    if (snprintf(state_path, sizeof(state_path), "%s.state", path) >= (int)sizeof(state_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     source_fd = open(path, O_RDONLY | O_CLOEXEC);
     position = 0;
     return source_fd < 0 ? -1 : 0;
@@ -37,6 +46,33 @@ int kvs_ebpf_get_failures(struct kvs_ebpf_failures *failures)
 {
     *failures = (struct kvs_ebpf_failures){0};
     return 0;
+}
+
+/* 仅测试替身使用的原子替换文本文件；生产状态来自内核 Map。 */
+int kvs_ebpf_read_state(struct kvs_ebpf_state *state)
+{
+    FILE *file = fopen(state_path, "r");
+    if (file == NULL)
+        return errno == ENOENT ? -EAGAIN : -errno;
+    char primary[41], sync[41];
+    unsigned long long generation, offset, end, over, ring, read, old_over, old_ring, old_read;
+    int count = fscanf(file, "%llu %40s %40s %llu %llu %llu %llu %llu %llu %llu %llu",
+        &generation, primary, sync, &offset, &end, &over, &ring, &read,
+        &old_over, &old_ring, &old_read);
+    fclose(file);
+    if (count != 11 || strlen(primary) != 40 || strlen(sync) != 40)
+        return -EPROTO;
+    struct kvs_ebpf_state sample = {
+        .boundary = { .generation = generation, .stream_offset = offset,
+                      .failures = { old_over, old_ring, old_read } },
+        .stream_end = end, .failures = { over, ring, read }
+    };
+    memcpy(sample.boundary.primary_id, primary, 40);
+    memcpy(sample.boundary.full_sync_id, sync, 40);
+    int result = kvs_ebpf_validate_state(&sample);
+    if (result == 0)
+        *state = sample;
+    return result;
 }
 
 void kvs_ebpf_stop(void)

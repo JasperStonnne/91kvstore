@@ -17,6 +17,19 @@
 void *kvs_malloc(size_t size) { return malloc(size); }
 void kvs_free(void *ptr) { free(ptr); }
 
+/* 网络替身保留会话回调，单测可模拟取消后的迟到通知。 */
+static kvs_dynamic_connector_config_t dynamic_config;
+static int dynamic_starts;
+int ntyco_connect_dynamic(const kvs_dynamic_connector_config_t *config, kvs_dynamic_connector_t **handle)
+{
+    dynamic_config = *config;
+    *handle = (kvs_dynamic_connector_t *)&dynamic_config;
+    dynamic_starts++;
+    return 0;
+}
+void ntyco_cancel_dynamic(kvs_dynamic_connector_t **handle) { *handle = NULL; }
+void ntyco_shutdown_connection(int fd) { (void)fd; }
+
 static const char snapshot[] = "opaque-snapshot-bytes";
 static const char sync_id[] = "abcdef0123456789abcdef0123456789abcdef01";
 static const char command[] = "*3\r\n$4\r\nHSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
@@ -27,6 +40,10 @@ static int early_disconnect;
 static int partial_disconnect;
 static int oversized_chunk;
 static int starts;
+static int finish_ok_early;
+static int install_fail;
+static int apply_fail;
+static unsigned int advertised_capture_port;
 
 struct kvs_rdma_connection {
     int established;
@@ -50,6 +67,8 @@ static int verify_snapshot(const char *path)
     assert(fclose(file) == 0);
     assert(length == sizeof(snapshot) - 1);
     assert(memcmp(actual, snapshot, length) == 0);
+    if (install_fail)
+        return -1;
     ++installed;
     return 0;
 }
@@ -59,6 +78,8 @@ static int apply_command(const kvs_slice_t *fields, size_t count,
 {
     assert(count == 3);
     (void)fields;
+    if (apply_fail)
+        return snprintf(response, (size_t)capacity, "-ERR rejected\r\n");
     ++applied;
     /* 模拟命令执行器的成功响应；复制层消费命令但不把响应发回 Primary。 */
     return snprintf(response, (size_t)capacity, "+OK\r\n");
@@ -197,6 +218,7 @@ int kvs_rdma_listener_close(kvs_rdma_listener_t **listener)
 static kvs_connector_config_t setup(void)
 {
     installed = applied = starts = 0;
+    install_fail = apply_fail = 0;
     assert(kvs_replication_init(KVS_ROLE_REPLICA, "127.0.0.1", 29000,
                                 verify_snapshot, apply_command) == 0);
     kvs_connector_config_t connector = {0};
@@ -212,6 +234,39 @@ static int feed(kvs_connector_config_t *connector, char *input, int length,
     char output[256];
     kvs_output_buffer_t response = {.data = output, .capacity = sizeof(output)};
     return connector->message_handler(123, input, length, &response, consumed);
+}
+
+static int send_finish_ok(kvs_connector_config_t *connector)
+{
+    char message[128];
+    int consumed = 0;
+    int length = snprintf(message, sizeof(message), "SYNC_FINISHED_OK %s 112\r\n", sync_id);
+    assert(feed(connector, message, length, &consumed) == 0 && consumed == length);
+    assert(!kvs_replication_is_online());
+    return 1;
+}
+
+static int drive_replica(kvs_connector_config_t *connector)
+{
+    char output[256], expected[128];
+    int sent = 0, accepted = 0;
+    int length = snprintf(expected, sizeof(expected), "SYNC_FINISHED %s 112\r\n", sync_id);
+    for (int i = 0; i < 20; i++) {
+        int result = connector->stream_handler(123, output, sizeof(output));
+        if (result > 0) {
+            assert(result == length && memcmp(output, expected, length) == 0 && sent++ == 0);
+            assert(installed == 1 && transport.ack_sent && !transport.disconnected);
+            assert(access("snapshot.db.replication.tmp", F_OK) < 0 && errno == ENOENT);
+            if (finish_ok_early)
+                accepted = send_finish_ok(connector);
+        } else if (result == 0 || result != KVS_STREAM_WAIT) {
+            return result;
+        }
+        if (sent && transport.disconnected && !accepted)
+            accepted = send_finish_ok(connector);
+    }
+    assert(0 && "Replica failed to finish control handshake");
+    return -1;
 }
 
 static void teardown(void)
@@ -237,7 +292,7 @@ static void test_session(int reordered, int disconnect_early, int oversize)
     assert(starts == 0);
 
     int header_length = snprintf(input, sizeof(input),
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112 0\r\n",
         sizeof(snapshot) - 1, sync_id);
     assert(header_length > 0);
     memcpy(input + header_length, command, sizeof(command) - 1);
@@ -251,10 +306,8 @@ static void test_session(int reordered, int disconnect_early, int oversize)
     assert(feed(&connector, (char *)command, sizeof(command) - 1, &consumed) < 0);
     assert(installed == 0 && applied == 0);
 
-    char output[256];
-    int result = KVS_STREAM_WAIT;
-    for (int i = 0; i < 12 && result == KVS_STREAM_WAIT; ++i)
-        result = connector.stream_handler(123, output, sizeof(output));
+    finish_ok_early = reordered;
+    int result = drive_replica(&connector);
     if (disconnect_early || oversize) {
         assert(result < 0 && result != KVS_STREAM_WAIT);
         assert(installed == 0 && !transport.ack_sent);
@@ -300,15 +353,23 @@ static void test_session(int reordered, int disconnect_early, int oversize)
 static void test_control_boundaries(void)
 {
     recv_before_send = early_disconnect = partial_disconnect = oversized_chunk = 0;
+    finish_ok_early = 0;
     static const char *headers[] = {
-        "FULLRESYNC_RDMA short 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 -1 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 0 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 65536 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 short 112\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 extra\r\n",
-        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n"
+        "FULLRESYNC_RDMA short 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 0\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 -1 29747 abcdef0123456789abcdef0123456789abcdef01 112 0\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 29747 abcdef0123456789abcdef0123456789abcdef01 112 0\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 0 abcdef0123456789abcdef0123456789abcdef01 112 0\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 65536 abcdef0123456789abcdef0123456789abcdef01 112 0\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 short 112 0\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 0 extra\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 0 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 0\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 65536\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 -1\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 -0\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 29000\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 29747\r\n",
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 1 extra\r\n"
     };
     for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
         kvs_connector_config_t connector = setup();
@@ -325,19 +386,17 @@ static void test_control_boundaries(void)
     };
     for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
         kvs_connector_config_t connector = setup();
-        char input[256], output[256];
+        char input[256];
         int consumed = 0;
         int length = snprintf(input, sizeof(input),
-            "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112\r\n",
+            "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112 0\r\n",
             sizeof(snapshot) - 1, sync_id);
         for (int prefix = 1; prefix < length; prefix++) {
             assert(feed(&connector, input, prefix, &consumed) == 0);
             assert(consumed == 0 && starts == 0);
         }
         assert(feed(&connector, input, length, &consumed) == 0);
-        int result = KVS_STREAM_WAIT;
-        for (int attempt = 0; attempt < 12 && result == KVS_STREAM_WAIT; attempt++)
-            result = connector.stream_handler(123, output, sizeof(output));
+        int result = drive_replica(&connector);
         assert(result == 0 && installed == 1 && !kvs_replication_is_online());
 
         static const char online[] = "ONLINE 112\r\n";
@@ -354,6 +413,193 @@ static void test_control_boundaries(void)
     puts("[PASS] fixed full-sync headers, all control prefixes and invalid ONLINE boundaries");
 }
 
+static kvs_connector_config_t loaded_replica(void)
+{
+    recv_before_send = early_disconnect = partial_disconnect = oversized_chunk = 0;
+    kvs_connector_config_t connector = setup();
+    char input[256], output[256], expected[128];
+    int length = snprintf(input, sizeof(input),
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112 %u\r\n",
+        sizeof(snapshot) - 1, sync_id, advertised_capture_port);
+    int consumed = 0;
+    assert(feed(&connector, input, length, &consumed) == 0);
+    int expected_length = snprintf(expected, sizeof(expected), "SYNC_FINISHED %s 112\r\n", sync_id);
+    for (int i = 0; i < 12; i++) {
+        int result = connector.stream_handler(123, output, sizeof(output));
+        if (result > 0) {
+            assert(result == expected_length && memcmp(output, expected, (size_t)result) == 0);
+            assert(installed == 1 && transport.ack_sent && !transport.disconnected);
+            return connector;
+        }
+        assert(result == KVS_STREAM_WAIT);
+    }
+    assert(0 && "no SYNC_FINISHED after successful load");
+    return connector;
+}
+
+static void test_finish_handshake(void)
+{
+    static const char *bad[] = {
+        "SYNC_FINISHED_OK short 112\r\n",
+        "SYNC_FINISHED_OK abcdef0123456789abcdef0123456789abcdef01 111\r\n",
+        "SYNC_FINISHED_OK abcdef0123456789abcdef0123456789abcdef01 -1\r\n",
+        "SYNC_FINISHED_OK abcdef0123456789abcdef0123456789abcdef01 18446744073709551616\r\n",
+        "SYNC_FINISHED_OK abcdef0123456789abcdef0123456789abcdef01 112 extra\r\n",
+        "ONLINE 112\r\n"
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        kvs_connector_config_t connector = loaded_replica();
+        char input[256];
+        strcpy(input, bad[i]);
+        int consumed = 0;
+        assert(feed(&connector, input, (int)strlen(input), &consumed) < 0);
+        assert(!kvs_replication_is_online() && applied == 0);
+        teardown();
+    }
+    kvs_connector_config_t connector = loaded_replica();
+    char input[512], output[256];
+    int length = snprintf(input, sizeof(input), "SYNC_FINISHED_OK %s 112\r\n", sync_id);
+    int consumed = 0;
+    for (int prefix = 1; prefix < length; prefix++) {
+        assert(feed(&connector, input, prefix, &consumed) == 0 && consumed == 0);
+    }
+    kvs_output_buffer_t response = { .data = output, .capacity = sizeof(output) };
+    assert(connector.message_handler(124, input, length, &response, &consumed) < 0);
+    const char online[] = "ONLINE 112\r\n";
+    memcpy(input + length, online, sizeof(online) - 1);
+    memcpy(input + length + sizeof(online) - 1, command, sizeof(command) - 1);
+    int tail = (int)sizeof(online) + (int)sizeof(command) - 2;
+    assert(feed(&connector, input, length + tail, &consumed) == 0 && consumed == length);
+    memmove(input, input + consumed, (size_t)tail);
+    assert(feed(&connector, input, tail, &consumed) == 0 && consumed == 0);
+    assert(!kvs_replication_is_online() && applied == 0); /* OK 先到，CM 尚未关闭。 */
+    assert(connector.stream_handler(123, output, sizeof(output)) == 0 && transport.disconnected);
+    assert(feed(&connector, input, tail, &consumed) == 0 && consumed == (int)sizeof(online) - 1);
+    assert(kvs_replication_is_online() && applied == 0);
+    memmove(input, input + consumed, sizeof(command) - 1);
+    assert(feed(&connector, input, sizeof(command) - 1, &consumed) == 0 && applied == 1);
+    length = snprintf(input, sizeof(input), "SYNC_FINISHED_OK %s 112\r\n", sync_id);
+    assert(feed(&connector, input, length, &consumed) < 0); /* 重复确认不重新上线。 */
+    teardown();
+
+    connector = setup();
+    install_fail = 1;
+    length = snprintf(input, sizeof(input),
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112 0\r\n",
+        sizeof(snapshot) - 1, sync_id);
+    assert(feed(&connector, input, length, &consumed) == 0);
+    int result = KVS_STREAM_WAIT;
+    for (int i = 0; i < 12 && result == KVS_STREAM_WAIT; i++)
+        result = connector.stream_handler(123, output, sizeof(output));
+    assert(result < 0 && result != KVS_STREAM_WAIT && !transport.ack_sent && installed == 0);
+    assert(access("snapshot.db.replication.tmp", F_OK) < 0 && errno == ENOENT);
+    teardown();
+    puts("[PASS] SYNC_FINISHED: load failure, IDs/S/FD, split/coalesced OK, early OK waits for RDMA, duplicates");
+}
+
+
+static kvs_connector_config_t capture_replica(void)
+{
+    advertised_capture_port = 29005;
+    int before = dynamic_starts;
+    kvs_connector_config_t control = loaded_replica();
+    assert(dynamic_starts == before); /* 加载及最终 ACK 都不能提前连接采集端。 */
+    send_finish_ok(&control);
+    assert(dynamic_starts == before); /* OK 先到，仍等待本地 RDMA 关闭。 */
+    char output[256];
+    assert(control.stream_handler(123, output, sizeof(output)) == 0);
+    assert(dynamic_starts == before + 1 && transport.disconnected);
+    assert(dynamic_config.port == 29005 && !strcmp(dynamic_config.host, "127.0.0.1"));
+    int length = dynamic_config.opened(dynamic_config.context, dynamic_config.session,
+                                        456, output, sizeof(output));
+    char expected[128];
+    snprintf(expected, sizeof(expected), "BEGIN 0123456789abcdef0123456789abcdef01234567 %s 112\r\n", sync_id);
+    assert(length == (int)strlen(expected) && !memcmp(output, expected, (size_t)length));
+    return control;
+}
+
+static int capture_feed(kvs_dynamic_connector_config_t *config, char *input, int length,
+                         char *output, int *consumed)
+{
+    kvs_output_buffer_t response = {.data = output, .capacity = 256};
+    return config->message(config->context, config->session, 456, input, length, &response, consumed);
+}
+
+static void test_capture_connection(void)
+{
+    kvs_connector_config_t control = capture_replica();
+    char input[512], output[256];
+    int consumed = 0;
+    assert(feed(&control, (char *)command, sizeof(command) - 1, &consumed) < 0);
+    int header = snprintf(input, sizeof(input), "DATA 112 %zu\r\n", sizeof(command) - 1);
+    memcpy(input + header, command, sizeof(command) - 1);
+    int length = header + sizeof(command) - 1;
+    for (int prefix = 1; prefix < length; prefix++) {
+        assert(capture_feed(&dynamic_config, input, prefix, output, &consumed) == 0);
+        assert(consumed == 0 && applied == 0);
+    }
+    int reply = capture_feed(&dynamic_config, input, length, output, &consumed);
+    char expected[64];
+    snprintf(expected, sizeof(expected), "APPLIED %zu\r\n", 112 + sizeof(command) - 1);
+    assert(reply == (int)strlen(expected) && consumed == length && applied == 1);
+    assert(!memcmp(output, expected, (size_t)reply));
+    assert(capture_feed(&dynamic_config, input, length, output, &consumed) < 0); /* 重复区间 */
+    length = snprintf(input, sizeof(input), "ONLINE %zu\r\n", 112 + sizeof(command) - 1);
+    assert(capture_feed(&dynamic_config, input, length, output, &consumed) == 0);
+    assert(consumed == length && kvs_replication_is_online());
+    kvs_dynamic_connector_config_t stale = dynamic_config;
+    control.close_handler(123);
+    assert(!kvs_replication_is_online());
+    teardown();
+
+    /* FD 数字可复用，会话身份不可复用；旧回调不能破坏新的连接。 */
+    control = capture_replica();
+    length = snprintf(input, sizeof(input), "ONLINE 112\r\n");
+    assert(capture_feed(&dynamic_config, input, length, output, &consumed) == 0);
+    assert(kvs_replication_is_online());
+    stale.closed(stale.context, stale.session, 456);
+    assert(stale.opened(stale.context, stale.session, 456, output, sizeof(output)) < 0);
+    assert(capture_feed(&stale, input, length, output, &consumed) < 0);
+    assert(kvs_replication_is_online());
+    dynamic_config.closed(dynamic_config.context, dynamic_config.session, 456);
+    assert(!kvs_replication_is_online());
+    teardown();
+
+    static const char *bad[] = {
+        "DATA 111 1\r\nx", "DATA 113 1\r\nx", "DATA 112 65537\r\n",
+        "DATA 112 0\r\n", "DATA 112 -1\r\n", "ONLINE 113\r\n", "ERROR CAPTURE_LOSS\r\n"
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        capture_replica();
+        strcpy(input, bad[i]);
+        assert(capture_feed(&dynamic_config, input, (int)strlen(input), output, &consumed) < 0);
+        assert(applied == 0 && !kvs_replication_is_online());
+        teardown();
+    }
+    capture_replica();
+    apply_fail = 1;
+    header = snprintf(input, sizeof(input), "DATA 112 %zu\r\n", sizeof(command) - 1);
+    memcpy(input + header, command, sizeof(command) - 1);
+    assert(capture_feed(&dynamic_config, input, header + sizeof(command) - 1, output, &consumed) < 0);
+    assert(applied == 0 && !kvs_replication_is_online());
+    teardown();
+
+    /* 命令可跨 DATA 帧；只有完整执行后才返回 APPLIED。 */
+    capture_replica();
+    header = snprintf(input, sizeof(input), "DATA 112 5\r\n");
+    memcpy(input + header, command, 5);
+    assert(capture_feed(&dynamic_config, input, header + 5, output, &consumed) == 0 && applied == 0);
+    strcpy(input, "ONLINE 117\r\n");
+    assert(capture_feed(&dynamic_config, input, (int)strlen(input), output, &consumed) < 0);
+    header = snprintf(input, sizeof(input), "DATA 117 %zu\r\n", sizeof(command) - 6);
+    memcpy(input + header, command + 5, sizeof(command) - 6);
+    reply = capture_feed(&dynamic_config, input, header + sizeof(command) - 6, output, &consumed);
+    assert(reply == (int)strlen(expected) && !memcmp(output, expected, (size_t)reply) && applied == 1);
+    teardown();
+    advertised_capture_port = 0;
+    puts("[PASS] capture Replica: delayed connect, BEGIN, split DATA, APPLIED, ONLINE, failed apply, gap/duplicate/error, stale sessions");
+}
+
 int main(void)
 {
     char directory[] = "/tmp/91kv-boundary.XXXXXX";
@@ -366,6 +612,8 @@ int main(void)
     test_session(0, 1, 0);
     test_session(0, 2, 0);
     test_session(0, 0, 1);
+    test_finish_handshake();
+    test_capture_connection();
     assert(fchdir(original_directory) == 0);
     assert(close(original_directory) == 0 && rmdir(directory) == 0);
     return 0;

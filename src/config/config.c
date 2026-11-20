@@ -27,7 +27,7 @@ enum config_field {
     FIELD_PRIMARY_PORT,
     FIELD_ALLOCATOR,
     FIELD_REPLICATION_INCREMENTAL_MODE,
-    FIELD_REPLICATION_CAPTURE_SOCKET,
+    FIELD_REPLICATION_CAPTURE_PORT,
     FIELD_COUNT
 };
 
@@ -45,7 +45,7 @@ static const char *const field_names[FIELD_COUNT] = {
     "primary_port",
     "allocator",
     "replication_incremental_mode",
-    "replication_capture_socket"
+    "replication_capture_port"
 };
 
 /* 把错误位置和原因统一写入调用方提供的缓冲区。 */
@@ -276,12 +276,10 @@ static int parse_field(
         }
         return 0;
 
-    case FIELD_REPLICATION_CAPTURE_SOCKET:
-        if (value[0] != '/' || strlen(value) >= sizeof(parsed->replication_capture_socket)) {
+    case FIELD_REPLICATION_CAPTURE_PORT:
+        if (parse_port(value, &parsed->replication_capture_port) < 0)
             return config_error(error, error_capacity, path, line_number,
-                                "replication_capture_socket must be an absolute Unix socket path");
-        }
-        strcpy(parsed->replication_capture_socket, value);
+                                "invalid replication_capture_port; expected 1-65535");
         return 0;
 
     case FIELD_REPLICATION_PORT:
@@ -512,15 +510,19 @@ static int validate_config(
         );
     }
     if (parsed->role != KVS_ROLE_PRIMARY &&
-        (seen[FIELD_REPLICATION_INCREMENTAL_MODE] || seen[FIELD_REPLICATION_CAPTURE_SOCKET])) {
+        (seen[FIELD_REPLICATION_INCREMENTAL_MODE] || seen[FIELD_REPLICATION_CAPTURE_PORT])) {
         return config_error(error, error_capacity, path, 0,
                             "incremental replication settings are only valid for role=primary");
     }
     bool ebpf = parsed->replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_EBPF;
-    if (ebpf != seen[FIELD_REPLICATION_CAPTURE_SOCKET]) {
+    if (ebpf != seen[FIELD_REPLICATION_CAPTURE_PORT]) {
         return config_error(error, error_capacity, path, 0,
-                            "replication_capture_socket is required for ebpf mode only");
+                            "replication_capture_port is required for ebpf mode only");
     }
+    if (ebpf && (parsed->replication_capture_port == parsed->service_port ||
+                 parsed->replication_capture_port == parsed->rdma_port))
+        return config_error(error, error_capacity, path, 0,
+                            "replication_capture_port must differ from service_port and rdma_port");
     /* Primary 的全量同步必须使用 RDMA，需要显式指定监听端口。 */
     if (parsed->role == KVS_ROLE_PRIMARY &&
         !seen[FIELD_RDMA_PORT]) {

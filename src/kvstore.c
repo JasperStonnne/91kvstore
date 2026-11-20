@@ -1370,8 +1370,8 @@ kvs_close_current_persistence();
 
     if (config.role == KVS_ROLE_PRIMARY) {
         if (config.replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_EBPF &&
-            kvs_replication_set_capture_socket(config.replication_capture_socket) < 0) {
-            fprintf(stderr, "failed to configure replication capture socket\n");
+            kvs_replication_set_capture_port(config.replication_capture_port) < 0) {
+            fprintf(stderr, "failed to configure replication capture port\n");
             kvs_replication_destroy();
             kvs_close_current_persistence();
             dest_kvengine();

@@ -3,6 +3,7 @@
 #ifndef __SERVER_H__
 #define __SERVER_H__
 #include <stddef.h>
+#include <stdint.h>
 #define BUFFER_LENGTH		1024
 #define CONNECTION_SIZE (1024*1024)//添加最大链接数量
 
@@ -46,6 +47,27 @@ typedef struct {
     kvs_connection_stream_handler stream_handler; /* 处理完消息后调用；返回 WAIT 时，稍后再次调用。NULL 表示不使用。 */
     kvs_connection_close_handler close_handler;    // 连接断开后调用
 } kvs_connector_config_t;
+
+/* 动态连接只允许在运行中的 NtyCo 协程内创建；网络层唯一拥有 FD。 */
+typedef struct kvs_dynamic_connector kvs_dynamic_connector_t;
+typedef struct {
+    const char *host;
+    unsigned short port;
+    uint64_t session;
+    void *context;
+    size_t max_input_bytes;
+    int (*opened)(void *, uint64_t, int, char *, int);
+    int (*message)(void *, uint64_t, int, char *, int,
+                   struct kvs_output_buffer *, int *);
+    void (*closed)(void *, uint64_t, int);
+} kvs_dynamic_connector_config_t;
+
+int ntyco_connect_dynamic(const kvs_dynamic_connector_config_t *config,
+                           kvs_dynamic_connector_t **handle);
+/* 清空调用方 handle，只取消/唤醒；最终 close 和对象释放仍由连接协程执行。 */
+void ntyco_cancel_dynamic(kvs_dynamic_connector_t **handle);
+/* 现有 control_fd 仍由 server_reader 拥有，此接口只 shutdown、不 close。 */
+void ntyco_shutdown_connection(int fd);
 
 typedef int (*kvs_frame_handler)(//单命令处理函数类型
 	int connection_fd,

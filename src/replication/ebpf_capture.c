@@ -6,7 +6,7 @@
  *
  * 每次写入触发后的数据采集，由 BPF 程序 on_committed() 完成。
  * kvs_ebpf_read() 每次非阻塞取出一条事件，复制到调用方的记录里。
- * TCP 发送和 AOF 缺口补偿由复制模块负责。
+ * 本模块只采集事件和边界/水位，不负责网络转发。
  */
 #include <errno.h>
 #include <unistd.h>
@@ -22,9 +22,12 @@
 static struct bpf_object *capture_object;
 /* 保存 on_committed 与当前 Primary 成功点之间的挂载关系。 */
 static struct bpf_link *capture_link;
+static struct bpf_link *boundary_link;
 /* 管理 ring buffer 的用户态映射。 */
 static struct ring_buffer *capture_queue;
 static int failure_map_fd = -1;
+static int stream_map_fd = -1;
+static int boundary_map_fd = -1;
 
 /* 只在同步读取期间借用调用方的目标记录，不保留队列内存指针。 */
 struct capture_read_context {
@@ -67,7 +70,7 @@ static int receive_event(void *ctx, void *data, size_t size)
 
 int kvs_ebpf_is_ready(void)
 {
-    return capture_link != NULL && capture_queue != NULL;
+    return capture_link != NULL && boundary_link != NULL && capture_queue != NULL;
 }
 
 int kvs_ebpf_get_failures(struct kvs_ebpf_failures *failures)
@@ -86,6 +89,39 @@ int kvs_ebpf_get_failures(struct kvs_ebpf_failures *failures)
     failures->ring_full = counts[1];
     failures->read_error = counts[2];
     return 0;
+}
+
+int kvs_ebpf_read_state(struct kvs_ebpf_state *state)
+{
+    if (state == NULL)
+        return -EINVAL;
+    if (!kvs_ebpf_is_ready() || stream_map_fd < 0 || boundary_map_fd < 0)
+        return -ENODEV;
+
+    const __u32 key = 0;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        struct kvs_ebpf_state sample = {0};
+        struct kvs_ebpf_snapshot_boundary after;
+        if (bpf_map_lookup_elem(boundary_map_fd, &key, &sample.boundary) < 0)
+            return -errno;
+        if (sample.boundary.generation == 0 || (sample.boundary.generation & 1))
+            continue;
+        if (bpf_map_lookup_elem(stream_map_fd, &key, &sample.stream_end) < 0)
+            return -errno;
+        int result = kvs_ebpf_get_failures(&sample.failures);
+        if (result < 0)
+            return result;
+        if (bpf_map_lookup_elem(boundary_map_fd, &key, &after) < 0)
+            return -errno;
+        if (sample.boundary.generation != after.generation || (after.generation & 1))
+            continue;
+        result = kvs_ebpf_validate_state(&sample);
+        if (result < 0)
+            return result;
+        *state = sample; /* 失败时不覆盖调用方状态，避免误用半份数据。 */
+        return 0;
+    }
+    return -EAGAIN;
 }
 
 int kvs_ebpf_read(struct kvs_ebpf_event *event)
@@ -110,20 +146,37 @@ int kvs_ebpf_read(struct kvs_ebpf_event *event)
 void kvs_ebpf_stop(void)
 {
     /* 先解除探针挂载，再释放 BPF 对象；NULL 也可以安全清理。 */
+    bpf_link__destroy(boundary_link);
+    boundary_link = NULL;
     bpf_link__destroy(capture_link);
     capture_link = NULL;
     ring_buffer__free(capture_queue);
     capture_queue = NULL;
     failure_map_fd = -1;
+    stream_map_fd = -1;
+    boundary_map_fd = -1;
     read_context.destination = NULL;
     bpf_object__close(capture_object);
     capture_object = NULL;
 }
 
+/* 拒绝不匹配的对象布局，lookup 前保证目标缓冲区大小正确。 */
+static int kvs_ebpf_state_map_fd(const char *name, size_t value_bytes)
+{
+    struct bpf_map *map = bpf_object__find_map_by_name(capture_object, name);
+    if (map == NULL)
+        return -ENOENT;
+    if (bpf_map__type(map) != BPF_MAP_TYPE_ARRAY ||
+        bpf_map__key_size(map) != sizeof(__u32) ||
+        bpf_map__value_size(map) != value_bytes || bpf_map__max_entries(map) != 1)
+        return -EPROTO;
+    return bpf_map__fd(map);
+}
+
 static int kvs_ebpf_attach(const char *object_path, pid_t pid,
                            const char *executable)
 {
-    if (capture_link != NULL)
+    if (kvs_ebpf_is_ready())
         return 0;
     if (object_path == NULL || object_path[0] == '\0') {
         errno = EINVAL;
@@ -158,6 +211,13 @@ static int kvs_ebpf_attach(const char *object_path, pid_t pid,
         error = failure_map_fd;
         goto failed;
     }
+    stream_map_fd = kvs_ebpf_state_map_fd("stream_end", sizeof(__u64));
+    boundary_map_fd = kvs_ebpf_state_map_fd("snapshot_boundary",
+        sizeof(struct kvs_ebpf_snapshot_boundary));
+    if (stream_map_fd < 0 || boundary_map_fd < 0) {
+        error = stream_map_fd < 0 ? stream_map_fd : boundary_map_fd;
+        goto failed;
+    }
     capture_queue = ring_buffer__new(map_fd, receive_event, &read_context, NULL);
     if (capture_queue == NULL) {
         error = -errno;
@@ -182,6 +242,22 @@ static int kvs_ebpf_attach(const char *object_path, pid_t pid,
     error = libbpf_get_error(capture_link);
     if (capture_link == NULL || error != 0) {
         capture_link = NULL;
+        if (error == 0)
+            error = -errno;
+        goto failed;
+    }
+
+    program = bpf_object__find_program_by_name(capture_object, "on_snapshot_boundary");
+    if (program == NULL) {
+        error = -ENOENT;
+        goto failed;
+    }
+    options.func_name = "kvs_replication_snapshot_boundary";
+    boundary_link = bpf_program__attach_uprobe_opts(
+        program, pid, executable, 0, &options);
+    error = libbpf_get_error(boundary_link);
+    if (boundary_link == NULL || error != 0) {
+        boundary_link = NULL;
         if (error == 0)
             error = -errno;
         goto failed;

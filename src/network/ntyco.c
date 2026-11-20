@@ -14,7 +14,9 @@
 #include <time.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <poll.h>
 #define NTYCO_MAX_LISTENER_COUNT 2
+static int ntyco_runtime_active;
 #define NTYCO_MAX_CONNECTOR_COUNT 1 // 当前一台 Replica 只连接一个 Primary
 #define NTYCO_STREAM_RETRY_INTERVAL_MS 1
 #define NTYCO_STREAM_READ_BYTES (64 * 1024)
@@ -287,6 +289,25 @@ static int ntyco_flush_output(int fd, kvs_output_buffer_t *output)
     return 0;
 }
 
+/* stream 等待时仍处理完整控制帧；半帧留在原输入缓冲，不另建协议栈。 */
+static int ntyco_stream_control(int fd, msg_handler handler,
+                                 kvs_input_buffer_t *input, kvs_output_buffer_t *output)
+{
+    if (input->length == 0)
+        return 0;
+    int consumed = 0;
+    int response = handler(fd, input->data, input->length, output, &consumed);
+    if (response < 0 || response > output->capacity || consumed < 0 || consumed > input->length ||
+        (response > 0 && consumed == 0))
+        return -1;
+    if (kvs_input_buffer_consume(input, consumed) < 0)
+        return -1;
+    output->length = response;
+    if (ntyco_flush_output(fd, output) < 0)
+        return -1;
+    return consumed > 0;
+}
+
 void server_reader(void *arg) {
     ntyco_connection_context_t *context =
         (ntyco_connection_context_t *)arg;
@@ -414,6 +435,12 @@ void server_reader(void *arg) {
                     goto connection_closed;
                 }
 				while(1){
+					int control = ntyco_stream_control(fd, handler, &input, &output);
+					if (control < 0) goto connection_closed;
+					if (control > 0) {
+						consumed_length = 1; /* 让 stream 结束后也继续处理缓冲区中的尾帧。 */
+						continue;
+					}
 					int stream_length=stream_handler(
 						fd,
 						output.data,
@@ -424,13 +451,22 @@ void server_reader(void *arg) {
 				* 当前协程休眠一小段时间，让出 CPU 后再检查。
 				*/
 				if(stream_length==KVS_STREAM_WAIT){
-					char probe;
-                    ssize_t pending = syscall(
-                        SYS_recvfrom,
-                        fd, &probe, 1,
-                        MSG_PEEK | MSG_DONTWAIT,
-                        NULL, NULL
-                    );
+                    /* 非阻塞收控制帧；输入暂不能消费时限在一个 stream 块内。 */
+                    ssize_t pending = -1;
+                    errno = EAGAIN;
+                    if (input.length < NTYCO_STREAM_READ_BYTES) {
+                        if (kvs_input_buffer_ensure_space(&input, 1) < 0)
+                            goto connection_closed;
+                        int available = input.capacity - input.length;
+                        if (available > NTYCO_STREAM_READ_BYTES - input.length)
+                            available = NTYCO_STREAM_READ_BYTES - input.length;
+                        pending = syscall(SYS_recvfrom, fd, input.data + input.length,
+                                          available, MSG_DONTWAIT, NULL, NULL);
+                    }
+                    if (pending > 0) {
+                        input.length += (int)pending;
+                        continue;
+                    }
 
                     if (pending == 0) {
                         /* 对端已关闭连接。 */
@@ -735,11 +771,205 @@ int ntyco_start_runtime(const kvs_listener_config_t *listeners,size_t listener_c
 				return -1;
 		}
 }//为每个主动连接任务创建一个连接器协程
+	ntyco_runtime_active = 1;
 	nty_schedule_run();
+	ntyco_runtime_active = 0;
 	for(size_t i=0;i<initialized_count;i++){
 		ntyco_listener_context_destroy(&contexts[i]);
 	}
 	return 0;
+}
+
+struct kvs_dynamic_connector {
+    kvs_dynamic_connector_config_t config;
+    char host[256];
+    int fd;
+    int cancelled;
+};
+
+static void ntyco_dynamic_pause(void)
+{
+    nty_coroutine *co = nty_coroutine_get_sched()->curr_thread;
+    nty_schedule_sched_sleepdown(co, 1);
+    nty_coroutine_yield(co);
+}
+
+void ntyco_shutdown_connection(int fd)
+{
+    if (fd >= 0)
+        (void)syscall(SYS_shutdown, fd, SHUT_RDWR);
+}
+
+void ntyco_cancel_dynamic(kvs_dynamic_connector_t **handle)
+{
+    if (handle == NULL || *handle == NULL)
+        return;
+    kvs_dynamic_connector_t *connection = *handle;
+    *handle = NULL;
+    connection->cancelled = 1;
+    ntyco_shutdown_connection(connection->fd);
+}
+
+static int ntyco_dynamic_connect(kvs_dynamic_connector_t *connection)
+{
+    struct sockaddr_in address = { .sin_family = AF_INET,
+        .sin_port = htons(connection->config.port) };
+    if (inet_pton(AF_INET, connection->host, &address.sin_addr) != 1)
+        return -1;
+    connection->fd = (int)syscall(SYS_socket, AF_INET,
+        SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (connection->fd < 0 || ntyco_set_nodelay(connection->fd) < 0)
+        return -1;
+    int enabled = 1, idle = 5, interval = 1, count = 3;
+    if (setsockopt(connection->fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) < 0 ||
+        setsockopt(connection->fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) < 0 ||
+        setsockopt(connection->fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) < 0 ||
+        setsockopt(connection->fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) < 0)
+        return -1;
+    if (syscall(SYS_connect, connection->fd, &address, sizeof(address)) == 0)
+        return 0;
+    if (errno != EINPROGRESS)
+        return -1;
+    long long started = ntyco_monotonic_ms();
+    while (!connection->cancelled) {
+        struct pollfd ready = { .fd = connection->fd, .events = POLLOUT };
+        if (poll(&ready, 1, 0) > 0) {
+            int error = 0;
+            socklen_t size = sizeof(error);
+            if (getsockopt(connection->fd, SOL_SOCKET, SO_ERROR, &error, &size) < 0)
+                return -1;
+            if (error) { errno = error; return -1; }
+            return 0;
+        }
+        if (started < 0 || ntyco_monotonic_ms() - started >= 3000) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        ntyco_dynamic_pause();
+    }
+    errno = ECANCELED;
+    return -1;
+}
+
+static int ntyco_dynamic_flush(kvs_dynamic_connector_t *connection, kvs_output_buffer_t *output)
+{
+    if (output->offset < output->length) {
+        ssize_t bytes = syscall(SYS_sendto, connection->fd, output->data + output->offset,
+            output->length - output->offset, MSG_DONTWAIT | MSG_NOSIGNAL, NULL, 0);
+        if (bytes < 0)
+            return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : -1;
+        if (bytes == 0)
+            return -1;
+        output->offset += (int)bytes;
+    }
+    if (output->offset != output->length)
+        return 0;
+    output->offset = output->length = 0;
+    return 1;
+}
+
+static void ntyco_dynamic_run(void *arg)
+{
+    kvs_dynamic_connector_t *connection = arg;
+    kvs_dynamic_connector_config_t *config = &connection->config;
+    kvs_input_buffer_t input = {0};
+    kvs_output_buffer_t output = {0};
+    if (connection->cancelled)
+        goto done;
+    if (ntyco_dynamic_connect(connection) < 0) {
+        kvs_log_message(KVS_LOG_ERROR, "network: dynamic connect %s:%u failed: %s\n",
+                        connection->host, config->port, strerror(errno));
+        goto done;
+    }
+    if (connection->cancelled || kvs_output_buffer_ensure_space(&output, BUFFER_LENGTH) < 0)
+        goto done;
+    output.length = config->opened(config->context, config->session, connection->fd,
+                                    output.data, output.capacity);
+    if (output.length < 0 || output.length > output.capacity)
+        goto done;
+    while (!connection->cancelled) {
+        int consumed = 0;
+        /* 零长度回调用于业务超时检查；不伪造输入消息。 */
+        if (config->message(config->context, config->session, connection->fd,
+                            NULL, 0, &output, &consumed) < 0)
+            break;
+        int flushed = ntyco_dynamic_flush(connection, &output);
+        if (flushed < 0)
+            break;
+        if (flushed) {
+            /* 满缓冲仍先解析已有帧，避免公平调度的帧数预算触发误断开。 */
+            if ((size_t)input.length < config->max_input_bytes &&
+                kvs_input_buffer_ensure_space(&input, 1) < 0)
+                break;
+            size_t available = (size_t)(input.capacity - input.length);
+            if (available > config->max_input_bytes - (size_t)input.length)
+                available = config->max_input_bytes - (size_t)input.length;
+            ssize_t bytes = available ? syscall(SYS_recvfrom, connection->fd, input.data + input.length,
+                                    available, MSG_DONTWAIT, NULL, NULL) : -1;
+            if (!available)
+                errno = EAGAIN;
+            if (bytes == 0)
+                break;
+            if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                break;
+            if (bytes > 0)
+                input.length += (int)bytes;
+            for (int budget = 0; budget < 32 && input.length && !connection->cancelled; budget++) {
+                if (kvs_output_buffer_ensure_space(&output, BUFFER_LENGTH) < 0)
+                    goto done;
+                kvs_output_buffer_t response = { .data = output.data + output.length,
+                    .capacity = output.capacity - output.length };
+                int reply = config->message(config->context, config->session, connection->fd,
+                    input.data, input.length, &response, &consumed);
+                if (reply < 0 || reply > response.capacity || consumed < 0 || consumed > input.length)
+                    goto done;
+                output.length += reply;
+                if (kvs_input_buffer_consume(&input, consumed) < 0)
+                    goto done;
+                if (!consumed) {
+                    if ((size_t)input.length >= config->max_input_bytes)
+                        goto done;
+                    break;
+                }
+            }
+        }
+        ntyco_dynamic_pause();
+    }
+done:
+    if (connection->fd >= 0)
+        (void)syscall(SYS_close, connection->fd); /* 唯一 close 点，取消接口不关闭 FD。 */
+    kvs_input_buffer_free(&input);
+    kvs_output_buffer_free(&output);
+    config->closed(config->context, config->session, connection->fd);
+    kvs_free(connection);
+}
+
+int ntyco_connect_dynamic(const kvs_dynamic_connector_config_t *config,
+                           kvs_dynamic_connector_t **handle)
+{
+    struct in_addr address;
+    if (!ntyco_runtime_active || nty_coroutine_get_sched()->curr_thread == NULL ||
+        config == NULL || handle == NULL || *handle != NULL || config->host == NULL ||
+        strlen(config->host) >= 256 || inet_pton(AF_INET, config->host, &address) != 1 ||
+        config->port == 0 || config->opened == NULL || config->message == NULL ||
+        config->closed == NULL || config->max_input_bytes == 0 || config->max_input_bytes > 1024 * 1024) {
+        errno = EINVAL;
+        return -1;
+    }
+    kvs_dynamic_connector_t *connection = kvs_malloc(sizeof(*connection));
+    if (connection == NULL)
+        return -1;
+    *connection = (kvs_dynamic_connector_t){ .config = *config, .fd = -1 };
+    strcpy(connection->host, config->host);
+    connection->config.host = connection->host;
+    *handle = connection;
+    nty_coroutine *co;
+    if (nty_coroutine_create(&co, ntyco_dynamic_run, connection) != 0) {
+        *handle = NULL;
+        kvs_free(connection);
+        return -1;
+    }
+    return 0;
 }
 
 int ntyco_start_listeners(

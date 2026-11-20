@@ -307,26 +307,54 @@ ONLINE          继续从同一复制 offset 发送实时增量
 Primary 和 Replica 都用 `bin/kvstore`。两端可配 `persistence_mode = none`。只在 Primary 的配置中选择增量来源：
 
 - `replication_incremental_mode = socket` 是默认值，由 Primary 持有 8 MiB 缓存。
-- `replication_incremental_mode = ebpf` 由独立进程持有 8 MiB 缓存。Primary 还需设置 `replication_capture_socket = /绝对路径/capture.sock`，和采集进程使用相同的路径。把 socket 放在 Primary 用户可访问的私有目录中。
+- `replication_incremental_mode = ebpf` 由独立采集进程持有 8 MiB 缓存，Primary 不分配自己的复制缓存。Primary 必须配置 `replication_capture_port = 29005`，端口不得与 `service_port`、`rdma_port` 冲突；该字段不用于 socket 模式或 Replica 配置。旧的 `replication_capture_socket` 已移除，继续配置会明确报错。
 
-服务先启动 Primary，再启动采集进程。等采集进程输出已挂载的消息后，启动 Replica。采集进程提前暂存写入，Primary 处理 `PSYNC` 时自动发送本轮快照 offset。Replica 完成加载后，Primary 才从采集进程取数据，并通过原来的 TCP 连接发送。
+先启动 Primary，再启动采集进程；看到探针挂载和 `capture TCP listening` 后才启动 Replica。采集进程的监听地址须是 Replica 可访问的 Primary IPv4，端口与 Primary 配置一致：
 
 ```sh
 make all ebpf-capture
-sudo bin/kvstore-ebpf-capture "$PRIMARY_PID" build/ebpf_capture.bpf.o --socket "$CAPTURE_SOCKET"
+# PRIMARY_PID 为本次 Primary 进程的 PID。
+sudo bin/kvstore-ebpf-capture "$PRIMARY_PID" build/ebpf_capture.bpf.o --listen 172.16.145.135:29005
 ```
 
-Primary 和 Replica 需要使用同一版本的全量握手。当前通知格式为
-`FULLRESYNC_RDMA <repl_id> <snapshot_bytes> <rdma_port> <sync_id> <stream_offset>`。
+Primary 和 Replica 必须使用同一版本的全量控制协议：
+`FULLRESYNC_RDMA <repl_id> <snapshot_bytes> <rdma_port> <sync_id> <stream_offset> <capture_port>`。
+末尾为 `0` 时走普通 socket；非零时 Replica 直连采集端，不允许静默降级。
 
-Primary 的发送临时文件在收到最终快照确认后删除，Replica 从接收临时文件加载后删除。缓存失效或采集进程退出时结束本轮复制，重启 Replica 后重新全量。eBPF 当前单个事件最多携带 4 KiB 编码命令。缺失事件导致进度无法追平时，本轮同步会报错结束。
+```text
+Primary:29000           Replica                  Capture:29005
+     |-- FULLRESYNC_RDMA -->|                         |
+     |==== RDMA .tmp ======>|                         | 提前滚存事件
+     |                      | 校验、加载、删除接收 .tmp |
+     |<-- SYNC_FINISHED ----|                         |
+     | 最终 ACK、关闭 RDMA、删除发送 .tmp               |
+     |-- SYNC_FINISHED_OK ->|                         |
+     |                      | 关闭本地 RDMA            |
+     |                      |-- BEGIN <IDs> <S> ------>|
+     |                      |<-- DATA <start> <len> ---|
+     |                      |-- APPLIED <offset> ---->| 完整命令执行成功才确认
+     |                      |<-- ONLINE <T> ----------| 追平后切换实时
+     | 控制连接持续保留       |<-- DATA / APPLIED ----->|
+```
 
-在具备 iWARP 的开发机上，可以用同一个脚本验证两种模式。脚本以普通用户启动主从，仅采集进程使用 sudo。
+普通 socket 模式在同样的加载握手后，由 Primary 在原控制连接发送增量和 `ONLINE`。eBPF 模式的增量及 `ONLINE` 全部来自采集端；Primary 不回传增量，不创建 `.sock` 文件。网络层独占连接的关闭权，以会话编号取消另一条连接，避免迟到回调关闭复用的 FD。
+
+内核 BPF 在成功提交点更新 `stream_end`，在快照边界更新包含本轮身份、S 和丢失计数基线的 `snapshot_boundary` Map；采集端读取一致的 Map 状态核对 `BEGIN` 和追平目标。BPF ring buffer 只负责搬运事件，可靠范围由用户态的 8 MiB 字节缓存决定：连接前滚动淘汰，连接后只按 `APPLIED` 回收。单事件最多 4 KiB 编码命令。
+
+缓存起点已被淘汰、区间缺口、溢出、内核丢失计数变化、约 5 秒采集滞后（包括只丢最后一条且不再写入）、确认超时，都会结束当前增量会话。采集进程退出、端口不可达、`ERROR` 或任一连接断开，Replica 取消两条连接并回到 `LOADING`，不提供旧数据。空闲断链由 TCP keepalive 辅助发现；这不等于远端无响应的绝对时间保证。无自动重连或断点续传；重启采集进程丢失缓存后，重新启动 Replica 发起新全量。新边界即使没有后续写入，也可从 Map 中确认并上线。
+
+具备 iWARP 的开发机可验证真实 BPF → 独立 TCP → 真实 Replica，以及无采集端、控制断开和缓存丢失后重新全量：
 
 ```sh
 make all ebpf-capture
 sudo -v
-RDMA_TEST_IP=172.16.145.135 python3 -B tests/test_capture_replication.py .
+RDMA_TEST_IP=172.16.145.135 python3 -u -B tests/test_capture_replication.py . --output /tmp/91kv-direct-bpf-$(date +%Y%m%d-%H%M%S)
+```
+
+无需 sudo 的事件替身验收使用同样的采集端 TCP 和 Replica 生产代码：
+
+```sh
+RDMA_TEST_IP=172.16.145.135 make test-capture-faults test-capture-server
 ```
 
 
@@ -436,6 +464,24 @@ RDMA_TEST_IP=172.16.145.135 python3 -B tests/test_capture_replication.py .
 短时快速 Pipeline 样本受计时粒度与调度噪声限制；P/QPS 是批周期，非单条执行时间。复制QPS计量Primary回复，另核对ONLINE、最终标记和每轮1000次可见性探针；完整CPU、延迟、失败计数与每轮数据见报告。组合修复未逐开关隔离归因，旧eBPF缺口也不能追认一定由ring_full造成。
 
 ![双机实时复制修复前后](docs/performance/figures/20261119-replication.svg)
+
+**2026-11-20：直连 eBPF 单轮复测，135→136。**
+
+同样使用 `-O2 -g`、c1/P1、32B 热键覆盖 128B 值、1 万次热身和 10 万次正式 HSET，另做 1,000 次串行可见性探针。普通 socket 和 `.sock` eBPF 沿用上表修复后历史三轮，未在本日重测；新值是单轮，不计算轮间波动。
+
+| 模式 | 样本 | Primary QPS | 可见性 P50(ms) | 可见性 P99(ms) |
+| --- | --- | ---: | ---: | ---: |
+| 普通 socket（历史） | 3 轮中位数 | 29,154.52 | 1.526 | 3.219 |
+| 旧 `.sock` eBPF（历史） | 3 轮中位数 | 25,667.35 | 4.172 | 5.557 |
+| 直连 eBPF（本轮） | 1 轮实测 | 28,727.38 | 2.542 | 2.730 |
+
+相对旧 `.sock` eBPF 的三轮中位数，本轮 QPS **+11.92%**，可见性 P50 **−39.08%**、P99 **−50.88%**。相对历史普通 socket，QPS **−1.47%**、P50 **+66.57%**、P99 **−15.20%**，不能概括为全面更快。Primary / 采集端 / Replica CPU 本轮约 **34.1% / 3.1% / 37.5%**，旧 `.sock` eBPF 为 **99.4% / 3.8% / 5.2%**；CPU 工作分布也改变了。
+
+本轮 ONLINE、最终标记及 `APPLIED = stream_end = 20,979,189` 验证通过，三项 BPF 丢失计数均为零。可见性采样在 QPS 窗口外，包含两端请求往返和 1ms 轮询；不代表压测并发期间的延迟。单轮、跨日、共享宿主机及整版代码变化限制因果归因，不能将差值全部算作删除 Unix socket 的收益。清理脚本的退出轮询告警与随后独立清理核对均完整保留。
+
+[完整口径、原始结果与清理说明](docs/performance/2026-11-20-direct-ebpf.md)。
+
+![直连 eBPF 单轮与历史参考](docs/performance/figures/20261120-direct-ebpf.svg)
 
 **相同 168,000,052 字节真实快照：热缓存、1 MiB 分块 / window=1、接收进内存，12 次正式文件传输均通过长度/CRC。** 只计首块到末 ACK，不含准备、CRC、落盘或加载。
 

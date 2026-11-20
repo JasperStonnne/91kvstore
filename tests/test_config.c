@@ -429,7 +429,7 @@ static void test_example_config_files(void)
     assert(primary.log_level == KVS_LOG_INFO);
     assert(primary.persistence_mode == KVS_PERSISTENCE_NONE);
     assert(primary.replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_SOCKET);
-    assert(primary.replication_capture_socket[0] == '\0');
+    assert(primary.replication_capture_port == 0);
 
     kvs_config_t replica = load_example("config/replica.conf");
     assert(replica.role == KVS_ROLE_REPLICA);
@@ -567,8 +567,31 @@ static void test_aof_checksum(void)
     puts("aof checksum defaults, modes and role restrictions passed");
 }
 
+static void test_capture_port(void)
+{
+    const char *base = "role=primary\nservice_port=29000\nrdma_port=29747\npersistence_mode=none\n";
+    char text[1024];
+    snprintf(text, sizeof(text), "%sreplication_incremental_mode=ebpf\nreplication_capture_port=29005\n", base);
+    kvs_config_t config = load_valid(text);
+    assert(config.replication_capture_port == 29005);
+    const char *bad[] = { "0", "65536", "-1", "abc", "29000", "29747" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        snprintf(text, sizeof(text), "%sreplication_incremental_mode=ebpf\nreplication_capture_port=%s\n", base, bad[i]);
+        expect_invalid("invalid/conflicting capture port", text, "replication_capture_port");
+    }
+    snprintf(text, sizeof(text), "%sreplication_incremental_mode=ebpf\n", base);
+    expect_invalid("missing capture port", text, "replication_capture_port");
+    snprintf(text, sizeof(text), "%sreplication_capture_port=29005\n", base);
+    expect_invalid("socket cannot configure capture port", text, "replication_capture_port");
+    snprintf(text, sizeof(text), "%sreplication_capture_socket=/tmp/removed.sock\n", base);
+    expect_invalid("removed Unix setting", text, "unknown");
+    expect_invalid("standalone capture port", "role=standalone\nservice_port=29000\npersistence_mode=none\nreplication_capture_port=29005\n", "role=primary");
+    puts("capture port defaults, ebpf-only, conflicts and removed Unix setting passed");
+}
+
 int main(void)
 {
+    test_capture_port();
     test_aof_checksum();
     test_snapshot_checksum();
     test_valid_standalone();

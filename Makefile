@@ -182,7 +182,7 @@ $(BUILD_DIR)/uring_io.o: \
 
 $(BUILD_DIR)/replication.o: \
 	$(REPLICATION_DIR)/replication.c \
-	$(INCLUDE_DIR)/replication_capture_ipc.h \
+	$(INCLUDE_DIR)/replication_capture_protocol.h \
 	$(INCLUDE_DIR)/replication.h \
 	$(INCLUDE_DIR)/persistence.h \
 	$(INCLUDE_DIR)/aof_format.h \
@@ -286,6 +286,8 @@ clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
 
 UNIT_TEST_TARGETS := \
+    test-capture-cache \
+    test-ebpf-state \
     test-uring-io \
 	test-protocol \
 	test-config \
@@ -592,16 +594,75 @@ ebpf-capture: $(BIN_DIR)/kvstore-ebpf-capture $(BUILD_DIR)/ebpf_capture.bpf.o
 $(BIN_DIR)/kvstore-ebpf-capture: \
     $(REPLICATION_DIR)/ebpf_capture_main.c \
     $(BUILD_DIR)/ebpf_capture.o \
+    $(BUILD_DIR)/ebpf_state.o \
+    $(BUILD_DIR)/capture_cache.o $(BUILD_DIR)/capture_server.o $(BUILD_DIR)/codec.o \
     $(BUILD_DIR)/log.o \
-    $(INCLUDE_DIR)/replication_capture_ipc.h | $(BIN_DIR)
+    $(INCLUDE_DIR)/replication_capture_protocol.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c %.o,$^) $(LDFLAGS) -lbpf -o $@
+
+$(BUILD_DIR)/capture_cache.o: $(REPLICATION_DIR)/capture_cache.c \
+    $(REPLICATION_DIR)/capture_cache.h $(INCLUDE_DIR)/ebpf_event.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -c $< -o $@
+
+$(BUILD_DIR)/capture_server.o: $(REPLICATION_DIR)/capture_server.c \
+    $(REPLICATION_DIR)/capture_server.h $(REPLICATION_DIR)/capture_cache.h \
+    $(INCLUDE_DIR)/ebpf_capture.h $(INCLUDE_DIR)/ebpf_state.h \
+    $(INCLUDE_DIR)/ebpf_event.h $(INCLUDE_DIR)/protocol.h \
+    $(INCLUDE_DIR)/replication_capture_protocol.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -c $< -o $@
+
+.PHONY: test-capture-cache test-capture-server
+test-capture-cache: $(BIN_DIR)/test_capture_cache
+	./$(BIN_DIR)/test_capture_cache
+
+$(BIN_DIR)/test_capture_cache: $(TEST_DIR)/test_capture_cache.c \
+    $(REPLICATION_DIR)/capture_cache.c $(REPLICATION_DIR)/capture_cache.h \
+    $(INCLUDE_DIR)/ebpf_event.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c,$^) -o $@
+
+test-capture-server: $(BIN_DIR)/test_capture_mock
+	python3 -u -B $(TEST_DIR)/test_capture_server.py .
 
 $(BUILD_DIR)/ebpf_capture.o: \
     $(REPLICATION_DIR)/ebpf_capture.c \
     $(INCLUDE_DIR)/ebpf_capture.h \
     $(INCLUDE_DIR)/ebpf_event.h \
+    $(INCLUDE_DIR)/ebpf_state.h \
     $(INCLUDE_DIR)/log.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -c $< -o $@
+
+$(BUILD_DIR)/ebpf_state.o: $(REPLICATION_DIR)/ebpf_state.c \
+    $(INCLUDE_DIR)/ebpf_state.h $(INCLUDE_DIR)/ebpf_event.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -c $< -o $@
+
+.PHONY: test-ebpf-state test-ebpf-state-read ebpf-state-probe
+test-ebpf-state: $(BIN_DIR)/test_ebpf_state
+	./$(BIN_DIR)/test_ebpf_state
+
+# map 读取替身测试链接已有 libbpf；不扩大普通 test-unit 的依赖。
+test-ebpf-state-read: $(BIN_DIR)/test_ebpf_state_read
+	./$(BIN_DIR)/test_ebpf_state_read
+
+$(BIN_DIR)/test_ebpf_state: $(TEST_DIR)/test_ebpf_state.c \
+    $(REPLICATION_DIR)/ebpf_state.c $(INCLUDE_DIR)/ebpf_state.h \
+    $(INCLUDE_DIR)/ebpf_event.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c,$^) -o $@
+
+$(BIN_DIR)/test_ebpf_state_read: $(TEST_DIR)/test_ebpf_state_read.c \
+    $(REPLICATION_DIR)/ebpf_capture.c $(REPLICATION_DIR)/ebpf_state.c \
+    $(BUILD_DIR)/log.o $(INCLUDE_DIR)/ebpf_capture.h $(INCLUDE_DIR)/ebpf_state.h \
+    $(INCLUDE_DIR)/ebpf_event.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(TEST_DIR)/test_ebpf_state_read.c \
+	    $(REPLICATION_DIR)/ebpf_state.c $(BUILD_DIR)/log.o \
+	    -Wl,--wrap=bpf_map_lookup_elem -lbpf -o $@
+
+# 显式构建真实 BPF 验证助手；普通单测不加载 BPF，也不需要 sudo。
+ebpf-state-probe: $(BIN_DIR)/ebpf-state-probe $(BUILD_DIR)/ebpf_capture.bpf.o
+
+$(BIN_DIR)/ebpf-state-probe: $(TEST_DIR)/ebpf_state_probe.c \
+    $(BUILD_DIR)/ebpf_capture.o $(BUILD_DIR)/ebpf_state.o $(BUILD_DIR)/log.o \
+    $(INCLUDE_DIR)/ebpf_capture.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c %.o,$^) $(LDFLAGS) -lbpf -o $@
 
 # 可选诊断：独立临时目录，不改变普通构建或 make test 的工具链要求。
 FUZZ_RUNS ?= 50000
@@ -649,8 +710,12 @@ $(BIN_DIR)/benchmark_transfer: $(TEST_DIR)/benchmark_transfer.c \
 # 独立进程故障回归使用文件事件源替身，正式采集二进制继续链接 libbpf。
 $(BIN_DIR)/test_capture_mock: $(TEST_DIR)/mock_ebpf_capture.c \
     $(REPLICATION_DIR)/ebpf_capture_main.c $(INCLUDE_DIR)/ebpf_capture.h \
-    $(INCLUDE_DIR)/ebpf_event.h $(INCLUDE_DIR)/replication_capture_ipc.h | $(BIN_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c,$^) -o $@
+    $(REPLICATION_DIR)/capture_cache.c $(REPLICATION_DIR)/capture_cache.h \
+    $(REPLICATION_DIR)/capture_server.c $(REPLICATION_DIR)/capture_server.h \
+    $(REPLICATION_DIR)/ebpf_state.c $(INCLUDE_DIR)/ebpf_state.h $(BUILD_DIR)/codec.o \
+    $(INCLUDE_DIR)/replication_capture_protocol.h \
+    $(INCLUDE_DIR)/ebpf_event.h $(INCLUDE_DIR)/replication_capture_protocol.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c %.o,$^) -o $@
 
 .PHONY: test-capture-faults
 test-capture-faults: $(BIN_DIR)/kvstore $(BIN_DIR)/test_capture_mock

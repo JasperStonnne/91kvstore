@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import select
 import signal
 import socket
 import subprocess
@@ -249,7 +250,7 @@ class Gate:
             upstream.sendall(b'PSYNC ? -1\r\n')
             header = self.line(upstream)
             parts = header.split()
-            require(len(parts) == 6 and parts[0] == b'FULLRESYNC_RDMA',
+            require(len(parts) == 7 and parts[0] == b'FULLRESYNC_RDMA',
                     'expected RDMA full-sync notification')
             require(0 < int(parts[3]) <= 65535 and
                     re.fullmatch(rb'[0-9a-f]{40}', parts[1]) is not None and
@@ -261,15 +262,21 @@ class Gate:
             self.ready.set()
             require(self.release.wait(120), 'Snapshot gate release timed out')
             downstream.sendall(header)
-            upstream.settimeout(.5)
+            # 加载完成握手是双向控制，代理不能只转发 Primary -> Replica。
+            upstream.settimeout(3)
+            downstream.settimeout(3)
             while not self.stopped.is_set():
-                try:
-                    chunk = upstream.recv(65536)
-                except socket.timeout:
-                    continue
-                if not chunk:
-                    break
-                downstream.sendall(chunk)
+                ready, _, _ = select.select([upstream, downstream], [], [], .1)
+                for source in ready:
+                    chunk = source.recv(65536)
+                    destination = downstream if source is upstream else upstream
+                    if not chunk:
+                        try:
+                            destination.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        return
+                    destination.sendall(chunk)
         except Exception as exc:
             if not self.stopped.is_set():
                 self.errors.append(repr(exc))

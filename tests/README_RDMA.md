@@ -217,3 +217,14 @@ printf 'two-vm exit=%s\n' "$status"
 
 双机命令需要两端代码及构建版本一致。工作负载为前后各 5 万记录，以及
 独立的 32 MiB 受控追赶；不等同于失败事件单测。
+
+
+### 独立采集端增量（③b）
+
+`FULLRESYNC_RDMA` 末尾新增 `capture_port`（普通 socket 为 0），测试代理也须按七个字段解析。两端必须使用相同协议版本。
+Replica 加载成功后发送 `SYNC_FINISHED <sync_id> <S>`；Primary 验证最终 RDMA ACK 并关闭自己的 RDMA 后返回 `SYNC_FINISHED_OK <sync_id> <S>`。
+Replica 收到 OK 且本地 RDMA 关闭后，才连接通知中的采集端口并发送 `BEGIN <primary_id> <sync_id> <S>`。
+
+`test_capture_replication.py` 验证真实 RDMA 与真实 Replica；默认是真实 BPF（需要 sudo），`--mock-collector /绝对路径/bin/test_capture_mock` 只替换事件与 Map 来源。两种模式使用同样的写入，检查每条成功应用的字节区间连续且只出现一次；eBPF 模式同时断言 Primary 控制连接没有增量或 ONLINE。可通过 `--output /新的证据目录` 保留配置与日志。
+
+`test_capture_server.py` 保留独立 TCP 的跨环、缺口、溢出、重启、末条丢失及错误帧验收；`test_capture_faults.py` 保留普通缓存溢出后重新全量的真实 RDMA 验收。真实 BPF 到测试客户端的六项较细场景仍可单独运行 `tests/test_capture_server_bpf.py`。

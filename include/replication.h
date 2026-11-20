@@ -9,6 +9,7 @@ typedef enum {
     KVS_REPLICATION_STATE_CONNECTING,       // Replica 正在连接 Primary
     KVS_REPLICATION_STATE_HANDSHAKE,        // 已连接，正在交换同步信息
     KVS_REPLICATION_STATE_FULL_SYNC,        // 正在传输和加载 Snapshot
+    KVS_REPLICATION_STATE_WAIT_SYNC_FINISHED, // 已加载/已关闭 RDMA，等待控制握手完成
     KVS_REPLICATION_STATE_CATCH_UP,          // 正在补齐 Snapshot 之后的增量命令
     KVS_REPLICATION_STATE_ONLINE             // 已追平，持续接收实时写命令
 } kvs_replication_state_t;
@@ -52,8 +53,8 @@ int kvs_replication_init(
     kvs_snapshot_install_handler snapshot_install_handler,
     kvs_replication_command_handler command_handler
 );
-/* Primary 在启动网络前设置独立采集端；复制模块复制路径。 */
-int kvs_replication_set_capture_socket(const char *path);
+/* 0 为 socket 增量；非零为独立采集端 TCP 端口。 */
+int kvs_replication_set_capture_port(unsigned short port);
 /* Primary 初始化复制模块后调用；失败后由 destroy 清理。 */
 int kvs_replication_start_rdma_listener(
     const char *bind_ip,

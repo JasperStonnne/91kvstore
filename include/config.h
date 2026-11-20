@@ -2,7 +2,6 @@
 #define KVS_CONFIG_H
 
 #include <stddef.h>
-#include <sys/un.h>
 #include "log.h"
 #include "snapshot_format.h"
 #include "aof_format.h"
@@ -42,7 +41,7 @@ typedef struct {
     /* 已废弃：仅用于识别并拒绝旧配置，不再监听此端口。 */
     unsigned short replication_port;
 
-    /* Replica 连接的 Primary 地址与 TCP service_port（控制消息和 AOF 增量）。 */
+    /* Replica 连接的 Primary 地址与 TCP service_port（复制控制，socket 模式也传增量）。 */
     char primary_host[KVS_CONFIG_PRIMARY_HOST_CAPACITY];
     unsigned short primary_port;
 
@@ -51,7 +50,7 @@ typedef struct {
     kvs_snapshot_checksum_t snapshot_checksum;
     kvs_aof_checksum_t aof_checksum;
     kvs_replication_incremental_mode_t replication_incremental_mode;
-    char replication_capture_socket[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    unsigned short replication_capture_port;
     /* 保存启动时选择的内存分配后端。 */
     kvs_allocator_backend_t allocator_backend;
 
