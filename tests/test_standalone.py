@@ -762,6 +762,16 @@ def test_empty_and_malformed_resp2(port):
         )
     print("[PASS] empty Bulk and malformed frames; connection remains usable")
 
+def test_alloctrim(port):
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.sendall(b"*1\r\n$9\r\nALLOCTRIM\r\n")
+        with connection.makefile("rb") as reply:
+            assert reply.readline() == b"+OK\r\n"
+            connection.sendall(b"*2\r\n$9\r\nALLOCTRIM\r\n$1\r\nx\r\n")
+            assert reply.readline() == b"-ERR wrong number of arguments for ALLOCTRIM\r\n"
+    print("[PASS] explicit ALLOCTRIM and wrong arity; connection remains usable")
+
+
 def main():
     if not os.access(KVSTORE_BIN, os.X_OK):
         print(f"[FAIL] missing executable: {KVSTORE_BIN}; run make first", file=sys.stderr)
@@ -837,6 +847,7 @@ def main():
         test_pipelining(port)
         test_mixed_pipeline(port)
         test_pipeline_partial_tail(port)
+        test_alloctrim(port)
         test_pipeline_large_batch(port)
         test_other_log_level(test_dir, "error")
         test_other_log_level(test_dir, "debug")

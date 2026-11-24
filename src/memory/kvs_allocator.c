@@ -47,6 +47,7 @@ typedef struct kvs_large {
 typedef struct kvs_size_class {
     size_t block_size;
     kvs_slab_t *slabs;
+    size_t slabs_created;
 } kvs_size_class_t;
 
 /* 每个规格池直接保存块大小；slabs 自动初始化为 NULL。 */
@@ -72,6 +73,8 @@ static kvs_size_class_t pools[] = {
 #define SIZE_CLASS_COUNT \
     (sizeof(pools) / sizeof(pools[0]))
 
+_Static_assert(SIZE_CLASS_COUNT == KVS_POOL_CLASS_COUNT, "pool stats class count");
+static size_t pool_mapped_bytes_total;
 static int allocator_initialized = 0;
 /* 实现在文件后面，供公开的销毁函数调用。 */
 static int pool_destroy(void);
@@ -99,7 +102,9 @@ int kvs_allocator_init(kvs_allocator_backend_t backend)
     }
     for (size_t i = 0; i < SIZE_CLASS_COUNT; i++) {
         pools[i].slabs = NULL;
+        pools[i].slabs_created = 0;
     }
+    pool_mapped_bytes_total = 0;
     allocator_backend = backend;
     allocator_initialized = 1;
     return 0;
@@ -273,6 +278,7 @@ static void *region_memory_alloc(size_t mapping_size)
         return NULL;
     }
 
+    pool_mapped_bytes_total += mapping_size;
     return (void *)aligned;
 }
 
@@ -360,6 +366,7 @@ static void *pool_alloc_small(size_t size)
             return NULL;
         }
 
+        pool->slabs_created++;
         /* 创建完整后，才挂入这个规格池。 */
         slab->next = pool->slabs;
         if (pool->slabs != NULL) {
@@ -595,6 +602,34 @@ int kvs_allocator_pool_stats(kvs_pool_stats_t *stats)
         large = large->next;
     }
 
+    *stats = result;
+    return 0;
+}
+
+int kvs_allocator_pool_details(kvs_pool_detail_stats_t *stats)
+{
+    if (stats == NULL || !allocator_initialized || allocator_backend != KVS_ALLOCATOR_POOL)
+        return -1;
+    kvs_pool_detail_stats_t result = {0};
+    result.class_count = SIZE_CLASS_COUNT;
+    result.mapped_bytes_total = pool_mapped_bytes_total;
+    for (size_t i = 0; i < SIZE_CLASS_COUNT; i++) {
+        kvs_pool_class_stats_t *row = &result.classes[i];
+        row->block_size = pools[i].block_size;
+        row->slabs_created = pools[i].slabs_created;
+        for (const kvs_slab_t *slab = pools[i].slabs; slab != NULL; slab = slab->next) {
+            row->slab_count++;
+            row->used_blocks += slab->used_count;
+            row->capacity_blocks += slab->capacity;
+            row->mapped_bytes += KVS_SLAB_SIZE;
+        }
+        result.mapped_bytes += row->mapped_bytes;
+    }
+    for (const kvs_large_t *large = large_regions; large != NULL; large = large->next) {
+        result.large_count++;
+        result.large_mapped_bytes += large->mapping_size;
+    }
+    result.mapped_bytes += result.large_mapped_bytes;
     *stats = result;
     return 0;
 }

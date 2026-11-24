@@ -334,6 +334,10 @@ static void test_pool_stats(void)
     assert(kvs_allocator_init(KVS_ALLOCATOR_POOL) == 0);
 
     kvs_pool_stats_t stats;
+    kvs_pool_detail_stats_t details;
+    assert(kvs_allocator_pool_details(NULL) == -1);
+    assert(kvs_allocator_pool_details(&details) == 0);
+    assert(details.class_count == 16 && details.mapped_bytes_total == 0);
 
     /* 刚初始化，还没有申请任何区域。 */
     assert(kvs_allocator_pool_stats(&stats) == 0);
@@ -350,6 +354,16 @@ static void test_pool_stats(void)
     assert(stats.live_objects == 2);
     assert(stats.slab_count == 1);
     assert(stats.large_count == 1);
+    assert(kvs_allocator_pool_details(&details) == 0);
+    assert(details.classes[1].block_size == 32);
+    assert(details.classes[1].slab_count == 1 && details.classes[1].used_blocks == 1);
+    assert(details.classes[1].capacity_blocks > 1);
+    assert(details.classes[1].mapped_bytes == 65536);
+    assert(details.classes[1].slabs_created == 1);
+    assert(details.large_count == 1 && details.large_mapped_bytes >= 100000);
+    assert(details.mapped_bytes == stats.mapped_bytes);
+    assert(details.mapped_bytes_total == details.mapped_bytes);
+    size_t historical = details.mapped_bytes_total;
 
     kvs_allocator_free(small);
     kvs_allocator_free(large);
@@ -361,6 +375,10 @@ static void test_pool_stats(void)
     assert(stats.large_count == 0);
     assert(stats.mapped_bytes == 0);
 
+    assert(kvs_allocator_pool_details(&details) == 0);
+    assert(details.mapped_bytes == 0 && details.mapped_bytes_total == historical);
+    assert(details.classes[1].slab_count == 0 && details.classes[1].slabs_created == 1);
+
     /* 同规格再次申请会重新创建 slab，仍可正常读写和释放。 */
     small = kvs_allocator_alloc(25);
     assert(small != NULL);
@@ -370,8 +388,12 @@ static void test_pool_stats(void)
     assert(stats.slab_count == 1);
     assert(stats.mapped_bytes == 64u * 1024u);
 
+    assert(kvs_allocator_pool_details(&details) == 0);
+    assert(details.classes[1].slabs_created == 2);
+    assert(details.mapped_bytes_total == historical + 65536);
     kvs_allocator_free(small);
     assert(kvs_allocator_destroy() == 0);
+    assert(kvs_allocator_pool_details(&details) == -1);
 
     puts("[PASS] allocator stats and reuse");
 }
@@ -384,6 +406,9 @@ int main(void)
         (kvs_allocator_backend_t)999) == -1);
 
     assert(kvs_allocator_init(KVS_ALLOCATOR_SYSTEM) == 0);
+    kvs_pool_detail_stats_t unavailable;
+    assert(kvs_allocator_pool_details(&unavailable) == -1);
+
 
     /* 使用过程中不能重复初始化。 */
     assert(kvs_allocator_init(KVS_ALLOCATOR_SYSTEM) == -1);

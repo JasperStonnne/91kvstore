@@ -11,6 +11,22 @@ typedef struct kvs_pool_stats {
 } kvs_pool_stats_t;
 
 
+#define KVS_POOL_CLASS_COUNT 16
+
+typedef struct {
+    size_t block_size, slab_count, used_blocks, capacity_blocks, mapped_bytes;
+    size_t slabs_created; /* 本次初始化以来创建过的 slab 数，回收后也保留。 */
+} kvs_pool_class_stats_t;
+
+typedef struct {
+    kvs_pool_class_stats_t classes[KVS_POOL_CLASS_COUNT];
+    size_t class_count, large_count, large_mapped_bytes, mapped_bytes;
+    size_t mapped_bytes_total; /* 历史累计保留映射字节，不含对齐时裁去的区域。 */
+} kvs_pool_detail_stats_t;
+
+/* 只读遍历，不分配内存；仅初始化后的 POOL 模式可查询。 */
+int kvs_allocator_pool_details(kvs_pool_detail_stats_t *stats);
+
 typedef enum {
     KVS_ALLOCATOR_SYSTEM = 0,
     KVS_ALLOCATOR_POOL

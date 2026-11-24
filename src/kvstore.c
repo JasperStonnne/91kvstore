@@ -19,6 +19,9 @@
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <dirent.h>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <sys/stat.h>
 
 /* 只限制客户端的一条 RESP 命令；不改变 AOF/Snapshot/复制解析。 */
@@ -102,6 +105,7 @@ const char *response[]={
 
 };
 
+static kvs_allocator_backend_t kvs_active_allocator = KVS_ALLOCATOR_SYSTEM;
 static kvs_role_t kvs_server_role = KVS_ROLE_STANDALONE;
 static kvs_persistence_mode_t kvs_persistence_mode =
     KVS_PERSISTENCE_NONE;
@@ -910,6 +914,65 @@ static int kvs_execute_fields(
         return result;
     }
 
+    /* 仅基准显式请求时运行；默认启动和 free 路径均不主动 trim。 */
+    if (source == KVS_COMMAND_SOURCE_CLIENT && strcmp(tokens[0], "ALLOCTRIM") == 0) {
+        const char *reply = "+OK\r\n";
+        if (field_count != 1) {
+            reply = "-ERR wrong number of arguments for ALLOCTRIM\r\n";
+        } else {
+#if defined(__linux__) && defined(__GLIBC__)
+            if (kvs_active_allocator == KVS_ALLOCATOR_SYSTEM)
+                (void)malloc_trim(0);
+#endif
+        }
+        size_t length = strlen(reply);
+        int result = -1;
+        if (length <= (size_t)reply_capacity) {
+            memcpy(reply_data, reply, length);
+            result = (int)length;
+        }
+        kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
+        return result;
+    }
+
+    if (source == KVS_COMMAND_SOURCE_CLIENT && strcmp(tokens[0], "ALLOCINFO") == 0) {
+        int result;
+        if (field_count != 1) {
+            result = snprintf(reply_data, (size_t)reply_capacity,
+                "-ERR wrong number of arguments for ALLOCINFO\r\n");
+            if (result >= reply_capacity) result = -1;
+        } else {
+            char text[2048];
+            kvs_pool_detail_stats_t stats;
+            if (kvs_allocator_pool_details(&stats) != 0) {
+                snprintf(text, sizeof(text), "backend=system pool_stats=unavailable\n");
+            } else {
+                int length = snprintf(text, sizeof(text),
+                    "backend=pool mapped_bytes=%zu mapped_bytes_total=%zu large_count=%zu large_mapped_bytes=%zu\n"
+                    "block_size,slab_count,used_blocks,capacity_blocks,mapped_bytes,slabs_created\n",
+                    stats.mapped_bytes, stats.mapped_bytes_total, stats.large_count, stats.large_mapped_bytes);
+                for (size_t i = 0; i < stats.class_count && length > 0 && (size_t)length < sizeof(text); i++) {
+                    kvs_pool_class_stats_t *row = &stats.classes[i];
+                    int written = snprintf(text + length, sizeof(text) - (size_t)length,
+                        "%zu,%zu,%zu,%zu,%zu,%zu\n", row->block_size, row->slab_count,
+                        row->used_blocks, row->capacity_blocks, row->mapped_bytes, row->slabs_created);
+                    if (written < 0 || (size_t)written >= sizeof(text) - (size_t)length) {
+                        length = -1;
+                        break;
+                    }
+                    length += written;
+                }
+                if (length < 0 || (size_t)length >= sizeof(text)) {
+                    kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
+                    return -1;
+                }
+            }
+            result = kvs_encode_value_to_output(response, text);
+        }
+        kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
+        return result;
+    }
+
     if (source == KVS_COMMAND_SOURCE_CLIENT && strcmp(tokens[0], "SAVEINFO") == 0) {
         kvs_reap_background_save();
         int result;
@@ -1638,6 +1701,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    kvs_active_allocator = config.allocator_backend;
     const char *name =
         config.allocator_backend == KVS_ALLOCATOR_SYSTEM
         ? "system" : "pool";

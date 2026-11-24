@@ -11,6 +11,7 @@ import base64
 import csv
 import hashlib
 import json
+import io
 import os
 from pathlib import Path
 import platform
@@ -28,6 +29,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 MODES = ("system", "pool", "jemalloc")
+ALL_MODES = ("system", "system-trim", "system-malloctrim", "pool", "jemalloc", "jemalloc-decay0")
 ENGINES = (
     ("array", b"SET", b"GET", b"DEL"),
     ("hash", b"HSET", b"HGET", b"HDEL"),
@@ -125,8 +127,12 @@ def clean_environment(mode, library=None, diagnostic=False):
     environment = os.environ.copy()
     for name in CLEAR_ENV:
         environment.pop(name, None)
-    if mode == "jemalloc":
+    if mode.startswith("jemalloc"):
         environment["LD_PRELOAD"] = str(library)
+    if mode == "system-trim":
+        environment["GLIBC_TUNABLES"] = "glibc.malloc.trim_threshold=0"
+    if mode == "jemalloc-decay0":
+        environment["MALLOC_CONF"] = "dirty_decay_ms:0,muzzy_decay_ms:0"
     if diagnostic:
         environment["LD_DEBUG"] = "bindings"
     return environment
@@ -248,7 +254,8 @@ class Service:
         limit = self.args.as_limit_mib * 1024 * 1024
 
         def child_limits():
-            # Same address-space limit for all three modes; no forced trimming.
+            # Same address-space limit. Pool immediately munmaps empty slabs;
+            # libc/jemalloc use their default or explicitly selected reclaim policy.
             _, hard = resource.getrlimit(resource.RLIMIT_AS)
             if hard != resource.RLIM_INFINITY and hard < limit:
                 raise RuntimeError("inherited RLIMIT_AS is below requested limit")
@@ -280,6 +287,16 @@ class Service:
             # A common readiness request, with no test data inserted.
             if self.client.command(b"GET", b"__memory_benchmark_ready__") is not None:
                 raise RuntimeError("isolated service unexpectedly contains data")
+            # Warm the same small ALLOCINFO response buffer before RSS baseline in every mode.
+            self.client.command(b"ALLOCINFO")
+            actual_env = dict(item.decode().split("=", 1) for item in
+                Path(f"/proc/{self.process.pid}/environ").read_bytes().split(b"\0") if b"=" in item)
+            selected = clean_environment(self.mode, self.library, self.diagnostic)
+            for name in ("GLIBC_TUNABLES", "MALLOC_CONF", "LD_PRELOAD"):
+                if actual_env.get(name) != selected.get(name):
+                    raise RuntimeError(f"allocator environment mismatch: {name}")
+            write_json(self.directory / "allocator-environment.json",
+                {name: actual_env.get(name) for name in ("GLIBC_TUNABLES", "MALLOC_CONF", "LD_PRELOAD")})
             time.sleep(self.args.settle)
             self.guard()
             text = (self.directory / "server.log").read_text(errors="replace")
@@ -287,7 +304,7 @@ class Service:
                 raise RuntimeError("startup allocator marker missing or incorrect")
             maps = Path(f"/proc/{self.process.pid}/maps").read_text()
             (self.directory / "startup-maps.txt").write_text(maps)
-            if self.mode == "jemalloc":
+            if self.mode.startswith("jemalloc"):
                 paths = []
                 for line in maps.splitlines():
                     fields = line.split(None, 5)
@@ -314,6 +331,16 @@ class Service:
         return memory
 
     def sample(self):
+        raw_info = self.client.command(b"ALLOCINFO").decode()
+        lines = raw_info.splitlines()
+        summary = dict(item.split("=", 1) for item in lines[0].split())
+        classes = []
+        if summary["backend"] == "pool":
+            summary = {name: int(value) if name != "backend" else value for name, value in summary.items()}
+            classes = [{name: int(value) for name, value in row.items()}
+                       for row in csv.DictReader(io.StringIO("\n".join(lines[1:])))]
+            if len(classes) != 16 or sum(row["mapped_bytes"] for row in classes) + summary["large_mapped_bytes"] != summary["mapped_bytes"]:
+                raise RuntimeError("inconsistent ALLOCINFO detail totals")
         time.sleep(self.args.settle)
         raw = []
         for _ in range(5):
@@ -323,8 +350,9 @@ class Service:
             "VmSize_KiB": statistics.median(x["VmSize"] for x in raw),
             "VmRSS_KiB": statistics.median(x["VmRSS"] for x in raw),
             "raw_proc_samples_KiB": raw,
-            "allocator_stats": None,
-            "allocator_stats_note": "not exposed by current service protocol",
+            "allocator_stats": {"summary": summary, "classes": classes},
+            "allocinfo_raw": raw_info,
+            "allocator_stats_note": "current pool mappings are not RSS; total is lifetime mapped bytes",
         }
 
     def close(self):
@@ -366,7 +394,7 @@ def verify_backend(args, mode, directory, library):
                 raise RuntimeError(f"cannot verify service binding: {symbol}")
             for record in matching:
                 provider = Path(record["provider"]).resolve()
-                valid = provider == library if mode == "jemalloc" else "libc.so" in provider.name
+                valid = provider == library if mode.startswith("jemalloc") else "libc.so" in provider.name
                 if not valid:
                     raise RuntimeError(f"unexpected {symbol} provider: {provider}")
     result = {"mode": mode, "bindings": records, "diagnostic_process_excluded": True}
@@ -452,6 +480,15 @@ def perform_run(args, mode, round_number, directory, library, plan, binary_hash)
 
             run_phase(service, plan, "delete", result, path)
             run_phase(service, plan, "verify_absent", result, path)
+            if mode == "system-malloctrim":
+                result["states"]["end_before_trim"] = service.sample()
+                began = time.perf_counter()
+                reply = service.client.command(b"ALLOCTRIM")
+                if reply != b"OK":
+                    raise RuntimeError(f"ALLOCTRIM failed: {reply!r}")
+                result["manual_trim"] = {"command": "ALLOCTRIM", "count": 1,
+                    "reply": reply.decode(), "call_ms": (time.perf_counter() - began) * 1000,
+                    "position": "after all deletes and verify_absent, before final RSS samples"}
             result["states"]["end"] = service.sample()
 
             for filename in ("snapshot.bin", "snapshot.db", "commands.aof", "appendonly.aof"):
@@ -493,7 +530,7 @@ def save_tables(output, results):
                     "delete_seconds": delete.get("elapsed_seconds"),
                 })
     summary = []
-    for mode in MODES:
+    for mode in ALL_MODES:
         group = [r for r in results if r["mode"] == mode and r["status"] == "passed"]
         for state in ("start", "peak", "end"):
             if group:
@@ -550,7 +587,11 @@ def self_test():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("all",) + MODES, default="all")
+    parser.add_argument("--backend", choices=("all",) + ALL_MODES, default="all")
+    parser.add_argument("--backends", nargs="+", choices=ALL_MODES,
+                        help="explicit same-round subset, e.g. system-malloctrim pool")
+    parser.add_argument("--reclaim-policy", choices=("default", "comparable", "all"), default="default",
+                        help="default: original three modes; comparable: system-trim/system-malloctrim/pool/jemalloc-decay0; all: six modes")
     parser.add_argument("--entries", type=int, default=10_000)
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--server", type=Path, default=ROOT / "bin" / "kvstore")
@@ -578,8 +619,13 @@ def main():
     args.server = args.server.resolve()
     if not args.server.is_file() or not os.access(args.server, os.X_OK):
         parser.error(f"executable server not found: {args.server}")
-    modes = list(MODES) if args.backend == "all" else [args.backend]
-    library = find_jemalloc(args.jemalloc_lib) if "jemalloc" in modes else None
+    selected_modes = {"default": MODES, "comparable": ("system-trim", "system-malloctrim", "pool", "jemalloc-decay0"), "all": ALL_MODES}
+    if args.backends and args.backend != "all":
+        parser.error("--backends cannot be combined with --backend")
+    if args.backends and len(set(args.backends)) != len(args.backends):
+        parser.error("--backends must not contain duplicate modes")
+    modes = args.backends or (list(selected_modes[args.reclaim_policy]) if args.backend == "all" else [args.backend])
+    library = find_jemalloc(args.jemalloc_lib) if any(mode.startswith("jemalloc") for mode in modes) else None
     dependency = capture(["ldd", str(args.server)])
     if dependency.get("exit") != 0:
         raise RuntimeError(f"cannot inspect server dependencies: {dependency}")
@@ -612,16 +658,23 @@ def main():
         "git_head": capture(["git", "-C", str(args.server.parent.parent), "rev-parse", "HEAD"]),
         "git_status": capture(["git", "-C", str(args.server.parent.parent), "status", "--short"]),
         "compiler": capture(["gcc", "--version"]),
+        "glibc_version": capture(["getconf", "GNU_LIBC_VERSION"]),
+        "reclaim_environments": {mode: {key: clean_environment(mode, library).get(key)
+            for key in ("GLIBC_TUNABLES", "MALLOC_CONF", "LD_PRELOAD")} for mode in modes},
+        "glibc_trim_tunable": capture(["env", "GLIBC_TUNABLES=glibc.malloc.trim_threshold=0",
+            next((str(path) for path in Path("/lib").glob("ld-linux-*.so.*")), "/lib64/ld-linux-x86-64.so.2"), "--list-tunables"]),
         "makefile_sha256": sha256_file(args.server.parent.parent / "Makefile"),
         "cleared_child_environment": {k: os.environ[k] for k in CLEAR_ENV if k in os.environ},
         "plan": plan, "key_bytes": 32, "value_bytes": 128,
         "dataset": "unique 8-byte hex id + 24 bytes SHA256/base85; hex digest repeated for value",
         "sampling": "five /proc/status samples per state; within-state median; all raw samples retained",
+        "manual_trim_definition": "system-malloctrim only: exactly one ALLOCTRIM after delete+verify_absent; end_before_trim precedes it, end follows it; no trim_threshold override",
         "peak_definition": "all requested records inserted and GET-verified; not historical RSS maximum",
         "request_window": 1, "timing_note": "includes generation and serial network round trips; not throughput benchmark",
         "limitations": [
             "jemalloc LD_PRELOAD replaces ordinary allocations process-wide, including third-party libraries",
-            "pool internal statistics are not exported by the service protocol",
+            "pool ALLOCINFO is read-only, all 16 classes exported; current mappings differ from RSS",
+            "pool immediately munmaps empty slabs; trim_threshold=0 does not guarantee all arena holes are returned",
             "no reinsert/reuse phase or leak conclusion from RSS alone",
             "SIGTERM cleanup is not evidence of graceful allocator destruction",
             "startup chooses a free port then releases reservation; binding collision fails the run",
@@ -656,6 +709,7 @@ def main():
                     and all(r["status"] == "passed" for r in results))
         write_json(output / "completion.json", {
             "million_three_mode_multi_round_measurement_completed": complete,
+            "requested_experiment_completed": len(results) == len(modes) * args.rounds and all(r["status"] == "passed" for r in results),
             "completed_runs": sum(r["status"] == "passed" for r in results),
             "expected_runs": len(modes) * args.rounds,
             "note": "memory table completion only; not full stage-8 acceptance",
