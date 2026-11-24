@@ -29,3 +29,18 @@ int __wrap_kvs_uring_io_sync(kvs_uring_io_t *io, int fd)
     }
     return __real_kvs_uring_io_sync(io, fd);
 }
+
+int __real_kvs_uring_io_write_and_datasync(kvs_uring_io_t *, int,
+    const void *, size_t, off_t);
+
+int __wrap_kvs_uring_io_write_and_datasync(kvs_uring_io_t *io, int fd,
+    const void *data, size_t length, off_t offset)
+{
+    const char *trigger = getenv("KVS_TEST_SYNC_TRIGGER");
+    if (trigger && access(trigger, F_OK) == 0) {
+        kvs_uring_write_t write = { .data = data, .length = length, .offset = offset };
+        if (kvs_uring_io_write_batch(io, fd, &write, 1) < 0) return -1;
+        return __wrap_kvs_uring_io_sync(io, fd);
+    }
+    return __real_kvs_uring_io_write_and_datasync(io, fd, data, length, offset);
+}

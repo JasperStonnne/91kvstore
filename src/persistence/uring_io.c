@@ -569,3 +569,89 @@ int kvs_uring_io_write_batch(
         /* 本轮成功；下一轮继续处理短写留下的部分。 */
     }
 }
+
+int kvs_uring_io_write_and_datasync(kvs_uring_io_t *io, int fd,
+    const void *data, size_t length, off_t offset)
+{
+    if (io == NULL || !io->initialized || fd < 0 || offset < 0 ||
+        (length > 0 && data == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    off_t end;
+    if (__builtin_add_overflow(offset, length, &end)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) return -1;
+    if (flags & O_APPEND) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t completed = 0;
+    do {
+        size_t requested = length - completed;
+        if (requested > (size_t)INT_MAX) requested = INT_MAX;
+        struct io_uring_sqe *write_sqe = io_uring_get_sqe(&io->ring);
+        struct io_uring_sqe *sync_sqe = io_uring_get_sqe(&io->ring);
+        if (write_sqe == NULL || sync_sqe == NULL) {
+            errno = EBUSY;
+            uring_abort_requests(io, 0);
+            return -1;
+        }
+        io_uring_prep_write(write_sqe, fd,
+            length ? (const char *)data + completed : "", (unsigned int)requested,
+            offset + (off_t)completed);
+        write_sqe->flags |= IOSQE_IO_LINK;
+        io_uring_sqe_set_data64(write_sqe, 0);
+        io_uring_prep_fsync(sync_sqe, fd, IORING_FSYNC_DATASYNC);
+        io_uring_sqe_set_data64(sync_sqe, 1);
+        int submitted;
+        if (uring_submit_prepared(io, 2, &submitted) < 0) {
+            uring_abort_requests(io, submitted);
+            return -1;
+        }
+        int results[2] = {0};
+        unsigned int seen = 0;
+        int invalid = 0;
+        /* 即使 WRITE 失败/短写，也必须先回收链接的同步结果。 */
+        for (int received = 0; received < 2; received++) {
+            size_t id;
+            int result;
+            if (uring_receive_write_result(io, &id, &result) < 0) {
+                uring_abort_requests(io, 2 - received);
+                return -1;
+            }
+            if (id > 1 || (seen & (1U << id))) {
+                invalid = 1;
+                continue;
+            }
+            seen |= 1U << id;
+            results[id] = result;
+        }
+        if (invalid || seen != 3) {
+            errno = EIO;
+            return -1;
+        }
+        int written = results[0], synced = results[1];
+        /* WRITE 中断时后续 fsync 通常被取消，重试同一段数据。 */
+        if (written == -EINTR && (synced == -ECANCELED || synced == -EINTR || synced == 0))
+            continue;
+        if (written < 0 || (requested && written == 0) || (size_t)written > requested) {
+            errno = written < 0 ? -written : EIO;
+            return -1;
+        }
+        int short_write = (size_t)written < requested;
+        /* 短写会打断软链接；ECANCELED 此时不是独立的刷盘错误。 */
+        if (synced < 0 && synced != -EINTR && !(short_write && synced == -ECANCELED)) {
+            errno = -synced;
+            return -1;
+        }
+        /* 同步中断且本段已完整写入：重写本段并重新链接同步。 */
+        if (synced == -EINTR && !short_write)
+            continue;
+        completed += (size_t)written;
+    } while (completed < length);
+    return 0;
+}

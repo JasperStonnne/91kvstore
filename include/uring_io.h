@@ -56,6 +56,12 @@ int kvs_uring_io_write_batch(
  */
 int kvs_uring_io_sync(kvs_uring_io_t *io, int fd);
 
+/* 按 offset 写完并以链接的 fdatasync 保证落盘；返回前回收全部 CQE。
+ * 参数和文件范围要求同 write_batch；失败返回 -1 并设置 errno。
+ */
+int kvs_uring_io_write_and_datasync(kvs_uring_io_t *io, int fd,
+    const void *data, size_t length, off_t offset);
+
 /*
  * 释放队列，不关闭调用方的文件，也不自动同步文件。
  * 调用前，前面的操作必须已经返回。

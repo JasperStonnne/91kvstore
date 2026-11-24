@@ -335,7 +335,8 @@ int kvs_aof_append(char **tokens, int count)
         errno = EOVERFLOW;
         return -1;
     }
-    char *encoded = kvs_malloc(capacity);
+    char stack_buf[4096];
+    char *encoded = capacity <= sizeof(stack_buf) ? stack_buf : kvs_malloc(capacity);
     if (encoded == NULL) {
         return -1;
     }
@@ -351,12 +352,9 @@ int kvs_aof_append(char **tokens, int count)
         aof_encode_trailer((unsigned char *)encoded + encoded_length,
                            (uint64_t)(next_offset - KVS_AOF_HEADER_SIZE), next_crc);
     }
-    kvs_uring_write_t request = {
-        .data = encoded, .length = encoded_length + trailer_size, .offset = aof_writer.offset
-    };
     /* offset 指向旧文件尾起点，新命令和新尾部作为一个连续缓冲写入。 */
-    if (kvs_uring_io_write_batch(&aof_writer.io, aof_writer.fd, &request, 1) < 0 ||
-        kvs_uring_io_sync(&aof_writer.io, aof_writer.fd) < 0) {
+    if (kvs_uring_io_write_and_datasync(&aof_writer.io, aof_writer.fd,
+            encoded, encoded_length + trailer_size, aof_writer.offset) < 0) {
         /* file 模式 I/O 失败后必须关闭并重新校验，不能沿旧状态继续追加。 */
         aof_writer.failed = aof_writer.checksum == KVS_AOF_CHECKSUM_FILE;
         goto done;
@@ -368,7 +366,7 @@ int kvs_aof_append(char **tokens, int count)
 done:
     {
         int saved_errno = errno;
-        kvs_free(encoded);
+        if (encoded != stack_buf) kvs_free(encoded);
         errno = saved_errno;
     }
     return result;

@@ -19,6 +19,7 @@
 static int ntyco_runtime_active;
 #define NTYCO_MAX_CONNECTOR_COUNT 1 // 当前一台 Replica 只连接一个 Primary
 #define NTYCO_STREAM_RETRY_INTERVAL_MS 1
+#define NTYCO_READ_CHUNK_BYTES (64 * 1024)
 #define NTYCO_STREAM_READ_BYTES (64 * 1024)
 /* 待发送回复达到 64 KiB 时，先发送这一批。 */
 #define NTYCO_REPLY_BATCH_THRESHOLD (64 * 1024)
@@ -293,11 +294,11 @@ static int ntyco_flush_output(int fd, kvs_output_buffer_t *output)
 static int ntyco_stream_control(int fd, msg_handler handler,
                                  kvs_input_buffer_t *input, kvs_output_buffer_t *output)
 {
-    if (input->length == 0)
+    if (input->length == input->offset)
         return 0;
     int consumed = 0;
-    int response = handler(fd, input->data, input->length, output, &consumed);
-    if (response < 0 || response > output->capacity || consumed < 0 || consumed > input->length ||
+    int response = handler(fd, input->data + input->offset, input->length - input->offset, output, &consumed);
+    if (response < 0 || response > output->capacity || consumed < 0 || consumed > input->length - input->offset ||
         (response > 0 && consumed == 0))
         return -1;
     if (kvs_input_buffer_consume(input, consumed) < 0)
@@ -339,7 +340,7 @@ void server_reader(void *arg) {
 	while (1) {
 		int consumed_length=0;
 		/* 保留尚未处理的数据；空间满时先扩容，再继续接收。 */
-	if (kvs_input_buffer_ensure_space(&input, 1) < 0) {
+	if (kvs_input_buffer_ensure_space(&input, NTYCO_READ_CHUNK_BYTES) < 0) {
 		goto connection_closed;
 	}
 	int available = input.capacity - input.length;
@@ -365,7 +366,7 @@ void server_reader(void *arg) {
 			output.offset=0;
 			    if (!protocol_selected) {
                 kvs_connection_kind_t kind =
-                    kvs_identify_connection(input.data, input.length);
+                    kvs_identify_connection(input.data + input.offset, input.length - input.offset);
 
                 if (kind == KVS_CONNECTION_NEED_MORE) {
                     /* 半包不消费，退出内层循环，继续接收。 */
@@ -394,8 +395,8 @@ void server_reader(void *arg) {
 			/* handler 返回本条命令新生成的回复长度。 */
 			int response_length = handler(
 					fd,
-					input.data,
-					input.length,
+					input.data + input.offset,
+					input.length - input.offset,
 					&output,
 					&consumed_length
 			);
@@ -454,7 +455,7 @@ void server_reader(void *arg) {
                     /* 非阻塞收控制帧；输入暂不能消费时限在一个 stream 块内。 */
                     ssize_t pending = -1;
                     errno = EAGAIN;
-                    if (input.length < NTYCO_STREAM_READ_BYTES) {
+                    if (input.length - input.offset < NTYCO_STREAM_READ_BYTES) {
                         if (kvs_input_buffer_ensure_space(&input, 1) < 0)
                             goto connection_closed;
                         int available = input.capacity - input.length;
@@ -504,7 +505,7 @@ void server_reader(void *arg) {
 					}
 				}
 			}
-	} while (input.length > 0 && consumed_length > 0);
+	} while (input.length > input.offset && consumed_length > 0);
 
 			/*
 				* 内部循环结束后，必须发送剩余回复，
@@ -898,12 +899,12 @@ static void ntyco_dynamic_run(void *arg)
             break;
         if (flushed) {
             /* 满缓冲仍先解析已有帧，避免公平调度的帧数预算触发误断开。 */
-            if ((size_t)input.length < config->max_input_bytes &&
+            if ((size_t)(input.length - input.offset) < config->max_input_bytes &&
                 kvs_input_buffer_ensure_space(&input, 1) < 0)
                 break;
             size_t available = (size_t)(input.capacity - input.length);
-            if (available > config->max_input_bytes - (size_t)input.length)
-                available = config->max_input_bytes - (size_t)input.length;
+            if (available > config->max_input_bytes - (size_t)(input.length - input.offset))
+                available = config->max_input_bytes - (size_t)(input.length - input.offset);
             ssize_t bytes = available ? syscall(SYS_recvfrom, connection->fd, input.data + input.length,
                                     available, MSG_DONTWAIT, NULL, NULL) : -1;
             if (!available)
@@ -914,20 +915,20 @@ static void ntyco_dynamic_run(void *arg)
                 break;
             if (bytes > 0)
                 input.length += (int)bytes;
-            for (int budget = 0; budget < 32 && input.length && !connection->cancelled; budget++) {
+            for (int budget = 0; budget < 32 && input.length > input.offset && !connection->cancelled; budget++) {
                 if (kvs_output_buffer_ensure_space(&output, BUFFER_LENGTH) < 0)
                     goto done;
                 kvs_output_buffer_t response = { .data = output.data + output.length,
                     .capacity = output.capacity - output.length };
                 int reply = config->message(config->context, config->session, connection->fd,
-                    input.data, input.length, &response, &consumed);
-                if (reply < 0 || reply > response.capacity || consumed < 0 || consumed > input.length)
+                    input.data + input.offset, input.length - input.offset, &response, &consumed);
+                if (reply < 0 || reply > response.capacity || consumed < 0 || consumed > input.length - input.offset)
                     goto done;
                 output.length += reply;
                 if (kvs_input_buffer_consume(&input, consumed) < 0)
                     goto done;
                 if (!consumed) {
-                    if ((size_t)input.length >= config->max_input_bytes)
+                    if ((size_t)(input.length - input.offset) >= config->max_input_bytes)
                         goto done;
                     break;
                 }

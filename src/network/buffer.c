@@ -56,7 +56,20 @@ int kvs_input_buffer_ensure_space(
     kvs_input_buffer_t *buffer,
     int minimum_free)
 {
-    if (buffer == NULL) return -1;
+    if (buffer == NULL || minimum_free <= 0 ||
+        buffer->offset < 0 || buffer->offset > buffer->length ||
+        buffer->length > buffer->capacity || buffer->capacity < 0 ||
+        (buffer->capacity == 0 && buffer->data != NULL) ||
+        (buffer->capacity > 0 && buffer->data == NULL)) return -1;
+
+    /* 只在接收前压紧一次，逐条消费不搬移剩余请求。 */
+    if (buffer->offset > 0) {
+        int unread = buffer->length - buffer->offset;
+        if (unread > 0)
+            memmove(buffer->data, buffer->data + buffer->offset, (size_t)unread);
+        buffer->length = unread;
+        buffer->offset = 0;
+    }
 
     return ensure_buffer_space(
         &buffer->data,
@@ -74,6 +87,7 @@ void kvs_input_buffer_free(kvs_input_buffer_t *buffer)
     kvs_free(buffer->data);
     buffer->data = NULL;
     buffer->length = 0;
+    buffer->offset = 0;
     buffer->capacity = 0;
 }
 
@@ -108,16 +122,17 @@ void kvs_output_buffer_free(kvs_output_buffer_t *buffer)
     buffer->capacity = 0;
 }
 
-//删除请求缓冲区前面已经处理的字节，把末尾尚未处理的数据移动到开头。
-int kvs_input_buffer_consume(kvs_input_buffer_t *buffer,int consumed_length){
-    if(buffer==NULL||consumed_length>buffer->length||consumed_length<0){
+/* 消费只推进游标；全部消费后复用整个缓冲区。 */
+int kvs_input_buffer_consume(kvs_input_buffer_t *buffer, int consumed_length)
+{
+    if (buffer == NULL || buffer->offset < 0 || buffer->offset > buffer->length ||
+        consumed_length < 0 || consumed_length > buffer->length - buffer->offset)
         return -1;
+    buffer->offset += consumed_length;
+    if (buffer->offset == buffer->length) {
+        buffer->offset = 0;
+        buffer->length = 0;
     }
-    int remaining_length=buffer->length-consumed_length;
-    if(consumed_length>0&&remaining_length>0){
-        memmove(buffer->data,buffer->data+consumed_length,remaining_length);
-    }
-    buffer->length=remaining_length;
     return 0;
 }
 /*

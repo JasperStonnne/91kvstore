@@ -738,10 +738,10 @@ static int kvs_replication_apply_capture(int fd, const char *bytes, size_t lengt
         return -1;
     memcpy(commands->data + commands->length, bytes, length);
     commands->length += (int)length;
-    while (commands->length) {
+    while (commands->length > commands->offset) {
         kvs_slice_t fields[3];
         size_t count, parsed;
-        int result = kvs_parse_command_limited(commands->data, (size_t)commands->length,
+        int result = kvs_parse_command_limited(commands->data + commands->offset, (size_t)(commands->length - commands->offset),
             fields, 3, &count, &parsed, KVS_CAPTURE_COMMAND_BYTES);
         if (result == 0)
             break;

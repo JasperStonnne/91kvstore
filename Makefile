@@ -21,7 +21,8 @@ CPPFLAGS := \
 	-I$(INCLUDE_DIR) \
 	-I$(NTYCO_DIR)/core
 
-CFLAGS := -std=gnu11 -Wall -Wextra -g
+OPT ?= -O2
+CFLAGS := -std=gnu11 $(OPT) -Wall -Wextra -g
 
 # NtyCo 的 read/write/connect hook 仅用于本程序，不能截获 librdmacm 的设备操作。
 # ELF 下隐藏静态库的动态符号导出，防止终端设备写错误陷入协程等待。
@@ -349,7 +350,7 @@ test-aof-write-failure: $(BIN_DIR)/kvstore
 $(BIN_DIR)/test_kvstore_sync_fault: $(OBJS) $(TEST_DIR)/aof_sync_fault.c \
         $(INCLUDE_DIR)/uring_io.h $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(TEST_DIR)/aof_sync_fault.c $(OBJS) \
-	    $(LDFLAGS) -Wl,--wrap=kvs_uring_io_sync $(LDLIBS) -luring -o $@
+	    $(LDFLAGS) -Wl,--wrap=kvs_uring_io_sync -Wl,--wrap=kvs_uring_io_write_and_datasync $(LDLIBS) -luring -o $@
 
 .PHONY: test-aof-sync-failure
 test-aof-sync-failure: $(BIN_DIR)/kvstore $(BIN_DIR)/test_kvstore_sync_fault

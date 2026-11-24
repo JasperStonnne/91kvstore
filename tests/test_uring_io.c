@@ -12,7 +12,7 @@
 #include "uring_io.h"
 
 
-static void test_short_write_then_failure(void)
+static void test_short_write_then_failure(int linked)
 {
     char path[] = "/tmp/91kv-uring-short-XXXXXX";
     int fd = mkstemp(path);
@@ -44,8 +44,8 @@ static void test_short_write_then_failure(void)
         .offset = 0
     };
 
-    int result = kvs_uring_io_write_batch(
-        &io, fd, &request, 1);
+    int result = linked ? kvs_uring_io_write_and_datasync(&io, fd, data, sizeof(data) - 1, 0)
+        : kvs_uring_io_write_batch(&io, fd, &request, 1);
     int write_errno = errno;
 
     /* 先恢复环境，再检查结果。 */
@@ -69,6 +69,15 @@ static void test_short_write_then_failure(void)
            == (ssize_t)(sizeof(data) - 1));
     assert(memcmp(actual, data, sizeof(data) - 1) == 0);
 
+    assert(kvs_uring_io_write_and_datasync(&io, fd, data, sizeof(data) - 1, 0) == 0);
+    assert(pread(fd, actual, sizeof(actual), 0) == (ssize_t)(sizeof(data) - 1));
+    assert(memcmp(actual, data, sizeof(data) - 1) == 0);
+    int readonly = open(path, O_RDONLY);
+    assert(readonly >= 0);
+    assert(kvs_uring_io_write_and_datasync(&io, readonly, data, sizeof(data) - 1, 0) == -1);
+    assert(errno == EBADF); /* linked fsync ECANCELED must not hide WRITE EBADF */
+    assert(close(readonly) == 0);
+    assert(kvs_uring_io_write_and_datasync(&io, fd, data, sizeof(data) - 1, 0) == 0);
     kvs_uring_io_close(&io);
     assert(close(fd) == 0);
     assert(unlink(path) == 0);
@@ -215,6 +224,7 @@ int main(void)
     kvs_uring_io_close(&io);
 
     puts("[PASS] io_uring sync error propagation");
-        test_short_write_then_failure();
+        test_short_write_then_failure(0);
+    test_short_write_then_failure(1);
     return 0;
 }

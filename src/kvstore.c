@@ -140,40 +140,46 @@ static int kvs_is_write_command(int cmd){
 }
 
 
-/* 将解析出的字段复制为旧命令执行器使用的 C 字符串。 */
+/* 用整数地址判断归属，避免对不同对象的指针做大小比较。 */
+static void kvs_release_tokens(char **tokens, size_t count,
+    const char *stack_buf, size_t stack_size)
+{
+    uintptr_t stack_start = (uintptr_t)stack_buf;
+    for (size_t i = 0; i < count; i++) {
+        uintptr_t address = (uintptr_t)tokens[i];
+        if (tokens[i] != NULL &&
+            !(address >= stack_start && address - stack_start < stack_size))
+            kvs_free(tokens[i]);
+        tokens[i] = NULL;
+    }
+}
+
+/* 字段、总长度和 NUL 已由唯一调用方校验。短命令共用栈空间。 */
 static int kvs_fields_to_tokens(
     const kvs_slice_t *fields,
     size_t field_count,
     char **tokens,
-    size_t token_capacity)
+    char *stack_buf,
+    size_t stack_size,
+    size_t total_bytes)
 {
-    if (fields == NULL || tokens == NULL ||
-        field_count == 0 || field_count > token_capacity) {
-        return -1;
-    }
-
+    size_t position = 0;
     for (size_t i = 0; i < field_count; i++) {
-        /* 旧执行器使用 strcmp 等函数，目前不能处理字段内的 NUL。 */
-        if (fields[i].data == NULL ||
-            fields[i].length == SIZE_MAX ||
-            memchr(fields[i].data, '\0', fields[i].length) != NULL) {
-            goto fail;
+        size_t bytes = fields[i].length + 1;
+        if (total_bytes <= stack_size) {
+            tokens[i] = stack_buf + position;
+            position += bytes;
+        } else {
+            tokens[i] = kvs_malloc(bytes);
+            if (tokens[i] == NULL) {
+                kvs_release_tokens(tokens, field_count, stack_buf, stack_size);
+                return -1;
+            }
         }
-
-        tokens[i] = kvs_malloc(fields[i].length + 1);
-        if (tokens[i] == NULL) goto fail;
-
         memcpy(tokens[i], fields[i].data, fields[i].length);
         tokens[i][fields[i].length] = '\0';
     }
     return 0;
-
-fail:
-    for (size_t i = 0; i < field_count; i++) {
-        kvs_free(tokens[i]);
-        tokens[i] = NULL;
-    }
-    return -1;
 }
 
 /* 根据读取命令，从对应的存储引擎中取 value。 */
@@ -667,6 +673,8 @@ static int kvs_execute_fields(
     kvs_exec_status_t *execution_status)
 {
     char *tokens[KVS_MAX_TOKENS] = {0};
+    char token_stack_buf[4096];
+    size_t token_bytes = 0;
         if (execution_status != NULL) {
         *execution_status = KVS_EXEC_FAILED;
     }
@@ -693,6 +701,12 @@ static int kvs_execute_fields(
             return -1;
         }
 
+        size_t bytes = fields[i].length + 1;
+        if (token_bytes > SIZE_MAX - bytes) {
+            return -1;
+        }
+        token_bytes += bytes;
+
         if (memchr(fields[i].data, '\0', fields[i].length) != NULL) {
             static const char reply[] =
                 "-ERR NUL bytes are not supported\r\n";
@@ -711,7 +725,7 @@ static int kvs_execute_fields(
     }
 
     if (kvs_fields_to_tokens(
-            fields, field_count, tokens, KVS_MAX_TOKENS) != 0) {
+            fields, field_count, tokens, token_stack_buf, sizeof(token_stack_buf), token_bytes) != 0) {
         return -1;
     }
         if (source == KVS_COMMAND_SOURCE_CLIENT &&
@@ -731,9 +745,7 @@ static int kvs_execute_fields(
             result = (int)reply_length;
         }
 
-        for (size_t i = 0; i < field_count; i++) {
-            kvs_free(tokens[i]);
-        }
+        kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
         return result;
     }
 
@@ -754,9 +766,7 @@ static int kvs_execute_fields(
         }
 
         /* 提前返回前，释放已经解析出的命令字段。 */
-        for (size_t i = 0; i < field_count; i++) {
-            kvs_free(tokens[i]);
-        }
+        kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
 
         return result;
     }
@@ -789,9 +799,7 @@ static int kvs_execute_fields(
             result = (int)reply_length;
         }
 
-        for (size_t i = 0; i < field_count; i++) {
-            kvs_free(tokens[i]);
-        }
+        kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
         return result;
     }
 
@@ -826,9 +834,7 @@ static int kvs_execute_fields(
                 }
             }
 
-            for (size_t i = 0; i < field_count; i++) {
-                kvs_free(tokens[i]);
-            }
+            kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
             return written;
         }
     }
@@ -845,9 +851,7 @@ static int kvs_execute_fields(
             result = (int)reply_length;
         }
 
-        for (size_t i = 0; i < field_count; i++) {
-            kvs_free(tokens[i]);
-        }
+        kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
         return result;
     }
 
@@ -878,9 +882,7 @@ static int kvs_execute_fields(
                 result = kvs_encode_value_to_output(response, value);
             }
 
-            for (size_t i = 0; i < field_count; i++) {
-                kvs_free(tokens[i]);
-            }
+            kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
 
             return result;
         }
@@ -1015,9 +1017,7 @@ static int kvs_execute_fields(
         }
     }
 
-    for (size_t i = 0; i < field_count; i++) {
-        kvs_free(tokens[i]);
-    }
+    kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
 
     return result;
 }

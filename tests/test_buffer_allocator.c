@@ -32,6 +32,7 @@ static void test_input(void)
     fail_alloc = 0;
 
     assert(input.data == NULL);
+    assert(input.offset == 0);
     assert(input.length == 0);
     assert(input.capacity == 0);
 
@@ -72,13 +73,38 @@ static void test_input(void)
     assert(input.length == 4);
     assert(memcmp(input.data, "data", 4) == 0);
 
-    /* 消费前两个字节后，剩余数据移到开头。 */
-    assert(kvs_input_buffer_consume(&input, 2) == 0);
-    assert(input.length == 2);
+    /* 多次消费只推进游标，底层字节不搬移。 */
+    assert(kvs_input_buffer_consume(&input, 1) == 0);
+    assert(input.offset == 1 && input.length == 4);
+    assert(kvs_input_buffer_consume(&input, 1) == 0);
+    assert(input.offset == 2 && input.length == 4);
+    assert(memcmp(input.data, "data", 4) == 0);
+    assert(kvs_input_buffer_consume(&input, -1) < 0);
+    assert(kvs_input_buffer_consume(&input, 3) < 0);
+    assert(input.offset == 2);
+
+    /* 残留半包在下一次接收前 compact，并可继续追加。 */
+    assert(kvs_input_buffer_ensure_space(&input, 4) == 0);
+    assert(input.offset == 0 && input.length == 2);
     assert(memcmp(input.data, "ta", 2) == 0);
+    memcpy(input.data + input.length, "il", 2);
+    input.length += 2;
+    assert(memcmp(input.data, "tail", 4) == 0);
+    assert(kvs_input_buffer_consume(&input, 4) == 0);
+    assert(input.offset == 0 && input.length == 0);
+
+    /* 非法游标在消费和扩容时均被拒绝。 */
+    input.offset = -1;
+    assert(kvs_input_buffer_consume(&input, 0) < 0);
+    assert(kvs_input_buffer_ensure_space(&input, 1) < 0);
+    input.offset = 1;
+    assert(kvs_input_buffer_consume(&input, 0) < 0);
+    assert(kvs_input_buffer_ensure_space(&input, 1) < 0);
+    input.offset = 0;
 
     kvs_input_buffer_free(&input);
     assert(input.data == NULL);
+    assert(input.offset == 0);
     assert(input.length == 0);
     assert(input.capacity == 0);
 

@@ -113,7 +113,8 @@ typedef int (*RCALLBACK)(int fd);
 /* 输入数据单独分配，空间不足时可以扩容。 */
 typedef struct kvs_input_buffer {
     char *data;   /* 保存收到的字节 */
-    int length;   /* 已收到、尚未处理的字节数 */
+    int length;   /* data 中已收到字节的末尾位置 */
+    int offset;   /* 已消费字节数；未读区间为 [offset, length) */
     int capacity; /* data 当前能容纳的总字节数 */
 } kvs_input_buffer_t;
 int kvs_input_buffer_consume(kvs_input_buffer_t *buffer,int consumed_length);

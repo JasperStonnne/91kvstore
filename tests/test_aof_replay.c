@@ -152,13 +152,18 @@ static void test_append(void)
     assert(kvs_aof_open(path) == 0);
 
     char *first[] = {"HSET", "k", "1"};
-    char *failed[] = {"HSET", "k", "9"};
+    char large_value[8192];
+    memset(large_value, '9', sizeof(large_value) - 1);
+    large_value[sizeof(large_value) - 1] = '\0';
+    char *failed[] = {"HSET", "k", large_value};
     char *second[] = {"HSET", "k", "2"};
 
     kvs_pool_stats_t stats;
 
     /* 写请求结束后，encoded 应当已经释放。 */
+    fail_alloc = 1; /* 短命令使用栈缓冲，不依赖堆分配。 */
     assert(kvs_aof_append(first, 3) == 0);
+    fail_alloc = 0;
     assert(kvs_allocator_pool_stats(&stats) == 0);
     assert(stats.live_objects == 0);
 
@@ -309,8 +314,12 @@ static void test_checked_append(const char *path)
 
     /* 重新打开时从已有命令重建 CRC，申请失败不污染下次追加。 */
     assert(kvs_aof_open_with_checksum(path, KVS_AOF_CHECKSUM_FILE) == 0);
+    char large_value[8192];
+    memset(large_value, '9', sizeof(large_value) - 1);
+    large_value[sizeof(large_value) - 1] = '\0';
+    char *large[] = {"HSET", "k", large_value};
     fail_alloc = 1;
-    assert(kvs_aof_append(second, 3) == -1);
+    assert(kvs_aof_append(large, 3) == -1);
     fail_alloc = 0;
     expect_file_unchanged(path, (const char *)expected, length);
     assert(kvs_aof_append(second, 3) == 0);
