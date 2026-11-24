@@ -185,5 +185,8 @@ int kvs_response(struct conn*c);
 #endif
 
 
+
+/* 主事件循环中的周期维护；回调不得阻塞（退出收尾除外）。 */
+void ntyco_set_maintenance(void (*callback)(void));
 #endif
 

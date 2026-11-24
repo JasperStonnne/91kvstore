@@ -691,6 +691,25 @@ void server(void *arg) {
 }
 
 
+static void (*ntyco_maintenance_callback)(void);
+
+void ntyco_set_maintenance(void (*callback)(void))
+{
+    ntyco_maintenance_callback = callback;
+}
+
+/* timer 在空闲 epoll 时也唤醒；显式 yield，不能只登记 sleep。 */
+static void ntyco_maintenance(void *unused)
+{
+    (void)unused;
+    while (ntyco_maintenance_callback != NULL) {
+        ntyco_maintenance_callback();
+        nty_coroutine *co = nty_coroutine_get_sched()->curr_thread;
+        nty_schedule_sched_sleepdown(co, 10);
+        nty_coroutine_yield(co);
+    }
+}
+
 int ntyco_start_runtime(const kvs_listener_config_t *listeners,size_t listener_count,const kvs_connector_config_t *connectors,size_t connector_count){
 	if(listeners==NULL||listener_count==0||listener_count>NTYCO_MAX_LISTENER_COUNT){
 		return -1;
@@ -772,6 +791,14 @@ int ntyco_start_runtime(const kvs_listener_config_t *listeners,size_t listener_c
 				return -1;
 		}
 }//为每个主动连接任务创建一个连接器协程
+    if (ntyco_maintenance_callback != NULL) {
+        nty_coroutine *co;
+        if (nty_coroutine_create(&co, ntyco_maintenance, NULL) != 0) {
+            for (size_t i = 0; i < initialized_count; i++)
+                ntyco_listener_context_destroy(&contexts[i]);
+            return -1;
+        }
+    }
 	ntyco_runtime_active = 1;
 	nty_schedule_run();
 	ntyco_runtime_active = 0;

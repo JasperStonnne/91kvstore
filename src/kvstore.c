@@ -12,6 +12,13 @@
 #include<errno.h>
 #include<limits.h>
 #include <stdint.h>
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 /* 只限制客户端的一条 RESP 命令；不改变 AOF/Snapshot/复制解析。 */
@@ -106,22 +113,154 @@ static int kvs_persistence_uses_aof(void)
     return kvs_persistence_mode == KVS_PERSISTENCE_AOF;
 }
 
+static pid_t bgsave_pid = -1;
+static int save_pending;
+static long long bgsave_started_ms;
+static long long last_fork_us, total_fork_us;
+static double last_save_ms, total_save_ms;
+static unsigned long long save_completed_count, save_failed_count, save_triggered_count;
+static int bgsave_result_fd = -1;
+static volatile sig_atomic_t kvs_stop_requested;
+
+static long long kvs_monotonic_us(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
+
+/* 子进程只保留标准流和耗时回传管道，不保留监听/客户端/epoll/uring FD。 */
+static void kvs_save_child_close_fds(int keep)
+{
+#ifdef SYS_close_range
+    if ((keep <= 3 || syscall(SYS_close_range, 3U, (unsigned int)keep - 1, 0) == 0) &&
+        syscall(SYS_close_range, (unsigned int)keep + 1, ~0U, 0) == 0)
+        return;
+#endif
+    DIR *directory = opendir("/proc/self/fd");
+    if (directory == NULL) _exit(1);
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        char *end;
+        long fd = strtol(entry->d_name, &end, 10);
+        if (*end == '\0' && fd >= 3 && fd != keep && fd != dirfd(directory))
+            syscall(SYS_close, (int)fd);
+    }
+    closedir(directory);
+}
+
+static int kvs_start_background_save(void)
+{
+    int result_pipe[2];
+    if (syscall(SYS_pipe2, result_pipe, O_CLOEXEC) < 0) {
+        save_failed_count++;
+        return -1;
+    }
+    long long started = kvs_monotonic_us();
+    pid_t child = fork();
+    long long fork_us = kvs_monotonic_us() - started;
+    if (child == 0) {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        kvs_save_child_close_fds(result_pipe[1]);
+        long long save_started = kvs_monotonic_us();
+        int result = kvs_snapshot_store_save_with_checksum("snapshot.bin", kvs_snapshot_checksum);
+        long long duration_us = kvs_monotonic_us() - save_started;
+        /* 小于 PIPE_BUF；回收端仅在子进程退出后读，不影响正常事件循环。 */
+        long written;
+        do {
+            written = syscall(SYS_write, result_pipe[1], &duration_us, sizeof(duration_us));
+        } while (written < 0 && errno == EINTR);
+        _exit(result == 0 && written == sizeof(duration_us) ? 0 : 1);
+    }
+    int saved_errno = errno;
+    syscall(SYS_close, result_pipe[1]);
+    last_fork_us = fork_us;
+    total_fork_us += fork_us;
+    if (child < 0) {
+        syscall(SYS_close, result_pipe[0]);
+        save_failed_count++;
+        errno = saved_errno;
+        return -1;
+    }
+    bgsave_pid = child;
+    bgsave_started_ms = started / 1000;
+    bgsave_result_fd = result_pipe[0];
+    return 0;
+}
+
+/* 非阻塞回收用于事件循环；阻塞模式仅用于退出，接力保存最新父进程视图。 */
+static void kvs_collect_background_save(int blocking)
+{
+    while (bgsave_pid > 0) {
+        int status = 0;
+        pid_t result;
+        do {
+            result = waitpid(bgsave_pid, &status, blocking ? 0 : WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result == 0) return;
+        if (result < 0 && errno != ECHILD) return;
+        long long duration_us;
+        ssize_t bytes;
+        do {
+            bytes = read(bgsave_result_fd, &duration_us, sizeof(duration_us));
+        } while (bytes < 0 && errno == EINTR);
+        syscall(SYS_close, bgsave_result_fd);
+        bgsave_result_fd = -1;
+        last_save_ms = bytes == sizeof(duration_us) ? duration_us / 1000.0
+            : kvs_monotonic_us() / 1000.0 - bgsave_started_ms;
+        total_save_ms += last_save_ms;
+        if (result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+            save_completed_count++;
+        else
+            save_failed_count++;
+        bgsave_pid = -1;
+        if (!save_pending) return;
+        save_pending = 0;
+        if (kvs_start_background_save() < 0) return;
+    }
+}
+
+static void kvs_reap_background_save(void)
+{
+    kvs_collect_background_save(0);
+}
+
 static void kvs_close_current_persistence(void)
 {
-    if (kvs_persistence_uses_aof()) {
-        kvs_aof_close();
+    kvs_collect_background_save(1);
+    if (kvs_persistence_uses_aof()) kvs_aof_close();
+}
+
+static void kvs_stop_signal(int number)
+{
+    (void)number;
+    kvs_stop_requested = 1;
+}
+
+static void kvs_persistence_maintenance(void)
+{
+    kvs_reap_background_save();
+    if (kvs_stop_requested) {
+        /* 单线程循环已停止处理请求；先完成子进程和接力，再释放进程资源。 */
+        kvs_close_current_persistence();
+        exit(EXIT_SUCCESS);
     }
 }
 
 static int kvs_save_current_snapshot(void)
 {
-    if (kvs_persistence_mode == KVS_PERSISTENCE_SNAPSHOT) {
-        return kvs_snapshot_store_save_with_checksum(
-            "snapshot.bin", kvs_snapshot_checksum);
+    kvs_reap_background_save();
+    if (kvs_persistence_mode != KVS_PERSISTENCE_SNAPSHOT) {
+        errno = ENOTSUP;
+        return -1;
     }
-
-    errno = ENOTSUP;
-    return -1;
+    save_triggered_count++;
+    if (bgsave_pid > 0) {
+        save_pending = 1;
+        return 0;
+    }
+    return kvs_start_background_save();
 }
 
 static int kvs_is_write_command(int cmd){
@@ -771,6 +910,26 @@ static int kvs_execute_fields(
         return result;
     }
 
+    if (source == KVS_COMMAND_SOURCE_CLIENT && strcmp(tokens[0], "SAVEINFO") == 0) {
+        kvs_reap_background_save();
+        int result;
+        if (field_count != 1) {
+            result = snprintf(reply_data, (size_t)reply_capacity,
+                "-ERR wrong number of arguments for SAVEINFO\r\n");
+        } else {
+            result = snprintf(reply_data, (size_t)reply_capacity,
+                "+in_progress=%d pending=%d completed=%llu failed=%llu triggered=%llu "
+                "pid=%ld started_ms=%lld last_fork_us=%lld total_fork_us=%lld "
+                "total_fork_ms=%.3f last_save_ms=%.3f total_save_ms=%.3f\r\n",
+                bgsave_pid > 0, save_pending, save_completed_count, save_failed_count,
+                save_triggered_count, (long)bgsave_pid, bgsave_started_ms,
+                last_fork_us, total_fork_us, total_fork_us / 1000.0,
+                last_save_ms, total_save_ms);
+        }
+        kvs_release_tokens(tokens, field_count, token_stack_buf, sizeof(token_stack_buf));
+        return result < 0 || result >= reply_capacity ? -1 : result;
+    }
+
         if (source == KVS_COMMAND_SOURCE_CLIENT &&
         strcmp(tokens[0], "SAVE") == 0) {
         static const char ok[] = "+OK\r\n";
@@ -1366,6 +1525,16 @@ kvs_close_current_persistence();
             return -1;
         }
     }
+    struct sigaction stop_action = {0};
+    stop_action.sa_handler = kvs_stop_signal;
+    sigemptyset(&stop_action.sa_mask);
+    if (sigaction(SIGINT, &stop_action, NULL) < 0 ||
+        sigaction(SIGTERM, &stop_action, NULL) < 0) {
+        kvs_close_current_persistence();
+        dest_kvengine();
+        return EXIT_FAILURE;
+    }
+    ntyco_set_maintenance(kvs_persistence_maintenance);
     int network_ret=-1;
 
     if (config.role == KVS_ROLE_PRIMARY) {

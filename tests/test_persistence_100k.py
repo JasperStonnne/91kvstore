@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Snapshot / AOF 各 100000 条的独立持久化验收。"""
 
+from snapshot_helpers import save_snapshot
+
 import argparse
 import json
 import signal
@@ -101,7 +103,7 @@ def wait_ready(process, port, timeout=300):
 
 
 def stop_checked(process, method="term"):
-    # SIGKILL 只模拟进程异常退出，不代表断电；调用前已收到所有写入/SAVE 成功回复。
+    # SIGKILL 只模拟进程异常退出，不代表断电；调用前已收到所有写入成功回复并确认 SAVEINFO completed。
     if method == "kill":
         process.kill()
         process.wait(timeout=10)
@@ -171,12 +173,12 @@ def run_mode(mode, stop_method="term"):
 
             if mode == "snapshot":
                 started = time.monotonic()
-                require(client.command(b"SAVE") == b"OK", "SAVE 未成功")
+                require(save_snapshot(port) == b"OK", "SAVE 未成功")
                 save_seconds = time.monotonic() - started
 
         # AOF 分支没有发送 SAVE。
         result["initial_exit_code"] = stop_checked(process, stop_method)
-        result["boundary"] = "successful SAVE reply" if mode == "snapshot" else "all SET replies successful"
+        result["boundary"] = "SAVEINFO completed after SAVE" if mode == "snapshot" else "all SET replies successful"
         process = None
 
         filename = "snapshot.bin" if mode == "snapshot" else "commands.aof"
@@ -252,7 +254,7 @@ def run_mode(mode, stop_method="term"):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stop-method", choices=("term", "kill"), default="term",
-                        help="kill: SIGKILL after acknowledged writes/SAVE; never a power-loss test")
+                        help="kill: SIGKILL after acknowledged writes/SAVEINFO completion; never a power-loss test")
     args = parser.parse_args()
     results = [run_mode(mode, args.stop_method) for mode in ("snapshot", "aof")]
     passed = sum(results)

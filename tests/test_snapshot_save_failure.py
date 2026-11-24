@@ -14,6 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from snapshot_helpers import save_snapshot, save_info, wait_save
 from test_aof_restart import encode_command
 from test_snapshot_restart import command
 from test_standalone import choose_port, wait_for_server
@@ -55,20 +56,25 @@ def main():
         owned.append((process, root / "fault.log"))
         wait_for_server(process, port)
         assert command(port, b"HSET", b"base", b"saved_old") == b"OK"
-        assert command(port, b"SAVE") == b"OK"
+        assert save_snapshot(port) == b"OK"
         original = snapshot.read_bytes()
         inode = snapshot.stat().st_ino
         (root / "successful-snapshot.backup").write_bytes(original)
 
         assert command(port, b"HMOD", b"base", b"unsaved_new") == b"OK"
         trigger.write_text("fail only this snapshot's selected SAVE operation\n")
+        before_failure = save_info(port)
         with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
             sock.settimeout(3)
             sock.sendall(encode_command(b"SAVE"))
             with sock.makefile("rb") as replies:
                 reply = replies.readline()
         result["save_reply"] = reply.decode(errors="replace")
-        assert reply == b"-ERR SAVE failed\r\n", reply
+        assert reply == b"+OK\r\n", reply
+        final_state = wait_save(port, int(before_failure["completed"]),
+                                int(before_failure["failed"]), expect_failure=True)
+        assert final_state["completed"] == before_failure["completed"], final_state
+        result["saveinfo"] = final_state
         assert process.poll() is None, "SAVE failure must not terminate service"
         memory_value = command(port, b"HGET", b"base")
         assert memory_value == b"unsaved_new", memory_value
@@ -130,7 +136,7 @@ def main():
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
 
     assert result["passed"], result
-    print(f"[PASS] SAVE {args.case} error: error reply, service alive, memory retains new value",
+    print(f"[PASS] SAVE {args.case} error: accepted reply, failure counter, service alive, memory retains new value",
           flush=True)
     if args.case == "dir-sync":
         print("[PASS] SAVE failed after rename: new snapshot retained and recovered; no rollback",

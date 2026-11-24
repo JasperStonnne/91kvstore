@@ -13,6 +13,7 @@ import time
 import zlib
 from pathlib import Path
 
+from snapshot_helpers import save_snapshot, save_info, wait_save
 from test_aof_restart import encode_command
 from test_snapshot_restart import command
 from test_standalone import choose_port, wait_for_server
@@ -57,13 +58,14 @@ def run_case(args, root, point):
     try:
         fault = subprocess.Popen(
             [str(args.fault_binary), str(config)], cwd=directory, env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=True)
         owned.append((fault, case / "crash.log"))
         wait_for_server(fault, port)
         for prefix in PREFIXES:
             assert command(port, prefix + b"SET", b"base", b"old") == b"OK"
             assert command(port, prefix + b"SET", b"removed", b"kept") == b"OK"
-        assert command(port, b"SAVE") == b"OK"
+        assert save_snapshot(port) == b"OK"
         original = snapshot.read_bytes()
         (case / "old-snapshot.backup").write_bytes(original)
         result["before_save_dataset"] = check_values(port, False)
@@ -78,10 +80,13 @@ def run_case(args, root, point):
             sock = socket.create_connection(("127.0.0.1", port), timeout=3)
             sock.settimeout(3)
             sock.sendall(encode_command(b"SAVE"))
+            assert sock.recv(5) == b"+OK\r\n"
+            child = int(save_info(port)["pid"])
+            assert child > 0
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 assert fault.poll() is None, "server exited before expected pause"
-                status = Path(f"/proc/{fault.pid}/status").read_text()
+                status = Path(f"/proc/{child}/status").read_text()
                 state = next(line for line in status.splitlines() if line.startswith("State:"))
                 if marker.exists() and "\tT" in state:
                     break
@@ -104,6 +109,14 @@ def run_case(args, root, point):
         result["formal_snapshot_replaced"] = replaced
         result["temporary_files"] = {name: {"bytes": len(data),
             "sha256": hashlib.sha256(data).hexdigest()} for name, data in temporary.items()}
+        if point != "before-save":
+            os.kill(child, signal.SIGKILL)
+            state = save_info(port)
+            deadline = time.monotonic() + 5
+            while state["in_progress"] != "0" and time.monotonic() < deadline:
+                time.sleep(0.01)
+                state = save_info(port)
+            assert state["failed"] == "1", state
         fault.kill()
         output, _ = fault.communicate(timeout=5)
         (case / "crash.log").write_bytes(output)
@@ -137,6 +150,11 @@ def run_case(args, root, point):
         assert after_temps == temporary, "restart changed orphan temporary evidence"
         result.update(orphan_temps_ignored_and_preserved=True, checks_complete=True)
     finally:
+        if fault is not None:
+            try:
+                os.killpg(fault.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         if sock is not None:
             sock.close()
         for process, log in owned:

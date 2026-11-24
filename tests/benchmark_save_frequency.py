@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Measure synchronous SAVE frequency with one persistent connection per run."""
+"""Measure asynchronous SAVE frequency, foreground latency and final drain."""
+from array import array
 import argparse
 import hashlib
 import json
@@ -44,11 +45,15 @@ def run(server, directory, entries, interval):
     try:
         process = launch()
         wait_ready(process, port)
+        latencies_ns = array("Q")
         with Client(port) as client:
+            initial = dict(item.split("=", 1) for item in client.command(b"SAVEINFO").decode().split())
             began = time.monotonic()
             for index in range(entries):
                 key, value = make_record(index)
+                request_started = time.perf_counter_ns()
                 reply = client.command(b"HSET", key, value)
+                latencies_ns.append(time.perf_counter_ns() - request_started)
                 if reply != b"OK":
                     raise RuntimeError(f"HSET failed at index={index}: {reply!r}")
                 result["written"] += 1
@@ -57,21 +62,58 @@ def run(server, directory, entries, interval):
                     reply = client.command(b"SAVE")
                     if reply != b"OK":
                         raise RuntimeError(f"SAVE failed after {result['written']} writes: {reply!r}")
-                    save_seconds = time.monotonic() - save_started
                     result["saves"].append({"after_writes": result["written"],
-                        "seconds": save_seconds, "bytes": (directory / "snapshot.bin").stat().st_size})
-            result["seconds"] = time.monotonic() - began
-        result["write_qps"] = entries / result["seconds"]
-        result["save_seconds"] = sum(item["seconds"] for item in result["saves"])
-        result["snapshot_bytes_written"] = sum(item["bytes"] for item in result["saves"])
-        if len(result["saves"]) != math.ceil(entries / interval):
-            raise RuntimeError("unexpected SAVE count")
+                        "ack_seconds": time.monotonic() - save_started})
+                if result["written"] % 100000 == 0:
+                    print(f"[every={interval}] written={result['written']}/{entries}", flush=True)
+            writes_finished = time.monotonic()
+            result["write_seconds"] = writes_finished - began
+            # 写入已结束；只在这里等待最后一次 SAVE（包括 pending 接力）落盘。
+            deadline = time.monotonic() + 300
+            while True:
+                state = dict(item.split("=", 1) for item in client.command(b"SAVEINFO").decode().split())
+                if int(state["failed"]) != int(initial["failed"]):
+                    raise RuntimeError(f"background SAVE failed: {state}")
+                if state["in_progress"] == "0" and state["pending"] == "0":
+                    break
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"final SAVE drain timed out: {state}")
+                time.sleep(.01)
+            drained = time.monotonic()
+        result["drain_seconds"] = drained - writes_finished
+        result["seconds"] = drained - began
+        result["total_seconds"] = result["seconds"]
+        result["write_qps"] = entries / result["write_seconds"]
+        result["end_to_end_qps"] = entries / result["total_seconds"]
+        result["save_ack_seconds"] = sum(item["ack_seconds"] for item in result["saves"])
+        result["triggered"] = int(state["triggered"]) - int(initial["triggered"])
+        result["completed"] = int(state["completed"]) - int(initial["completed"])
+        result["failed"] = int(state["failed"]) - int(initial["failed"])
+        result["total_fork_ms"] = float(state["total_fork_ms"]) - float(initial["total_fork_ms"])
+        result["total_save_ms"] = float(state["total_save_ms"]) - float(initial["total_save_ms"])
+        result["final_saveinfo"] = state
+        expected_saves = math.ceil(entries / interval)
+        if len(result["saves"]) != expected_saves or result["triggered"] != expected_saves:
+            raise RuntimeError("unexpected SAVE trigger count")
+        if not 1 <= result["completed"] <= result["triggered"]:
+            raise RuntimeError(f"unexpected SAVE completion count: {state}")
+        # nearest-rank 分位数；HSET 请求组装+send 到完整回复，不含生成 key/value 或 SAVE。
+        ordered = sorted(latencies_ns)
+        result["hset_latency_ms"] = {
+            "count": len(ordered),
+            "p50": ordered[math.ceil(entries * .50) - 1] / 1e6,
+            "p99": ordered[math.ceil(entries * .99) - 1] / 1e6,
+            "max": ordered[-1] / 1e6,
+        }
+        del ordered, latencies_ns
         snapshot = directory / "snapshot.bin"
         result["snapshot_sha256"] = digest(snapshot)
         # 恢复和逐条校验在测量区间之后执行，原始文件继续保留。
         stop_server(process)
+        restart_started = time.monotonic()
         process = launch()
         wait_ready(process, port)
+        result["restart_seconds"] = time.monotonic() - restart_started
         began = time.monotonic()
         with Client(port) as client:
             for index in range(entries):
@@ -79,11 +121,16 @@ def run(server, directory, entries, interval):
                 if client.command(b"HGET", key) != value:
                     raise RuntimeError(f"recovered value differs at index={index}")
                 result["verified"] += 1
+                if result["verified"] % 100000 == 0:
+                    print(f"[every={interval}] verified={result['verified']}/{entries}", flush=True)
         result["verify_seconds"] = time.monotonic() - began
-        if digest(snapshot) != result["snapshot_sha256"]:
+        result["snapshot_sha256_after_restart"] = digest(snapshot)
+        result["sha256_unchanged"] = result["snapshot_sha256_after_restart"] == result["snapshot_sha256"]
+        if not result["sha256_unchanged"]:
             raise RuntimeError("recovery changed snapshot bytes")
         if (directory / "commands.aof").exists() or list(directory.glob("snapshot.bin.tmp.*")):
             raise RuntimeError("unexpected AOF or temporary snapshot file")
+        result["snapshot_bytes"] = snapshot.stat().st_size
         result["status"] = "passed"
     except BaseException as error:
         result["error"] = repr(error)
@@ -116,7 +163,13 @@ def main():
         output = Path(tempfile.mkdtemp(prefix="91kv-save-frequency-"))
     metadata = {"arguments": vars(args) | {"server": str(server), "output": str(output)},
                 "binary_sha256": digest(server), "script_sha256": digest(Path(__file__)),
-                "timing": "generation + serial writes + synchronous SAVE; recovery verification afterward"}
+                "timing": {"write_seconds": "key/value generation + serial HSET round trips + SAVE accepted replies; no per-SAVE completion wait",
+                    "drain_seconds": "after final SAVE reply until SAVEINFO idle and pending=0",
+                    "total_seconds": "write_seconds + drain_seconds; excludes startup/recovery/verification",
+                    "write_qps": "entries / write_seconds", "end_to_end_qps": "entries / total_seconds",
+                    "hset_latency_ms": "perf_counter_ns around Client.command(HSET): encoding/send/full reply; excludes generation and SAVE; nearest-rank P50/P99",
+                    "total_fork_ms": "parent foreground fork time from SAVEINFO",
+                    "total_save_ms": "child-reported cumulative snapshot function time; overlaps foreground writes"}}
     (output / "metadata.json").write_text(json.dumps(metadata, default=str, indent=2) + "\n")
     print(f"Evidence: {output}", flush=True)
     results = []
@@ -129,8 +182,11 @@ def main():
                 directory = output / f"round-{round_number:02d}-case-{index:02d}-every-{interval}"
                 result = run(server, directory, args.entries, interval)
                 results.append(result)
+                (output / "summary.json").write_text(json.dumps({"passed": False, "results": results}, indent=2) + "\n")
                 print(json.dumps({k: result[k] for k in
-                    ("status", "entries", "save_every", "seconds", "save_seconds", "write_qps", "verified")}), flush=True)
+                    ("status", "entries", "save_every", "write_seconds", "drain_seconds", "total_seconds",
+                     "write_qps", "end_to_end_qps", "hset_latency_ms", "triggered", "completed", "failed",
+                     "total_fork_ms", "total_save_ms", "restart_seconds", "verify_seconds", "verified", "sha256_unchanged")}), flush=True)
         success = True
     finally:
         (output / "summary.json").write_text(json.dumps({"passed": success, "results": results}, indent=2) + "\n")

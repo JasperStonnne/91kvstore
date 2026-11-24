@@ -722,3 +722,7 @@ $(BIN_DIR)/test_capture_mock: $(TEST_DIR)/mock_ebpf_capture.c \
 test-capture-faults: $(BIN_DIR)/kvstore $(BIN_DIR)/test_capture_mock
 	python3 -B $(TEST_DIR)/test_capture_replication.py . --mock-collector $(abspath $(BIN_DIR)/test_capture_mock)
 	python3 -B $(TEST_DIR)/test_capture_faults.py .
+
+.PHONY: test-background-save
+test-background-save: $(BIN_DIR)/kvstore $(BIN_DIR)/test_kvstore_snapshot_fault
+	python3 -B $(TEST_DIR)/test_background_save.py

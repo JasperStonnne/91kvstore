@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """启动独立的 KVStore，检查基础命令和现有流水线测试。"""
 
+from snapshot_helpers import save_info, wait_save
 import os
 from pathlib import Path
 import shutil
@@ -634,6 +635,7 @@ def test_resp2_save(port, test_dir):
     with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
         connection.settimeout(3)
         with connection.makefile("rb") as replies:
+            before_save = save_info(port)
             connection.sendall(b"*1\r\n$4\r\nSAVE\r\n")
             save_reply = replies.readline()
 
@@ -644,6 +646,7 @@ def test_resp2_save(port, test_dir):
         raise TestFailure(f"RESP2 SAVE returned {save_reply!r}")
     if wrong_arity != b"-ERR wrong number of arguments for SAVE\r\n":
         raise TestFailure(f"RESP2 SAVE wrong arity returned {wrong_arity!r}")
+    wait_save(port, int(before_save["completed"]), int(before_save["failed"]))
     if not (test_dir / "snapshot.bin").is_file():
         raise TestFailure("RESP2 SAVE did not create snapshot.bin")
 

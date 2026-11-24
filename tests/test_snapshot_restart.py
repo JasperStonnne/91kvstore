@@ -1,3 +1,4 @@
+from snapshot_helpers import save_snapshot, save_info, wait_save
 import shutil
 import socket
 import subprocess
@@ -78,7 +79,7 @@ def test_record_recovery(directory, port):
         for key in (b"first", b"middle", b"last"):
             assert command(port, b"SET", key, b"value") == b"OK"
         assert command(port, b"HSET", b"other_engine", b"kept") == b"OK"
-        assert command(port, b"SAVE") == b"OK"
+        assert save_snapshot(port) == b"OK"
         stop_server(process)
         process = None
         original = snapshot_path.read_bytes()
@@ -144,7 +145,7 @@ def test_record_recovery(directory, port):
         process = launch(directory)
         wait_for_server(process, port)
         assert command(port, b"GET", b"middle") == b"value"
-        assert command(port, b"SAVE") == b"OK"
+        assert save_snapshot(port) == b"OK"
         rewritten = snapshot_path.read_bytes()
         assert rewritten[12] == 0
         assert zlib.crc32(rewritten[:-4]) == int.from_bytes(rewritten[-4:], "big")
@@ -208,7 +209,7 @@ def main():
 
             assert command(port, prefix + b"DEL", b"deleted") == 1
 
-        assert command(port, b"SAVE") == b"OK"
+        assert save_snapshot(port) == b"OK"
         assert (directory / "snapshot.bin").is_file()
 
         # SAVE 后再次修改，但不再保存。
