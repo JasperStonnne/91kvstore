@@ -450,6 +450,57 @@ def verify_online_mutations(fixture):
     print("[PASS] ONLINE insertion, modification and deletion", flush=True)
 
 
+def raw_resp_case(fixture):
+    """Non-canonical valid RESP must retain its exact bytes and stream offsets."""
+    fixture.start("primary")
+    writer = Client(fixture.primary_port)
+    gate = reader = None
+    try:
+        require(writer.command("HSET", "seed", "before") == b"OK", "raw seed failed")
+        gate = SnapshotGate(fixture.primary_port)
+        fixture.start("replica", gate.port)
+        require(gate.header_ready.wait(10), "raw full-sync boundary missing")
+        gate.check()
+
+        def padded(*fields):
+            fields = [x if isinstance(x, bytes) else x.encode() for x in fields]
+            return b"*0%d\r\n" % len(fields) + b"".join(
+                b"$0%d\r\n" % len(x) + x + b"\r\n" for x in fields)
+
+        value = b"first value\r\nx"
+        raw_first = padded("HSET", "raw_first", value)
+        raw_large = padded("HSET", "raw_large", b"x" * 5000)
+        failed = padded("HMOD", "missing", "ignored")
+        writer.sock.sendall(raw_first + failed + raw_large[:-2])
+        require(writer.reply() == b"OK", "raw pipeline write failed")
+        require(writer.file.readline() == b"-ERR key not found\r\n", "failed write unexpectedly succeeded")
+        writer.sock.sendall(raw_large[-2:])
+        require(writer.reply() == b"OK", "fragmented raw write failed")
+        expected = raw_first + raw_large
+        gate.release.set()
+        fixture.online()
+        reader = Client(fixture.replica_port)
+        require(reader.command("HGET", "raw_first") == value, "raw embedded CRLF differs")
+        require(reader.command("HGET", "raw_large") == b"x" * 5000, "raw large value differs")
+        end = gate.stream_offset + len(expected)
+        require(gate.forwarded_bytes == len(expected) + len(f"ONLINE {end}\r\n".encode()),
+                "raw RESP was re-encoded or failed/partial frame advanced the stream")
+        log = (fixture.root / "replica/server.log").read_text()
+        ranges = [tuple(map(int, pair)) for pair in re.findall(r"applied range=\[(\d+),(\d+)\)", log)]
+        require(ranges == [(gate.stream_offset, gate.stream_offset + len(raw_first)),
+                           (gate.stream_offset + len(raw_first), end)], "raw byte offsets changed")
+        assert_tcp_catchup_only(fixture, gate)
+        assert_rdma_snapshot(fixture)
+        gate.check()
+        print("[PASS] raw RESP: leading-zero lengths preserved, pipelined/fragmented frames, failed write excluded, CRLF/large values, exact offsets", flush=True)
+    finally:
+        if reader is not None:
+            reader.close()
+        writer.close()
+        if gate is not None:
+            gate.close()
+
+
 def exact_chunk_case(fixture):
     """恰好 1 MiB 的快照：最终块不能多发，也不能等一个不存在的下一块。"""
     fixture.start("primary")
@@ -1081,6 +1132,7 @@ def main():
             ("empty", empty_case),
             ("corrupt_snapshot", corrupt_snapshot_case),
             ("exact_chunk", exact_chunk_case),
+            ("raw_resp", raw_resp_case),
             ("catchup", catchup_case),
             ("restart", restart_case),
             ("interrupted_restart", interrupted_restart_case),
@@ -1101,7 +1153,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] RDMA acceptance scenarios: 15 passed; owned server processes stopped", flush=True)
+        print("[PASS] RDMA acceptance scenarios: 16 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

@@ -362,6 +362,7 @@ int kvs_filter_protocol(
     char *response,
     int response_capacity,
     kvs_command_source_t source,
+    kvs_slice_t raw_command,
     kvs_exec_status_t *status)
 {
 
@@ -649,29 +650,39 @@ int kvs_filter_protocol(
         }
 
         if (primary_client_write) {
-            kvs_slice_t fields[3];
-            for (int i = 0; i < count; i++) {
-                fields[i].data = tokens[i];
-                fields[i].length = strlen(tokens[i]);
-            }
+            if (raw_command.data != NULL && raw_command.length > 0 &&
+                raw_command.data[0] == '*') {
+                /* 借用当前已解析帧；提交探针和缓存复制均在输入缓冲消费前完成。 */
+                if (kvs_replication_advance_stream(raw_command.data, raw_command.length) < 0) {
+                    fprintf(stderr, "failed to record replication command\n");
+                    exit(EXIT_FAILURE);
+                }
+            } else {
+                /* 未提供原始 RESP（如旧式 inline 调用）时，仍编码为标准 RESP。 */
+                kvs_slice_t fields[3];
+                for (int i = 0; i < count; i++) {
+                    fields[i].data = tokens[i];
+                    fields[i].length = strlen(tokens[i]);
+                }
 
-            size_t encoded_capacity;
-            if (kvs_encoded_command_size(fields, (size_t)count, &encoded_capacity) < 0) {
-                fprintf(stderr, "failed to size replication command\n");
-                exit(EXIT_FAILURE);
-            }
+                size_t encoded_capacity;
+                if (kvs_encoded_command_size(fields, (size_t)count, &encoded_capacity) < 0) {
+                    fprintf(stderr, "failed to size replication command\n");
+                    exit(EXIT_FAILURE);
+                }
 
-            char *encoded = kvs_malloc(encoded_capacity);
-            size_t encoded_bytes;
-            if (encoded == NULL ||
-                kvs_encode_command(fields, (size_t)count, encoded,
-                                   encoded_capacity, &encoded_bytes) < 0 ||
-                kvs_replication_advance_stream(encoded, encoded_bytes) < 0) {
+                char *encoded = kvs_malloc(encoded_capacity);
+                size_t encoded_bytes;
+                if (encoded == NULL ||
+                    kvs_encode_command(fields, (size_t)count, encoded,
+                                       encoded_capacity, &encoded_bytes) < 0 ||
+                    kvs_replication_advance_stream(encoded, encoded_bytes) < 0) {
+                    kvs_free(encoded);
+                    fprintf(stderr, "failed to record replication command\n");
+                    exit(EXIT_FAILURE);
+                }
                 kvs_free(encoded);
-                fprintf(stderr, "failed to record replication command\n");
-                exit(EXIT_FAILURE);
             }
-            kvs_free(encoded);
         }
     }
 
@@ -686,6 +697,7 @@ static int kvs_execute_tokens(
     char *response,
     int response_capacity,
     kvs_command_source_t source,
+    kvs_slice_t raw_command,
     kvs_exec_status_t *status)
 {
     if (tokens == NULL || count <= 0 ||
@@ -693,7 +705,7 @@ static int kvs_execute_tokens(
         return -1;
     }
         int response_length = kvs_filter_protocol(
-        tokens, count, response, response_capacity, source, status
+        tokens, count, response, response_capacity, source, raw_command, status
     );
 
     if (response_length < 0) {
@@ -813,6 +825,7 @@ static int kvs_execute_fields(
     size_t field_count,
     kvs_output_buffer_t *response,
     kvs_command_source_t source,
+    kvs_slice_t raw_command,
     kvs_exec_status_t *execution_status)
 {
     char *tokens[KVS_MAX_TOKENS] = {0};
@@ -1117,6 +1130,7 @@ static int kvs_execute_fields(
         reply_data,      /* 本条回复从已有数据末尾写入。 */
         reply_capacity,  /* 只能使用剩余空间。 */
         source,
+        raw_command,
         &exec_status
     );
     if (execution_status != NULL && result >= 0) {
@@ -1267,6 +1281,7 @@ static int kvs_recovery_fields_protocol(
         field_count,
         &output,
         KVS_COMMAND_SOURCE_RECOVERY,
+        (kvs_slice_t){0},
         &execution_status
     );
 
@@ -1299,6 +1314,7 @@ static int kvs_replication_command_protocol(
         field_count,
         &output,
         KVS_COMMAND_SOURCE_REPLICATION,
+        (kvs_slice_t){0},
         &execution_status
     );
 
@@ -1370,6 +1386,7 @@ static int kvs_network_protocol(
         field_count,
         response,
         KVS_COMMAND_SOURCE_CLIENT,
+        (kvs_slice_t){.data = msg, .length = parsed_bytes},
         NULL
 );
         /*

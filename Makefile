@@ -287,6 +287,7 @@ clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
 
 UNIT_TEST_TARGETS := \
+    test-raw-commit \
     test-process-target \
     test-capture-cache \
     test-ebpf-state \
@@ -745,3 +746,15 @@ $(BIN_DIR)/test_process_target: $(TEST_DIR)/test_process_target.c \
 .PHONY: test-process-target-cli
 test-process-target-cli: $(BIN_DIR)/kvstore $(BIN_DIR)/ebpf_capture
 	python3 -B $(TEST_DIR)/test_process_target_cli.py
+
+.PHONY: test-raw-commit
+test-raw-commit: $(BIN_DIR)/test_raw_commit
+	./$(BIN_DIR)/test_raw_commit
+
+$(BIN_DIR)/test_raw_commit: $(TEST_DIR)/test_raw_commit.c $(SRC_DIR)/kvstore.c \
+    $(filter-out $(BUILD_DIR)/kvstore.o,$(OBJS)) $(NTYCO_DIR)/libntyco.a \
+    $(wildcard $(INCLUDE_DIR)/*.h) | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(TEST_DIR)/test_raw_commit.c \
+		$(filter-out $(BUILD_DIR)/kvstore.o,$(OBJS)) $(LDFLAGS) $(LDLIBS) -luring \
+		-Wl,--wrap=kvs_replication_advance_stream \
+		-Wl,--wrap=kvs_encoded_command_size -Wl,--wrap=kvs_encode_command -o $@
