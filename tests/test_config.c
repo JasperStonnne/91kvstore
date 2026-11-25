@@ -574,19 +574,19 @@ static void test_capture_port(void)
     snprintf(text, sizeof(text), "%sreplication_incremental_mode=ebpf\nreplication_capture_port=29005\n", base);
     kvs_config_t config = load_valid(text);
     assert(config.replication_capture_port == 29005);
-    const char *bad[] = { "0", "65536", "-1", "abc", "29000", "29747" };
+    const char *bad[] = { "0", "65536", "-1", "abc" };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         snprintf(text, sizeof(text), "%sreplication_incremental_mode=ebpf\nreplication_capture_port=%s\n", base, bad[i]);
         expect_invalid("invalid/conflicting capture port", text, "replication_capture_port");
     }
     snprintf(text, sizeof(text), "%sreplication_incremental_mode=ebpf\n", base);
-    expect_invalid("missing capture port", text, "replication_capture_port");
+    assert(load_valid(text).replication_capture_port == 0);
     snprintf(text, sizeof(text), "%sreplication_capture_port=29005\n", base);
-    expect_invalid("socket cannot configure capture port", text, "replication_capture_port");
+    assert(load_valid(text).replication_capture_port == 29005);
     snprintf(text, sizeof(text), "%sreplication_capture_socket=/tmp/removed.sock\n", base);
     expect_invalid("removed Unix setting", text, "unknown");
     expect_invalid("standalone capture port", "role=standalone\nservice_port=29000\npersistence_mode=none\nreplication_capture_port=29005\n", "role=primary");
-    puts("capture port defaults, ebpf-only, conflicts and removed Unix setting passed");
+    puts("capture mode without port, ignored legacy port and removed Unix setting passed");
 }
 
 int main(void)

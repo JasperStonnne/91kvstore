@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import socket
 import struct
 import subprocess
 import tempfile
@@ -34,7 +35,7 @@ class Fixture(rdma.Fixture):
         if directory.name == "primary":
             config += f"replication_incremental_mode={self.mode}\n"
             if self.mode == "ebpf":
-                config += f"replication_capture_port={self.capture_port}\n"
+                config += "# active push: no replication_capture_port required\n"
         return super().launch(directory, config)
 
 
@@ -53,6 +54,15 @@ def run(repo, root, mode, mock_collector, fault=None):
             temporary = root / "state.next"
             temporary.write_text(" ".join(map(str, fields)) + "\n")
             temporary.replace(str(mock_events) + ".state")
+
+    def ready():
+        if not mock_collector or mode != "ebpf": return
+        # 发布的事件模拟同一个生产就绪探针；先等 Primary 两条件齐备。
+        fixture.wait(lambda: f"endpoint={rdma.TEST_HOST}:{fixture.replica_port}" in
+            (root / "primary/server.log").read_text(), "Primary did not publish push readiness", timeout=10)
+        with Path(str(mock_events) + ".ready").open("ab") as stream:
+            stream.write(struct.pack("=IHH16s40s40sQ", 1, fixture.replica_port, 0,
+                rdma.TEST_HOST.encode(), gate.primary_id, gate.full_sync_id, gate.stream_offset))
 
     def emit(command, captured=True):
         nonlocal offset
@@ -80,14 +90,13 @@ def run(repo, root, mode, mock_collector, fault=None):
             if mock_collector:
                 mock_log = (root / "capture.log").open("wb")
                 collector = subprocess.Popen(
-                    [str(mock_collector), str(primary.pid), str(mock_events),
-                     "--listen", f"{rdma.TEST_HOST}:{fixture.capture_port}"],
+                    [str(mock_collector), str(primary.pid), str(mock_events)],
                     stdout=mock_log, stderr=mock_log)
-                fixture.wait(lambda: "capture TCP listening" in (root / "capture.log").read_text() or
+                fixture.wait(lambda: "capture push client ready" in (root / "capture.log").read_text() or
                              collector.poll() is not None, "capture did not listen", timeout=10)
                 assert collector.poll() is None, (root / "capture.log").read_text()
             else:
-                collector = Collector(repo, primary.pid, fixture.capture_port, root / "capture.log", fixture)
+                collector = Collector(repo, primary.pid, None, root / "capture.log", fixture)
 
         writer = rdma.Client(fixture.primary_port)
         seed = ("HSET", "color", "blue")
@@ -100,18 +109,22 @@ def run(repo, root, mode, mock_collector, fault=None):
         assert gate.header_ready.wait(10)
         gate.check()
         assert gate.stream_offset == offset == 35
-        assert gate.capture_port == (fixture.capture_port if mode == "ebpf" else 0)
+        assert gate.capture_port == (1 if mode == "ebpf" else 0)
         publish()
         commands = [("HMOD", "color", "green"), ("HSET", "extra", "value")]
+        if fault == "bulk":
+            commands += [("HSET", f"bulk{i}", "b" * 2000) for i in range(60)]
         for command in commands:
             assert writer.command(*command) == b"OK"
             emit(command, captured=not (mock_collector and mode == "ebpf"))
+        initial_target = offset
         writer.sock.sendall(rdma.frame("HMOD", "missing", "ignored"))
         assert writer.file.readline() == b"-ERR key not found\r\n"
         gate.release.set()
         primary_log = root / "primary/server.log"
         replica_log = root / "replica/server.log"
         if mock_collector and mode == "ebpf" and fault != "unavailable":
+            ready()
             fixture.wait(lambda: "capture connected" in replica_log.read_text(),
                          "Replica did not connect after full load", timeout=10)
             time.sleep(0.1)
@@ -131,7 +144,7 @@ def run(repo, root, mode, mock_collector, fault=None):
             reader = rdma.Client(fixture.replica_port)
             assert reader.command("HGET", "color") == b"green"
             assert reader.command("HGET", "extra") == b"value"
-            expected = b"".join(rdma.frame(*cmd) for cmd in commands) + b"ONLINE 107\r\n"
+            expected = b"".join(rdma.frame(*cmd) for cmd in commands) + f"ONLINE {initial_target}\r\n".encode()
             assert gate.wire == (expected if mode == "socket" else b"")
             live = ("HMOD", "color", "online")
             assert writer.command(*live) == b"OK"
@@ -152,7 +165,7 @@ def run(repo, root, mode, mock_collector, fault=None):
                       re.findall(r"applied range=\[(\d+),(\d+)\)", replica_log.read_text())]
             assert ranges == emitted[1:], (ranges, emitted[1:])
             if mode == "ebpf":
-                assert "capture TCP ONLINE offset=107" in (root / "capture.log").read_text()
+                assert f"capture TCP ONLINE offset={initial_target}" in (root / "capture.log").read_text()
                 assert "hand off increment to capture" in primary_log.read_text()
                 assert "start cache catch-up" not in primary_log.read_text()
                 if fault == "control-drop":
@@ -218,17 +231,17 @@ def run(repo, root, mode, mock_collector, fault=None):
                 mock_log.close()
                 mock_log = None
             mock_events.write_bytes(b"")
+            Path(str(mock_events) + ".ready").unlink(missing_ok=True)
             Path(str(mock_events) + ".state").unlink(missing_ok=True)
             if mock_collector:
                 mock_log = (root / "capture-restarted.log").open("wb")
                 collector = subprocess.Popen(
-                    [str(mock_collector), str(primary.pid), str(mock_events),
-                     "--listen", f"{rdma.TEST_HOST}:{fixture.capture_port}"],
+                    [str(mock_collector), str(primary.pid), str(mock_events)],
                     stdout=mock_log, stderr=mock_log)
-                fixture.wait(lambda: "capture TCP listening" in (root / "capture-restarted.log").read_text(),
+                fixture.wait(lambda: "capture push client ready" in (root / "capture-restarted.log").read_text(),
                              "restarted collector did not listen", timeout=10)
             else:
-                collector = Collector(repo, primary.pid, fixture.capture_port,
+                collector = Collector(repo, primary.pid, None,
                                       root / "capture-restarted.log", fixture)
             gate = Gate(fixture.primary_port)
             fixture.start("replica", gate.port)
@@ -237,6 +250,7 @@ def run(repo, root, mode, mock_collector, fault=None):
             assert gate.stream_offset == offset
             publish()
             gate.release.set()
+            ready()
             fixture.online()
             reader = rdma.Client(fixture.replica_port)
             expected_color = b"green" if fault == "unavailable" else (
@@ -268,6 +282,63 @@ def run(repo, root, mode, mock_collector, fault=None):
                 mock_log.close()
 
 
+def push_timeout_and_injection(repo, root):
+    fixture = Fixture(root, repo / "bin/kvstore", "ebpf")
+    writer = reader = connection = None
+    try:
+        fixture.start("primary")
+        writer = rdma.Client(fixture.primary_port)
+        assert writer.command("HSET", "timeout_seed", "before") == b"OK"
+        fixture.start("replica", fixture.primary_port)
+        primary_log = root / "primary/server.log"
+        replica_log = root / "replica/server.log"
+        pattern = r"capture push endpoint=([^:]+):(\d+) offset=(\d+) primary=([0-9a-f]{40}) sync=([0-9a-f]{40})"
+        fixture.wait(lambda: len(re.findall(pattern, primary_log.read_text())) >= 2 and
+            replica_log.read_text().count("waiting for capture push") >= 2,
+            "capture wait did not automatically request a new full sync", timeout=15)
+        events = re.findall(pattern, primary_log.read_text())
+        assert events[0][4] != events[-1][4], "full-sync identity reused after timeout"
+        host, port, offset, primary, sync = events[-1]
+        assert "capture wait timed out" in replica_log.read_text()
+        assert "enter ONLINE" not in replica_log.read_text()
+        begin = f"BEGIN {primary} {sync} {offset}\r\n".encode()
+        rejected = [("127.0.0.2", begin),
+            (rdma.TEST_HOST, f"BEGIN {'f' * 40} {sync} {offset}\r\n".encode()),
+            (rdma.TEST_HOST, f"BEGIN {primary} {events[0][4]} {offset}\r\n".encode()),
+            (rdma.TEST_HOST, f"BEGIN {primary} {sync} {int(offset)+1}\r\n".encode())]
+        for source, message in rejected:
+            with socket.socket() as probe:
+                probe.settimeout(3); probe.bind((source, 0)); probe.connect((host, int(port)))
+                probe.sendall(message)
+                try: assert probe.recv(1) == b"", "invalid BEGIN accepted"
+                except ConnectionResetError: pass
+        connection = socket.socket(); connection.settimeout(5)
+        connection.bind((rdma.TEST_HOST, 0)); connection.connect((host, int(port)))
+        connection.sendall(begin[:6])
+        time.sleep(.02)
+        connection.sendall(begin[6:20])
+        time.sleep(.02)
+        connection.sendall(begin[20:])
+        with connection.makefile("rb") as stream:
+            assert stream.readline() == f"APPLIED {offset}\r\n".encode()
+            # A second correctly identified connection cannot replace the live link.
+            with socket.socket() as probe:
+                probe.settimeout(3); probe.bind((rdma.TEST_HOST, 0)); probe.connect((host, int(port)))
+                probe.sendall(begin)
+                try: assert probe.recv(1) == b""
+                except ConnectionResetError: pass
+            connection.sendall(f"ONLINE {offset}\r\n".encode())
+            fixture.online()
+            reader = rdma.Client(fixture.replica_port)
+            assert reader.command("HGET", "timeout_seed") == b"before"
+        print("[PASS] push admission: actual source IP, Primary/sync IDs, offset, fragmented BEGIN and unique link; 5s timeout automatically retries full sync with fresh ID and recovers ONLINE", flush=True)
+    finally:
+        if connection: connection.close()
+        if reader: reader.close()
+        if writer: writer.close()
+        fixture.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path)
@@ -278,11 +349,14 @@ def main():
     def suite(root):
         cases = [("socket", None), ("ebpf", None), ("ebpf", "unavailable"), ("ebpf", "control-drop")]
         if args.mock_collector:
-            cases.extend([("ebpf", "tail-loss"), ("ebpf", "gap")])
+            cases.extend([("ebpf", "tail-loss"), ("ebpf", "gap"), ("ebpf", "bulk")])
         for mode, fault in cases:
             directory = root / (mode + ("-" + fault if fault else ""))
             directory.mkdir(parents=True)
             run(args.repo.resolve(), directory, mode, args.mock_collector, fault)
+        directory = root / "push-timeout-injection"
+        directory.mkdir()
+        push_timeout_and_injection(args.repo.resolve(), directory)
     if args.output:
         suite(args.output.resolve())
     else:

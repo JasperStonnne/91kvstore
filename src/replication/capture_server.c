@@ -16,10 +16,12 @@
 #include <time.h>
 #include <unistd.h>
 
-enum output_kind { OUTPUT_NONE, OUTPUT_DATA, OUTPUT_ONLINE, OUTPUT_ERROR };
+enum output_kind { OUTPUT_NONE, OUTPUT_BEGIN, OUTPUT_DATA, OUTPUT_ONLINE, OUTPUT_ERROR };
 
 struct capture_peer {
     int fd;
+    int connecting;
+    int handshake;
     int requested;
     int active;
     int online;
@@ -46,6 +48,11 @@ struct capture_peer {
 
 struct capture_server {
     int listener;
+    int push_mode, have_ready, push_failed;
+    kvs_replica_ready_event_t ready;
+    uint64_t resume_applied, resume_sent, retry_ms;
+    unsigned int retry_delay;
+    char pending_error[32];
     struct capture_cache cache;
     struct kvs_ebpf_state state;
     int state_result;
@@ -132,7 +139,15 @@ static unsigned long long process_start(pid_t pid)
 static void close_peer(struct capture_server *server)
 {
     struct capture_peer *peer = &server->peer;
-    if (peer->active && peer->generation > server->retired_generation)
+    if (server->push_mode) {
+        if (peer->fd >= 0) {
+            server->resume_applied = peer->applied;
+            server->resume_sent = peer->sent;
+        }
+        server->retry_delay = server->retry_delay ? server->retry_delay * 2 : 25;
+        if (server->retry_delay > 500) server->retry_delay = 500;
+        server->retry_ms = now_ms() + server->retry_delay;
+    } else if (peer->active && peer->generation > server->retired_generation)
         server->retired_generation = peer->generation;
     if (peer->fd >= 0)
         close(peer->fd);
@@ -142,6 +157,11 @@ static void close_peer(struct capture_server *server)
 static void fail_peer(struct capture_server *server, const char *reason)
 {
     struct capture_peer *peer = &server->peer;
+    if (server->push_mode && !peer->active && !peer->closing) {
+        snprintf(server->pending_error, sizeof(server->pending_error), "%s", reason);
+        return; /* BEGIN / APPLIED 身份校验后才发送 ERROR。 */
+    }
+    if (server->push_mode) server->push_failed = 1;
     if (peer->fd < 0 || peer->closing)
         return;
     fprintf(stderr, "capture TCP error=%s sent=%" PRIu64 " applied=%" PRIu64 "\n",
@@ -270,9 +290,43 @@ static int valid_applied(const struct capture_cache *cache, uint64_t from, uint6
     return from == to;
 }
 
+static void push_applied(struct capture_server *server, const char *line)
+{
+    struct capture_peer *peer = &server->peer;
+    uint64_t offset;
+    if (!peer->handshake || strncmp(line, "APPLIED ", 8) || parse_offset(line + 8, &offset) < 0 ||
+        offset < peer->applied || offset > peer->sent) {
+        peer->active = 1;
+        fail_peer(server, "INVALID_APPLIED");
+        return;
+    }
+    peer->active = 1;
+    int match = server->state_result == 0 ? kvs_ebpf_match_boundary(&server->state,
+        peer->primary_id, peer->sync_id, peer->snapshot) : -ESTALE;
+    if (match < 0 || server->pending_error[0] || !server->cache.valid ||
+        peer->applied < server->cache.start || offset > server->cache.end ||
+        !valid_applied(&server->cache, peer->applied, offset)) {
+        fail_peer(server, server->pending_error[0] ? server->pending_error :
+            match == -ENODATA ? "CAPTURE_LOSS" : "NEED_FULLSYNC");
+        return;
+    }
+    capture_cache_discard(&server->cache, offset);
+    peer->sent = peer->applied = offset;
+    peer->target = server->state.stream_end;
+    peer->generation = server->generation;
+    peer->ack_ms = now_ms();
+    server->retry_delay = 0;
+    fprintf(stderr, "capture TCP BEGIN S=%" PRIu64 " resume=%" PRIu64 " target=%" PRIu64 "\n",
+            peer->snapshot, offset, peer->target);
+}
+
 static void control_line(struct capture_server *server, const char *line)
 {
     struct capture_peer *peer = &server->peer;
+    if (server->push_mode && !peer->active) {
+        push_applied(server, line);
+        return;
+    }
     if (!peer->requested) {
         char offset[21];
         int consumed = 0;
@@ -356,9 +410,13 @@ static void check_session(struct capture_server *server, uint64_t now)
         return;
     }
     if (!peer->active) {
-        try_begin(server);
-        if (!peer->active && now - peer->accepted_ms >= KVS_CAPTURE_TIMEOUT_MS)
-            fail_peer(server, "NO_BOUNDARY");
+        if (!server->push_mode) try_begin(server);
+        if (!peer->active && now - peer->accepted_ms >= KVS_CAPTURE_TIMEOUT_MS) {
+            if (server->push_mode) {
+                server->push_failed = 1;
+                close_peer(server); /* 未完成身份确认，不能插入 ERROR。 */
+            } else fail_peer(server, "NO_BOUNDARY");
+        }
         return;
     }
     if (server->state_result < 0) {
@@ -422,6 +480,14 @@ static int prepare_output(struct capture_server *server)
 static void write_frames(struct capture_server *server)
 {
     struct capture_peer *peer = &server->peer;
+    if (peer->connecting) {
+        int error = 0; socklen_t size = sizeof(error);
+        if (getsockopt(peer->fd, SOL_SOCKET, SO_ERROR, &error, &size) < 0 || error) {
+            close_peer(server);
+            return;
+        }
+        peer->connecting = 0;
+    }
     /* 有上限的非阻塞发送；下轮必须回去继续消费 BPF。 */
     for (unsigned int budget = 0; budget < 16 && peer->fd >= 0; budget++) {
         if (!peer->output_length && !prepare_output(server))
@@ -447,6 +513,7 @@ static void write_frames(struct capture_server *server)
             close_peer(server);
             return;
         }
+        if (peer->output_kind == OUTPUT_BEGIN) peer->handshake = 1;
         if (peer->output_kind == OUTPUT_DATA) {
             if (peer->sent == peer->applied)
                 peer->ack_ms = now_ms();
@@ -496,14 +563,89 @@ static void report_stats(const struct capture_server *server)
             (uint64_t)server->state.failures.read_error, server->state_result);
 }
 
-int capture_server_run(const char *endpoint, pid_t primary_pid,
+static void push_ready(struct capture_server *server)
+{
+    for (unsigned int budget = 0; budget < 16; budget++) {
+        kvs_replica_ready_event_t event;
+        int result = kvs_ebpf_read_ready(&event);
+        if (result <= 0) {
+            if (result < 0) { server->source_changed = 1; fail_peer(server, "READY_SOURCE_ERROR"); }
+            return;
+        }
+        struct in_addr address;
+        if (event.version != KVS_EBPF_EVENT_VERSION || !event.replica_port ||
+            !memchr(event.replica_ip, '\0', sizeof(event.replica_ip)) ||
+            inet_pton(AF_INET, event.replica_ip, &address) != 1)
+            continue;
+        char primary[41], sync[41];
+        memcpy(primary, event.primary_id, 40); primary[40] = '\0';
+        memcpy(sync, event.full_sync_id, 40); sync[40] = '\0';
+        if (strspn(primary, "0123456789abcdef") != 40 || strspn(sync, "0123456789abcdef") != 40)
+            continue;
+        if (server->state_result == 0 &&
+            kvs_ebpf_match_boundary(&server->state, primary, sync, event.stream_offset) == -ESTALE)
+            continue;
+        if (server->have_ready && !memcmp(&event, &server->ready, sizeof(event))) continue;
+        close_peer(server);
+        server->ready = event;
+        server->have_ready = 1;
+        server->push_failed = 0;
+        server->pending_error[0] = '\0';
+        server->resume_applied = server->resume_sent = event.stream_offset;
+        server->retry_delay = 0;
+        server->retry_ms = 0;
+        fprintf(stderr, "capture push ready %s:%u S=%" PRIu64 "\n", event.replica_ip,
+                event.replica_port, (uint64_t)event.stream_offset);
+    }
+}
+
+static void push_connect(struct capture_server *server)
+{
+    if (!server->have_ready || server->push_failed || server->peer.fd >= 0 ||
+        now_ms() < server->retry_ms || server->state_result != 0)
+        return;
+    const kvs_replica_ready_event_t *event = &server->ready;
+    char primary[41], sync[41];
+    memcpy(primary, event->primary_id, 40); primary[40] = '\0';
+    memcpy(sync, event->full_sync_id, 40); sync[40] = '\0';
+    int match = kvs_ebpf_match_boundary(&server->state, primary, sync, event->stream_offset);
+    if (match < 0 && match != -ENODATA) return;
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(event->replica_port)};
+    if (inet_pton(AF_INET, event->replica_ip, &address.sin_addr) != 1) return;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { server->retry_ms = now_ms() + 500; return; }
+    int enabled = 1, idle = 5, interval = 1, count = 3;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) < 0) {
+        close(fd); server->retry_ms = now_ms() + 500; return;
+    }
+    int result = connect(fd, (struct sockaddr *)&address, sizeof(address));
+    if (result < 0 && errno != EINPROGRESS) {
+        close(fd); server->retry_ms = now_ms() + 100; return;
+    }
+    struct capture_peer *peer = &server->peer;
+    *peer = (struct capture_peer){.fd = fd, .requested = 1, .connecting = result < 0,
+        .snapshot = event->stream_offset, .sent = server->resume_sent,
+        .applied = server->resume_applied, .accepted_ms = now_ms()};
+    memcpy(peer->primary_id, event->primary_id, 40);
+    memcpy(peer->sync_id, event->full_sync_id, 40);
+    peer->output_kind = OUTPUT_BEGIN;
+    peer->output_length = (size_t)snprintf(peer->output, sizeof(peer->output),
+        "BEGIN %s %s %" PRIu64 "\r\n", peer->primary_id, peer->sync_id, peer->applied);
+}
+
+static int capture_run(const char *endpoint, pid_t primary_pid,
                         const volatile sig_atomic_t *stopping)
 {
     struct capture_server server = { .listener = -1, .peer = { .fd = -1 } };
     if (capture_cache_init(&server.cache, KVS_EBPF_CACHE_BYTES, 0) < 0)
         return -1;
-    server.listener = listen_endpoint(endpoint);
-    if (server.listener < 0) {
+    server.push_mode = endpoint == NULL;
+    if (endpoint) server.listener = listen_endpoint(endpoint);
+    if (endpoint && server.listener < 0) {
         int saved = errno;
         capture_cache_destroy(&server.cache);
         errno = saved;
@@ -516,7 +658,8 @@ int capture_server_run(const char *endpoint, pid_t primary_pid,
         errno = ESRCH;
         return -1;
     }
-    fprintf(stderr, "capture TCP listening %s\n", endpoint);
+    if (endpoint) fprintf(stderr, "capture TCP listening %s\n", endpoint);
+    else fprintf(stderr, "capture push client ready\n");
     uint64_t reported_ms = 0;
     int status = 0, saved_errno = 0;
     while (!*stopping) {
@@ -535,6 +678,7 @@ int capture_server_run(const char *endpoint, pid_t primary_pid,
             saved_errno = -events;
             break;
         }
+        if (server.push_mode) { push_ready(&server); push_connect(&server); }
         uint64_t now = now_ms();
         check_session(&server, now);
         if (now - reported_ms >= 1000) {
@@ -558,6 +702,7 @@ int capture_server_run(const char *endpoint, pid_t primary_pid,
              (!server.peer.online && server.peer.sent == server.peer.target &&
               server.peer.applied == server.peer.target))))
             fds[1].events |= POLLOUT;
+        if (server.push_mode && server.peer.output_length) fds[1].events |= POLLOUT;
         /* 无数据时睡 1ms；读/写/采集都有预算，慢客户端不能阻塞采集。 */
         int result = poll(fds, 2, 1);
         if (result < 0 && errno != EINTR) {
@@ -581,4 +726,13 @@ int capture_server_run(const char *endpoint, pid_t primary_pid,
     if (status < 0)
         errno = saved_errno;
     return status;
+}
+
+int capture_server_run(const char *endpoint, pid_t pid, const volatile sig_atomic_t *stopping)
+{
+    return capture_run(endpoint, pid, stopping);
+}
+int capture_client_run(pid_t pid, const volatile sig_atomic_t *stopping)
+{
+    return capture_run(NULL, pid, stopping);
 }

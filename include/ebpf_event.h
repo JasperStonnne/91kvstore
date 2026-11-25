@@ -37,4 +37,16 @@ struct kvs_ebpf_snapshot_boundary {
     unsigned char full_sync_id[KVS_EBPF_ID_BYTES];
 };
 
+/* 独立就绪 ring 的固定 ABI：IPv4 文本、主机序端口、两份精确 40 字节身份。 */
+typedef struct kvs_replica_ready_event {
+    __u32 version;
+    __u16 replica_port;
+    __u16 reserved;
+    char replica_ip[16];
+    unsigned char primary_id[KVS_EBPF_ID_BYTES];
+    unsigned char full_sync_id[KVS_EBPF_ID_BYTES];
+    __u64 stream_offset;
+} kvs_replica_ready_event_t;
+_Static_assert(sizeof(kvs_replica_ready_event_t) == 112, "ready event ABI must be 112 bytes");
+
 #endif

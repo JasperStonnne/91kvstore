@@ -17,18 +17,33 @@
 void *kvs_malloc(size_t size) { return malloc(size); }
 void kvs_free(void *ptr) { free(ptr); }
 
-/* 网络替身保留会话回调，单测可模拟取消后的迟到通知。 */
-static kvs_dynamic_connector_config_t dynamic_config;
-static int dynamic_starts;
-int ntyco_connect_dynamic(const kvs_dynamic_connector_config_t *config, kvs_dynamic_connector_t **handle)
+/* 接收路径使用真实协议回调；仅替换网络身份和单调时钟。 */
+#include <arpa/inet.h>
+#include <sys/syscall.h>
+#include <time.h>
+static long long advance_ms;
+static int wrong_peer;
+void ntyco_shutdown_connection(int fd) { (void)fd; }
+int getpeername(int fd, struct sockaddr *address, socklen_t *size)
 {
-    dynamic_config = *config;
-    *handle = (kvs_dynamic_connector_t *)&dynamic_config;
-    dynamic_starts++;
+    (void)fd;
+    assert(*size >= sizeof(struct sockaddr_in));
+    struct sockaddr_in *peer = (struct sockaddr_in *)address;
+    *peer = (struct sockaddr_in){.sin_family = AF_INET};
+    assert(inet_pton(AF_INET, wrong_peer ? "127.0.0.2" : "127.0.0.1", &peer->sin_addr) == 1);
+    *size = sizeof(*peer);
     return 0;
 }
-void ntyco_cancel_dynamic(kvs_dynamic_connector_t **handle) { *handle = NULL; }
-void ntyco_shutdown_connection(int fd) { (void)fd; }
+int clock_gettime(clockid_t clock_id, struct timespec *now)
+{
+    int result = (int)syscall(SYS_clock_gettime, clock_id, now);
+    if (result == 0 && clock_id == CLOCK_MONOTONIC) {
+        now->tv_sec += advance_ms / 1000;
+        now->tv_nsec += (advance_ms % 1000) * 1000000;
+        if (now->tv_nsec >= 1000000000) { now->tv_sec++; now->tv_nsec -= 1000000000; }
+    }
+    return result;
+}
 
 static const char snapshot[] = "opaque-snapshot-bytes";
 static const char sync_id[] = "abcdef0123456789abcdef0123456789abcdef01";
@@ -220,10 +235,12 @@ int kvs_rdma_listener_close(kvs_rdma_listener_t **listener)
 static kvs_connector_config_t setup(void)
 {
     installed = applied = starts = 0;
+    advance_ms = wrong_peer = 0;
     disconnect_before_ack = transport_closes = 0;
     install_fail = apply_fail = 0;
     assert(kvs_replication_init(KVS_ROLE_REPLICA, "127.0.0.1", 29000,
                                 verify_snapshot, apply_command) == 0);
+    assert(kvs_replication_set_service_port(29001) == 0);
     kvs_connector_config_t connector = {0};
     assert(kvs_replication_build_connector_config(&connector) == 0);
     char output[256];
@@ -480,104 +497,96 @@ static void test_finish_handshake(void)
 }
 
 
-static kvs_connector_config_t capture_replica(void)
-{
-    advertised_capture_port = 29005;
-    int before = dynamic_starts;
-    kvs_connector_config_t control = loaded_replica();
-    assert(dynamic_starts == before); /* 加载及最终 ACK 都不能提前连接采集端。 */
-    char output[256];
-    assert(control.stream_handler(123, output, sizeof(output)) == 0);
-    assert(dynamic_starts == before + 1 && transport.disconnected);
-    assert(dynamic_config.port == 29005 && !strcmp(dynamic_config.host, "127.0.0.1"));
-    int length = dynamic_config.opened(dynamic_config.context, dynamic_config.session,
-                                        456, output, sizeof(output));
-    char expected[128];
-    snprintf(expected, sizeof(expected), "BEGIN 0123456789abcdef0123456789abcdef01234567 %s 112\r\n", sync_id);
-    assert(length == (int)strlen(expected) && !memcmp(output, expected, (size_t)length));
-    return control;
-}
-
-static int capture_feed(kvs_dynamic_connector_config_t *config, char *input, int length,
-                         char *output, int *consumed)
+static int capture_feed(int fd, char *input, int length, char *output, int *consumed)
 {
     kvs_output_buffer_t response = {.data = output, .capacity = 256};
-    return config->message(config->context, config->session, 456, input, length, &response, consumed);
+    return kvs_replication_capture_network_protocol(fd, input, length, &response, consumed);
 }
-
+static kvs_connector_config_t capture_replica(void)
+{
+    advertised_capture_port = 1;
+    kvs_connector_config_t control = loaded_replica();
+    char output[256], begin[160]; int consumed;
+    int length = snprintf(begin, sizeof(begin), "BEGIN 0123456789abcdef0123456789abcdef01234567 %s 112\r\n", sync_id);
+    assert(capture_feed(456, begin, length, output, &consumed) < 0); /* CM 尚未释放。 */
+    assert(control.stream_handler(123, output, sizeof(output)) == 0 && transport.disconnected);
+    wrong_peer = 1;
+    assert(capture_feed(456, begin, length, output, &consumed) < 0);
+    wrong_peer = 0;
+    begin[6] = 'f';
+    assert(capture_feed(456, begin, length, output, &consumed) < 0); /* Primary ID */
+    begin[6] = '0'; begin[47] = '0';
+    assert(capture_feed(456, begin, length, output, &consumed) < 0); /* sync ID */
+    begin[47] = sync_id[0];
+    for (int i = 1; i < length; i++)
+        assert(capture_feed(456, begin, i, output, &consumed) == 0 && consumed == 0);
+    int result = capture_feed(456, begin, length, output, &consumed);
+    assert(result == 13 && consumed == length && !memcmp(output, "APPLIED 112\r\n", 13));
+    assert(capture_feed(457, begin, length, output, &consumed) < 0); /* 唯一活动链路 */
+    return control;
+}
 static void test_capture_connection(void)
 {
+    char input[512], output[256], expected[64]; int consumed;
     kvs_connector_config_t control = capture_replica();
-    char input[512], output[256];
-    int consumed = 0;
-    assert(feed(&control, (char *)command, sizeof(command) - 1, &consumed) < 0);
-    int header = snprintf(input, sizeof(input), "DATA 112 %zu\r\n", sizeof(command) - 1);
-    memcpy(input + header, command, sizeof(command) - 1);
-    int length = header + sizeof(command) - 1;
-    for (int prefix = 1; prefix < length; prefix++) {
-        assert(capture_feed(&dynamic_config, input, prefix, output, &consumed) == 0);
-        assert(consumed == 0 && applied == 0);
-    }
-    int reply = capture_feed(&dynamic_config, input, length, output, &consumed);
-    char expected[64];
-    snprintf(expected, sizeof(expected), "APPLIED %zu\r\n", 112 + sizeof(command) - 1);
-    assert(reply == (int)strlen(expected) && consumed == length && applied == 1);
-    assert(!memcmp(output, expected, (size_t)reply));
-    assert(capture_feed(&dynamic_config, input, length, output, &consumed) < 0); /* 重复区间 */
-    length = snprintf(input, sizeof(input), "ONLINE %zu\r\n", 112 + sizeof(command) - 1);
-    assert(capture_feed(&dynamic_config, input, length, output, &consumed) == 0);
-    assert(consumed == length && kvs_replication_is_online());
-    kvs_dynamic_connector_config_t stale = dynamic_config;
+    int header = snprintf(input, sizeof(input), "DATA 112 %zu\r\n", sizeof(command)-1);
+    memcpy(input+header, command, sizeof(command)-1);
+    int length = header + sizeof(command)-1;
+    for (int i = 1; i < length; i++)
+        assert(capture_feed(456, input, i, output, &consumed) == 0 && consumed == 0);
+    int reply = capture_feed(456, input, length, output, &consumed);
+    snprintf(expected, sizeof(expected), "APPLIED %zu\r\n", 112+sizeof(command)-1);
+    assert(reply == (int)strlen(expected) && !memcmp(output, expected, (size_t)reply) && applied == 1);
+    kvs_replication_capture_closed(456); /* ACK 丢失，使用旧确认偏移重连。 */
+    length = snprintf(input, sizeof(input), "BEGIN 0123456789abcdef0123456789abcdef01234567 %s 112\r\n", sync_id);
+    assert(capture_feed(457, input, length, output, &consumed) == reply);
+    assert(!memcmp(output, expected, (size_t)reply) && applied == 1);
+    kvs_replication_capture_closed(456); /* 旧 FD 关闭通知不能取消新连接。 */
+    length = snprintf(input, sizeof(input), "ONLINE %zu\r\n", 112+sizeof(command)-1);
+    assert(capture_feed(457, input, length, output, &consumed) == 0 && kvs_replication_is_online());
     control.close_handler(123);
     assert(!kvs_replication_is_online());
     teardown();
 
-    /* FD 数字可复用，会话身份不可复用；旧回调不能破坏新的连接。 */
-    control = capture_replica();
-    length = snprintf(input, sizeof(input), "ONLINE 112\r\n");
-    assert(capture_feed(&dynamic_config, input, length, output, &consumed) == 0);
-    assert(kvs_replication_is_online());
-    stale.closed(stale.context, stale.session, 456);
-    assert(stale.opened(stale.context, stale.session, 456, output, sizeof(output)) < 0);
-    assert(capture_feed(&stale, input, length, output, &consumed) < 0);
-    assert(kvs_replication_is_online());
-    dynamic_config.closed(dynamic_config.context, dynamic_config.session, 456);
-    assert(!kvs_replication_is_online());
-    teardown();
-
-    static const char *bad[] = {
-        "DATA 111 1\r\nx", "DATA 113 1\r\nx", "DATA 112 65537\r\n",
-        "DATA 112 0\r\n", "DATA 112 -1\r\n", "ONLINE 113\r\n", "ERROR CAPTURE_LOSS\r\n"
-    };
-    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-        capture_replica();
-        strcpy(input, bad[i]);
-        assert(capture_feed(&dynamic_config, input, (int)strlen(input), output, &consumed) < 0);
-        assert(applied == 0 && !kvs_replication_is_online());
+    static const char *bad[] = {"DATA 111 1\r\nx", "DATA 113 1\r\nx", "DATA 112 0\r\n", "DATA 112 -1\r\n", "DATA 112 65537\r\n",
+        "ONLINE 113\r\n", "ERROR CACHE_EVICTED\r\n"};
+    for (size_t i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
+        capture_replica(); strcpy(input, bad[i]);
+        assert(capture_feed(456, input, (int)strlen(input), output, &consumed) < 0);
+        assert(!kvs_replication_is_online() && applied == 0);
         teardown();
     }
+    capture_replica();
+    header = snprintf(input, sizeof(input), "DATA 112 5\r\n");
+    memcpy(input + header, command, 5);
+    assert(capture_feed(456, input, header + 5, output, &consumed) == 0 && applied == 0);
+    header = snprintf(input, sizeof(input), "DATA 117 %zu\r\n", sizeof(command) - 6);
+    memcpy(input + header, command + 5, sizeof(command) - 6);
+    reply = capture_feed(456, input, header + sizeof(command) - 6, output, &consumed);
+    assert(reply == (int)strlen(expected) && applied == 1);
+    assert(!memcmp(output, expected, (size_t)reply));
+    /* 已应用区间不能重复执行。 */
+    header = snprintf(input, sizeof(input), "DATA 112 %zu\r\n", sizeof(command) - 1);
+    memcpy(input + header, command, sizeof(command) - 1);
+    assert(capture_feed(456, input, header + sizeof(command) - 1, output, &consumed) < 0);
+    assert(applied == 1 && !kvs_replication_is_online());
+    teardown();
     capture_replica();
     apply_fail = 1;
     header = snprintf(input, sizeof(input), "DATA 112 %zu\r\n", sizeof(command) - 1);
     memcpy(input + header, command, sizeof(command) - 1);
-    assert(capture_feed(&dynamic_config, input, header + sizeof(command) - 1, output, &consumed) < 0);
+    assert(capture_feed(456, input, header + sizeof(command) - 1, output, &consumed) < 0);
     assert(applied == 0 && !kvs_replication_is_online());
     teardown();
-
-    /* 命令可跨 DATA 帧；只有完整执行后才返回 APPLIED。 */
-    capture_replica();
-    header = snprintf(input, sizeof(input), "DATA 112 5\r\n");
-    memcpy(input + header, command, 5);
-    assert(capture_feed(&dynamic_config, input, header + 5, output, &consumed) == 0 && applied == 0);
-    strcpy(input, "ONLINE 117\r\n");
-    assert(capture_feed(&dynamic_config, input, (int)strlen(input), output, &consumed) < 0);
-    header = snprintf(input, sizeof(input), "DATA 117 %zu\r\n", sizeof(command) - 6);
-    memcpy(input + header, command + 5, sizeof(command) - 6);
-    reply = capture_feed(&dynamic_config, input, header + sizeof(command) - 6, output, &consumed);
-    assert(reply == (int)strlen(expected) && !memcmp(output, expected, (size_t)reply) && applied == 1);
+    control = capture_replica();
+    kvs_replication_capture_closed(456);
+    advance_ms = 6000;
+    kvs_replication_maintenance();
+    assert(!kvs_replication_is_online() && kvs_replication_take_fullsync_retry() == 1);
+    assert(kvs_replication_take_fullsync_retry() == 0);
     teardown();
     advertised_capture_port = 0;
-    puts("[PASS] capture Replica: delayed connect, BEGIN, split DATA, APPLIED, ONLINE, failed apply, gap/duplicate/error, stale sessions");
+    puts("[PASS] capture push: readiness/IP/IDs, split BEGIN/DATA, APPLIED, lost-ACK resume, unique link, stale FD, ERROR, timeout/fullsync");
 }
 
 int main(void)

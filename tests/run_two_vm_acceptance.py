@@ -246,8 +246,10 @@ class Gate:
             upstream.sendall(b'PING\r\n')
             require(self.line(upstream) == b'PONG\r\n', 'unexpected Primary PONG')
             downstream.sendall(b'PONG\r\n')
-            require(self.line(downstream) == b'PSYNC ? -1\r\n', 'unexpected PSYNC')
-            upstream.sendall(b'PSYNC ? -1\r\n')
+            psync = self.line(downstream)
+            require(psync.startswith(b'PSYNC ? -1 ') and psync.endswith(b'\r\n'), 'unexpected PSYNC')
+            require(0 < int(psync.split()[3]) <= 65535, 'invalid Replica service port')
+            upstream.sendall(psync)
             header = self.line(upstream)
             parts = header.split()
             require(len(parts) == 7 and parts[0] == b'FULLRESYNC_RDMA',

@@ -1,4 +1,4 @@
-"""Real RDMA socket-cache overflow; capture TCP faults live in test_capture_server.py.
+"""Real RDMA socket-cache overflow; active capture resume/eviction in test_capture_push.py; --listen diagnostics in test_capture_server.py.
 
 Actual Replica collector exit/tail loss/control loss and full-sync retry are exercised
 by test_capture_replication.py, sharing the same DATA/APPLIED production path.

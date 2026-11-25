@@ -45,6 +45,7 @@ typedef struct {
     kvs_connection_open_handler open_handler;      // 连接成功后调用
     msg_handler message_handler;                   // 收到对方数据后调用
     kvs_connection_stream_handler stream_handler; /* 处理完消息后调用；返回 WAIT 时，稍后再次调用。NULL 表示不使用。 */
+    int (*retry_handler)(void); /* 关闭后需要重新连接时返回1。 */
     kvs_connection_close_handler close_handler;    // 连接断开后调用
 } kvs_connector_config_t;
 
@@ -97,6 +98,9 @@ typedef struct {//通用监听器配置，一个监听端口绑定一个消息�
     msg_handler replication_handler;
     kvs_connection_stream_handler replication_stream_handler;
     kvs_connection_close_handler replication_close_handler;
+    msg_handler capture_handler;
+    kvs_connection_stream_handler capture_stream_handler;
+    kvs_connection_close_handler capture_close_handler;
 }kvs_listener_config_t;
 
 

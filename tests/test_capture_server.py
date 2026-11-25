@@ -1,3 +1,4 @@
+# --listen compatibility diagnostics; active client resume/eviction lives in test_capture_push.py.
 """Controlled event/map source + real TCP client; no sudo, RDMA, or Replica changes."""
 import argparse
 import hashlib

@@ -23,6 +23,9 @@ static struct bpf_object *capture_object;
 /* 保存 on_committed 与当前 Primary 成功点之间的挂载关系。 */
 static struct bpf_link *capture_link;
 static struct bpf_link *boundary_link;
+static struct bpf_link *ready_link;
+static struct ring_buffer *ready_queue;
+static kvs_replica_ready_event_t *ready_destination;
 /* 管理 ring buffer 的用户态映射。 */
 static struct ring_buffer *capture_queue;
 static int failure_map_fd = -1;
@@ -68,9 +71,29 @@ static int receive_event(void *ctx, void *data, size_t size)
     return KVS_EBPF_EVENT_READY;
 }
 
+static int receive_ready(void *ctx, void *data, size_t size)
+{
+    (void)ctx;
+    if (size != sizeof(*ready_destination) ||
+        ((kvs_replica_ready_event_t *)data)->version != KVS_EBPF_EVENT_VERSION)
+        return -EPROTO;
+    memcpy(ready_destination, data, size);
+    return KVS_EBPF_EVENT_READY;
+}
+
+int kvs_ebpf_read_ready(kvs_replica_ready_event_t *event)
+{
+    if (!event || !ready_queue) return -ENODEV;
+    ready_destination = event;
+    int result = ring_buffer__consume(ready_queue);
+    ready_destination = NULL;
+    return result == KVS_EBPF_EVENT_READY ? 1 : result < 0 ? result : 0;
+}
+
 int kvs_ebpf_is_ready(void)
 {
-    return capture_link != NULL && boundary_link != NULL && capture_queue != NULL;
+    return capture_link != NULL && boundary_link != NULL && ready_link != NULL &&
+           capture_queue != NULL && ready_queue != NULL;
 }
 
 int kvs_ebpf_get_failures(struct kvs_ebpf_failures *failures)
@@ -146,6 +169,11 @@ int kvs_ebpf_read(struct kvs_ebpf_event *event)
 void kvs_ebpf_stop(void)
 {
     /* 先解除探针挂载，再释放 BPF 对象；NULL 也可以安全清理。 */
+    bpf_link__destroy(ready_link);
+    ready_link = NULL;
+    ring_buffer__free(ready_queue);
+    ready_queue = NULL;
+    ready_destination = NULL;
     bpf_link__destroy(boundary_link);
     boundary_link = NULL;
     bpf_link__destroy(capture_link);
@@ -260,6 +288,20 @@ static int kvs_ebpf_attach(const char *object_path, pid_t pid,
         boundary_link = NULL;
         if (error == 0)
             error = -errno;
+        goto failed;
+    }
+    map_fd = bpf_object__find_map_fd_by_name(capture_object, "ready_events");
+    if (map_fd < 0) { error = map_fd; goto failed; }
+    ready_queue = ring_buffer__new(map_fd, receive_ready, NULL, NULL);
+    if (!ready_queue) { error = -errno; goto failed; }
+    program = bpf_object__find_program_by_name(capture_object, "on_replica_ready");
+    if (!program) { error = -ENOENT; goto failed; }
+    options.func_name = "kvs_replication_replica_ready";
+    ready_link = bpf_program__attach_uprobe_opts(program, pid, executable, 0, &options);
+    error = libbpf_get_error(ready_link);
+    if (!ready_link || error) {
+        ready_link = NULL;
+        if (!error) error = -errno;
         goto failed;
     }
     return 0;

@@ -54,6 +54,11 @@ static void test_invalid_prefix(void)
 
 int main(void)
 {
+    static const char begin[] = "BEGIN ";
+    for (size_t i = 1; i < sizeof(begin) - 1; i++)
+        assert(kvs_identify_connection(begin, i) == KVS_CONNECTION_NEED_MORE);
+    assert(kvs_identify_connection(begin, sizeof(begin) - 1) == KVS_CONNECTION_CAPTURE);
+    assert(kvs_identify_connection("BEGIX", 5) == KVS_CONNECTION_INVALID);
     test_client_prefix();
     test_replica_handshake();
     test_coalesced_handshake();

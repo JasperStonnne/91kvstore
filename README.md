@@ -292,7 +292,7 @@ ONLINE          继续从同一复制 offset 发送实时增量
 ### RDMA 现状
 
 - 已有数据的全量快照只走 RDMA；握手、控制通知和增量仍走 TCP。
-- 无自动重连或断点续传；失败后需重新启动 Replica，从当前 Primary 重新全量，不接着半份快照传输。
+- RDMA 全量失败不续传半份快照；eBPF 增量支持缓存范围内的断线续传，等待采集接入超时会自动重做全量。
 - 开发机使用 Soft-iWARP（`siw0`），已有软件环境下的功能验收和整阶段测量，不代表物理 RDMA 网卡性能。
 - 构建需安装 `librdmacm-dev libibverbs-dev`；验收还需 `rdmacm-utils ibverbs-utils iproute2`。
 - Primary 配置 `role=primary`、iWARP IPv4 的 `bind_ip`、`service_port` 和必填 `rdma_port`。
@@ -307,51 +307,52 @@ ONLINE          继续从同一复制 offset 发送实时增量
 Primary 和 Replica 都用 `bin/kvstore`。两端可配 `persistence_mode = none`。只在 Primary 的配置中选择增量来源：
 
 - `replication_incremental_mode = socket` 是默认值，由 Primary 持有 8 MiB 缓存。
-- `replication_incremental_mode = ebpf` 由独立采集进程持有 8 MiB 缓存，Primary 不分配自己的复制缓存。Primary 必须配置 `replication_capture_port = 29005`，端口不得与 `service_port`、`rdma_port` 冲突；该字段不用于 socket 模式或 Replica 配置。旧的 `replication_capture_socket` 已移除，继续配置会明确报错。
+- `replication_incremental_mode = ebpf` 由独立采集进程持有 8 MiB 缓存，Primary 不分配自己的复制缓存。不再需要 `replication_capture_port`；Primary 的该旧字段仍可解析但不使用。旧的 `replication_capture_socket` 已移除，继续配置会明确报错。
 
-先启动 Primary，再启动采集进程；看到探针挂载和 `capture TCP listening` 后才启动 Replica。采集进程的监听地址须是 Replica 可访问的 Primary IPv4，端口与 Primary 配置一致：
+先启动 Primary，再启动采集进程；看到探针挂载和 `capture push client ready` 后启动 Replica。采集端默认不监听端口，收到全量完成就绪事件后主动连接 Replica 的 service_port：
 
 ```sh
 make all ebpf-capture
 # PRIMARY_PID 为本次 Primary 进程的 PID。
-sudo bin/kvstore-ebpf-capture "$PRIMARY_PID" build/ebpf_capture.bpf.o --listen 172.16.145.135:29005
+sudo bin/kvstore-ebpf-capture "$PRIMARY_PID" build/ebpf_capture.bpf.o
 ```
 
 若本机仅有一个 `kvstore` 实例，也可以用进程名替代 PID（与上面的命令任选其一）：
 
 ```sh
-sudo bin/ebpf_capture kvstore build/ebpf_capture.bpf.o --listen 172.16.145.135:29005
+sudo bin/ebpf_capture kvstore build/ebpf_capture.bpf.o
 ```
 
 进程名按 `/proc/<pid>/comm` 精确匹配，最多 15 字节，并跳过采集器自身。未找到或有多个匹配时明确报错，多个匹配会列出全部 PID；同机运行多个 `kvstore` 时请使用数字 PID。以数字开头的参数必须是合法的纯十进制 PID，不接受 `123abc` 这类混合输入。
 
 
 Primary 和 Replica 必须使用同一版本的全量控制协议：
-`FULLRESYNC_RDMA <repl_id> <snapshot_bytes> <rdma_port> <sync_id> <stream_offset> <capture_port>`。
-末尾为 `0` 时走普通 socket；非零时 Replica 直连采集端，不允许静默降级。
+`FULLRESYNC_RDMA <repl_id> <snapshot_bytes> <rdma_port> <sync_id> <stream_offset> <incremental_mode>`。
+末尾固定为 `0`（socket）或 `1`（ebpf）。Replica 发送 `PSYNC ? -1 <service_port>`；Primary 兼容无端口的旧 socket PSYNC。eBPF 模式必须提供 Replica service_port，地址从控制连接 getpeername 获取。
 
 ```text
-Primary:29000           Replica                  Capture:29005
-     |-- FULLRESYNC_RDMA -->|                         |
-     |==== RDMA .tmp ======>|                         | 提前滚存事件
-     |                      | 校验、加载、删除接收 .tmp |
-     |<-- SYNC_FINISHED ----|                         |
-     | 最终 ACK、关闭 RDMA、删除发送 .tmp               |
-     | 校验 SYNC_FINISHED；两条件齐备后启动增量         |
-     |                      | 关闭并释放本地 RDMA       |
-     |                      | 已发 SYNC_FINISHED 即进入 CATCH_UP，无额外 OK |
-     |                      |-- BEGIN <IDs> <S> ------>|
-     |                      |<-- DATA <start> <len> ---|
-     |                      |-- APPLIED <offset> ---->| 完整命令执行成功才确认
-     |                      |<-- ONLINE <T> ----------| 追平后切换实时
-     | 控制连接持续保留       |<-- DATA / APPLIED ----->|
+Primary                 Replica:service_port        Capture (client)
+   |<-- PSYNC ? -1 port -----|                           |
+   |-- FULLRESYNC_RDMA ----->|                           |
+   |===== RDMA snapshot ===>|                           | 采集/缓存命令
+   |                        | 校验、加载、删除接收临时文件 |
+   |<-- SYNC_FINISHED -------|                           |
+   | 最终 ACK -> 断开 RDMA -> 删除临时文件 -> 释放 RDMA    |
+   |-- replica_ready uprobe ---------------------------->|
+   |                        |<-- TCP connect + BEGIN ---|
+   |                        |--- APPLIED current ------>|
+   |                        |<-- DATA / ONLINE ---------|
+   |                        |--- APPLIED -------------->|
+   | 控制连接持续保留        |                           |
 ```
 
-普通 socket 模式在同样的加载握手后，由 Primary 在原控制连接发送增量和 `ONLINE`。eBPF 模式的增量及 `ONLINE` 全部来自采集端；Primary 不回传增量，不创建 `.sock` 文件。网络层独占连接的关闭权，以会话编号取消另一条连接，避免迟到回调关闭复用的 FD。
+普通 socket 模式在同样的加载握手后，由 Primary 在原控制连接发送增量和 `ONLINE`。eBPF 模式的增量及 `ONLINE` 全部来自采集端；Primary 不回传增量，不创建 `.sock` 文件。网络层独占连接的关闭权，增量接入检查当前就绪状态、Primary 源 IP、两份同步 ID 和续传偏移，并拒绝第二条活动链路。
 
 内核 BPF 在成功提交点更新 `stream_end`，在快照边界更新包含本轮身份、S 和丢失计数基线的 `snapshot_boundary` Map；采集端读取一致的 Map 状态核对 `BEGIN` 和追平目标。BPF ring buffer 只负责搬运事件，可靠范围由用户态的 8 MiB 字节缓存决定：连接前滚动淘汰，连接后只按 `APPLIED` 回收。单事件最多 4 KiB 编码命令。
 
-缓存起点已被淘汰、区间缺口、溢出、内核丢失计数变化、约 5 秒采集滞后（包括只丢最后一条且不再写入）、确认超时，都会结束当前增量会话。采集进程退出、端口不可达、`ERROR` 或任一连接断开，Replica 取消两条连接并回到 `LOADING`，不提供旧数据。空闲断链由 TCP keepalive 辅助发现；这不等于远端无响应的绝对时间保证。无自动重连或断点续传；重启采集进程丢失缓存后，重新启动 Replica 发起新全量。新边界即使没有后续写入，也可从 Map 中确认并上线。
+采集端在单独的 `ready_events` ring buffer 中读取就绪事件，先以当前边界/水位校验，再发送 `BEGIN`。Replica 回传实际 `APPLIED`，包括 ACK 丢失时已执行但尚未被采集端确认的部分；采集端校验完整命令边界后继续发送，避免重复执行。瞬断采用 25–500ms 退避重连，未应用的半包从最近完整命令位置重传。
+
+缓存淘汰/溢出、区间缺口、内核丢失计数变化等错误要求重新全量。Replica 等待首次接入或断线恢复超过 5 秒、接收到 ERROR 时，清理本轮并自动重新 PSYNC；控制连接失效始终取消增量，不提供旧数据。采集端重启丢失缓存，须等待新全量边界，不能续用旧会话。`--listen IPv4:PORT` 仅保留作旧协议诊断与细粒度兼容测试。
 
 具备 iWARP 的开发机可验证真实 BPF → 独立 TCP → 真实 Replica，以及无采集端、控制断开和缓存丢失后重新全量：
 

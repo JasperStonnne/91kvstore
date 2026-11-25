@@ -10,6 +10,7 @@ int kvs_ebpf_start_replication(const char *object_path, pid_t primary_pid);
 
 /* 仅由当前采集进程的同一线程调用；1=取到一条，0=暂无数据，负数=错误。 */
 int kvs_ebpf_read(struct kvs_ebpf_event *event);
+int kvs_ebpf_read_ready(kvs_replica_ready_event_t *event);
 
 /* 读取前后边界版本一致的状态；边界未知/更新中返回 -EAGAIN。 */
 int kvs_ebpf_read_state(struct kvs_ebpf_state *state);

@@ -7,6 +7,7 @@
 #include "kvs_allocator.h"
 #include "log.h"
 #include "protocol.h"
+#include "replication_capture_protocol.h"
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include<errno.h>
@@ -33,6 +34,9 @@ typedef struct {
 	msg_handler replication_handler;
     kvs_connection_stream_handler replication_stream_handler;
 	kvs_connection_close_handler replication_close_handler;
+    msg_handler capture_handler;
+    kvs_connection_stream_handler capture_stream_handler;
+    kvs_connection_close_handler capture_close_handler;
 }ntyco_listener_context_t;
 
 typedef struct {
@@ -46,6 +50,9 @@ typedef struct {
     kvs_connection_stream_handler replication_stream_handler;
 	long long identification_deadline_ms;
 	kvs_connection_close_handler replication_close_handler;
+    msg_handler capture_handler;
+    kvs_connection_stream_handler capture_stream_handler;
+    kvs_connection_close_handler capture_close_handler;
 } ntyco_connection_context_t;
 
 typedef struct{
@@ -56,6 +63,7 @@ typedef struct{
     msg_handler message_handler;                   // 收到数据后的处理函数
 	kvs_connection_stream_handler stream_handler;
     kvs_connection_close_handler close_handler;    // 连接断开回调
+    int (*retry_handler)(void);
 } ntyco_connector_context_t;
 
 #define NTYCO_IDENTIFICATION_TIMEOUT_MS 5000
@@ -153,6 +161,7 @@ static int ntyco_connector_context_init(
     context->host = config->host;                       // 保存目标地址
     context->port = config->port;                       // 保存目标端口
     context->fd = -1;                                   // 当前尚未建立连接
+    context->retry_handler = config->retry_handler;
     context->open_handler = config->open_handler;
     context->message_handler = config->message_handler;
     context->close_handler = config->close_handler;
@@ -176,6 +185,9 @@ static int ntyco_listener_context_init(
 		context->replication_handler = config->replication_handler;
 		context->replication_stream_handler =config->replication_stream_handler;
 		context->replication_close_handler =config->replication_close_handler;
+        context->capture_handler = config->capture_handler;
+        context->capture_stream_handler = config->capture_stream_handler;
+        context->capture_close_handler = config->capture_close_handler;
 		return 0;
 }
 
@@ -327,7 +339,11 @@ void server_reader(void *arg) {
 
     /* 没有配置复制候选路径的监听器，继续沿用原处理方式。 */
 	kvs_connection_close_handler replication_close_handler =context->replication_close_handler;
-    int protocol_selected = (replication_handler == NULL);
+    msg_handler capture_handler = context->capture_handler;
+    kvs_connection_stream_handler capture_stream = context->capture_stream_handler;
+    kvs_connection_close_handler capture_closed = context->capture_close_handler;
+    int capture_selected = 0;
+    int protocol_selected = context->identification_deadline_ms == 0;
 	long long identification_deadline_ms =context->identification_deadline_ms;
 
 	/* 所需参数已经复制到上面的局部变量，归还动态上下文。 */
@@ -377,7 +393,21 @@ void server_reader(void *arg) {
                     goto connection_closed;
                 }
 
+                if (kind == KVS_CONNECTION_CAPTURE) {
+                    if (!capture_handler) goto connection_closed;
+                    handler = capture_handler;
+                    stream_handler = capture_stream;
+                    close_handler = capture_closed;
+                    capture_selected = 1;
+                    int enabled = 1, idle = 5, interval = 1, count = 3;
+                    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) < 0 ||
+                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) < 0 ||
+                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) < 0 ||
+                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) < 0)
+                        goto connection_closed;
+                }
                 if (kind == KVS_CONNECTION_REPLICA) {
+                    if (!replication_handler) goto connection_closed;
                     handler = replication_handler;
                     stream_handler = replication_stream_handler;
 					close_handler = replication_close_handler;
@@ -455,12 +485,14 @@ void server_reader(void *arg) {
                     /* 非阻塞收控制帧；输入暂不能消费时限在一个 stream 块内。 */
                     ssize_t pending = -1;
                     errno = EAGAIN;
-                    if (input.length - input.offset < NTYCO_STREAM_READ_BYTES) {
+                    int input_limit = capture_selected ?
+                        NTYCO_STREAM_READ_BYTES + (int)KVS_CAPTURE_LINE_BYTES : NTYCO_STREAM_READ_BYTES;
+                    if (input.length - input.offset < input_limit) {
                         if (kvs_input_buffer_ensure_space(&input, 1) < 0)
                             goto connection_closed;
                         int available = input.capacity - input.length;
-                        if (available > NTYCO_STREAM_READ_BYTES - input.length)
-                            available = NTYCO_STREAM_READ_BYTES - input.length;
+                        if (available > input_limit - input.length)
+                            available = input_limit - input.length;
                         pending = syscall(SYS_recvfrom, fd, input.data + input.length,
                                           available, MSG_DONTWAIT, NULL, NULL);
                     }
@@ -537,6 +569,7 @@ static void ntyco_connector(void *arg)
 	ntyco_connector_context_t *context = (ntyco_connector_context_t *)arg;
 	if (context==NULL) return;
 
+reconnect_primary:
 	struct sockaddr_in primary_address={0};
 	primary_address.sin_family=AF_INET;
 	primary_address.sin_port=htons(context->port);
@@ -616,6 +649,12 @@ static void ntyco_connector(void *arg)
 
 	server_reader(&connection);
 	context->fd=-1;
+    if (context->retry_handler && context->retry_handler()) {
+        nty_coroutine *co = nty_coroutine_get_sched()->curr_thread;
+        nty_schedule_sched_sleepdown(co, 100);
+        nty_coroutine_yield(co);
+        goto reconnect_primary;
+    }
 
 
 }
@@ -652,7 +691,8 @@ void server(void *arg) {
         }
 		long long identification_deadline_ms = 0;
 
-        if (context->replication_handler != NULL) {
+        if (context->replication_handler != NULL || context->capture_handler != NULL) {
+            /* 仅复制候选监听器识别控制前缀；standalone/echo 保持原处理路径。 */
             long long accepted_at = ntyco_monotonic_ms();
 
             if (accepted_at < 0) {
@@ -677,6 +717,9 @@ void server(void *arg) {
 		connection->replication_handler = context->replication_handler;
 		connection->replication_stream_handler =context->replication_stream_handler;
 		connection->replication_close_handler =context->replication_close_handler;
+        connection->capture_handler = context->capture_handler;
+        connection->capture_stream_handler = context->capture_stream_handler;
+        connection->capture_close_handler = context->capture_close_handler;
 		connection->close_handler=NULL; // 普通客户端连接不需要复制断开通知
 		connection->heap_owned = 1; /* 由读协程负责释放。 */
 		nty_coroutine *read_co;

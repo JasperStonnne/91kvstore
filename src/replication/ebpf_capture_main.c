@@ -40,20 +40,8 @@ int main(int argc, char **argv)
             perror("capture TCP server");
     } else {
         fprintf(stderr, "replication uprobe attached to Primary %ld\n", (long)pid);
-        while (!stopping) {
-            struct kvs_ebpf_event event;
-            int count = kvs_ebpf_read(&event);
-            if (count < 0) { result = -1; break; }
-            if (!count) {
-                if (kill((pid_t)pid, 0) < 0 && errno == ESRCH) break;
-                poll(NULL, 0, 1);
-                continue;
-            }
-            printf("range=[%" PRIu64 ",%" PRIu64 ") length=%u payload=",
-                   (uint64_t)event.start, (uint64_t)event.end, event.length);
-            for (__u32 i = 0; i < event.length; i++) printf("%02x", event.payload[i]);
-            if (putchar('\n') == EOF || fflush(stdout) == EOF) { result = -1; break; }
-        }
+        result = capture_client_run(pid, &stopping);
+
     }
     kvs_ebpf_stop();
     return result < 0 ? EXIT_FAILURE : EXIT_SUCCESS;

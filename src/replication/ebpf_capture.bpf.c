@@ -9,6 +9,25 @@ struct {
     __uint(max_entries, KVS_EBPF_RING_BYTES);
 } events SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 64u * 1024u);
+} ready_events SEC(".maps");
+
+SEC("uprobe")
+int on_replica_ready(struct pt_regs *ctx)
+{
+    kvs_replica_ready_event_t *event = bpf_ringbuf_reserve(&ready_events, sizeof(*event), 0);
+    if (!event)
+        return 0; /* 独立就绪队列满时由 Replica 等待超时重新全量。 */
+    if (bpf_probe_read_user(event, sizeof(*event), (const void *)PT_REGS_PARM1(ctx)) < 0) {
+        bpf_ringbuf_discard(event, 0);
+        return 0;
+    }
+    bpf_ringbuf_submit(event, 0);
+    return 0;
+}
+
 /* 累计失败原因：0=长度超限或为零，1=队列满，2=读取命令内存失败。 */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);

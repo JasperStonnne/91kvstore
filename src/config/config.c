@@ -514,15 +514,7 @@ static int validate_config(
         return config_error(error, error_capacity, path, 0,
                             "incremental replication settings are only valid for role=primary");
     }
-    bool ebpf = parsed->replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_EBPF;
-    if (ebpf != seen[FIELD_REPLICATION_CAPTURE_PORT]) {
-        return config_error(error, error_capacity, path, 0,
-                            "replication_capture_port is required for ebpf mode only");
-    }
-    if (ebpf && (parsed->replication_capture_port == parsed->service_port ||
-                 parsed->replication_capture_port == parsed->rdma_port))
-        return config_error(error, error_capacity, path, 0,
-                            "replication_capture_port must differ from service_port and rdma_port");
+    /* replication_capture_port 仅为旧配置兼容；主动推流不监听该端口。 */
     /* Primary 的全量同步必须使用 RDMA，需要显式指定监听端口。 */
     if (parsed->role == KVS_ROLE_PRIMARY &&
         !seen[FIELD_RDMA_PORT]) {

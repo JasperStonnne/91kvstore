@@ -1,4 +1,7 @@
 #include "replication.h"
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #include "replication_capture_protocol.h"
 #include "kvs_allocator.h"
 #include "persistence.h"
@@ -66,9 +69,11 @@ kvs_replication_rdma_sync_t rdma_sync;
     char primary_host[KVS_REPLICATION_HOST_MAX_LENGTH];//Replica要链接的primary地址
     unsigned short primary_port;//primary的复制端口
     int control_fd;//与primary通信的socket
-    unsigned short capture_port;
+    int incremental_ebpf;
+    unsigned short service_port, replica_port;
+    char replica_ip[16];
+    int retry_fullsync;
     int incremental_fd;
-    kvs_dynamic_connector_t *incremental_connector;
     uint64_t incremental_session;
     uint64_t received_stream_offset;
     long long incremental_progress_ms;
@@ -126,7 +131,7 @@ static void kvs_replication_abort_replica(int control_already_closed);
 
 static int kvs_replication_data_fd(void)
 {
-    return replication_manager.capture_port ? replication_manager.incremental_fd :
+    return replication_manager.incremental_ebpf ? replication_manager.incremental_fd :
                                              replication_manager.control_fd;
 }
 
@@ -396,7 +401,7 @@ static int kvs_replication_replica_maybe_catch_up(void)
         kvs_log_message(KVS_LOG_INFO,
             "replication: SYNC_FINISHED sent and local RDMA closed, enter CATCH_UP offset=%" PRIu64 "\n",
             replication_manager.applied_stream_offset);
-        if (replication_manager.capture_port && kvs_replication_start_incremental() < 0)
+        if (replication_manager.incremental_ebpf && kvs_replication_start_incremental() < 0)
             return -1;
     }
     return 0;
@@ -452,7 +457,7 @@ static int kvs_replication_upstream_frame_protocol(
         int response_length=snprintf(
             response,
             response_capacity,
-            "PSYNC ? -1\r\n" // 首次同步：不知道 Primary ID，也没有旧 offset
+            "PSYNC ? -1 %u\r\n", (unsigned int)replication_manager.service_port
         );
 
         if(response_length < 0 ||
@@ -494,9 +499,7 @@ static int kvs_replication_upstream_frame_protocol(
 
         if (matched != 6 ||
             kvs_replication_parse_stream_offset(capture_port_text, strlen(capture_port_text), &capture_port) < 0 ||
-            capture_port > 65535 ||
-            (capture_port && (capture_port == replication_manager.primary_port ||
-                              capture_port == primary_rdma_port)) ||
+            capture_port > 1 ||
             parsed_length != frame_length ||
             strlen(primary_replication_id) != KVS_REPLICATION_ID_HEX_LENGTH ||
             strlen(full_sync_id) != KVS_REPLICATION_ID_HEX_LENGTH ||
@@ -533,7 +536,7 @@ static int kvs_replication_upstream_frame_protocol(
         sizeof(full_sync_id));
         kvs_replication_reset_finish();
         replication_manager.snapshot_stream_offset = stream_offset;
-        replication_manager.capture_port = (unsigned short)capture_port;
+        replication_manager.incremental_ebpf = (unsigned short)capture_port;
         replication_manager.snapshot_file_size =primary_snapshot_file_size;
         /* 根据 TCP 通知中的端口，异步发起 RDMA 连接。 */
         if (kvs_rdma_connection_start(
@@ -665,11 +668,12 @@ static long long kvs_replication_now_ms(void)
 static void kvs_replication_abort_replica(int control_already_closed)
 {
     int control = replication_manager.control_fd;
+    int incremental = replication_manager.incremental_fd;
     /* 先作废身份，再取消另一条连接；迟到回调只能清理它自己的网络对象。 */
     replication_manager.incremental_session++;
     replication_manager.control_fd = replication_manager.incremental_fd = -1;
     replication_manager.state = KVS_REPLICATION_STATE_DISCONNECTED;
-    ntyco_cancel_dynamic(&replication_manager.incremental_connector);
+    ntyco_shutdown_connection(incremental);
     if (!control_already_closed)
         ntyco_shutdown_connection(control);
     if (kvs_replication_rdma_sync_close(&replication_manager.rdma_sync) < 0)
@@ -681,37 +685,6 @@ static void kvs_replication_abort_replica(int control_already_closed)
     replication_manager.full_sync_id[0] = '\0';
     replication_manager.received_stream_offset = replication_manager.applied_stream_offset = 0;
     kvs_replication_reset_finish();
-}
-
-static int kvs_replication_incremental_open(void *context, uint64_t session, int fd,
-                                            char *output, int capacity)
-{
-    (void)context;
-    if (!replication_manager.initialized || session != replication_manager.incremental_session ||
-        replication_manager.state != KVS_REPLICATION_STATE_CATCH_UP ||
-        replication_manager.control_fd < 0 || !replication_manager.full_sync_rdma_closed ||
-        !replication_manager.sync_finished_sent)
-        return -1;
-    replication_manager.incremental_fd = fd;
-    replication_manager.incremental_progress_ms = kvs_replication_now_ms();
-    int length = snprintf(output, (size_t)capacity, "BEGIN %s %s %" PRIu64 "\r\n",
-        replication_manager.replication_id, replication_manager.full_sync_id,
-        replication_manager.snapshot_stream_offset);
-    if (length < 0 || length >= capacity)
-        return -1;
-    kvs_log_message(KVS_LOG_INFO, "replication: capture connected port=%u fd=%d session=%" PRIu64 "\n",
-                    replication_manager.capture_port, fd, session);
-    return length;
-}
-
-static void kvs_replication_incremental_closed(void *context, uint64_t session, int fd)
-{
-    (void)context;
-    if (!replication_manager.initialized || session != replication_manager.incremental_session)
-        return;
-    replication_manager.incremental_connector = NULL; /* 网络层正在释放这个对象。 */
-    kvs_log_message(KVS_LOG_ERROR, "replication: capture connection closed fd=%d session=%" PRIu64 "\n", fd, session);
-    kvs_replication_abort_replica(0);
 }
 
 static int kvs_replication_apply_capture(int fd, const char *bytes, size_t length,
@@ -810,14 +783,129 @@ static int kvs_replication_start_incremental(void)
     replication_manager.incremental_session++;
     replication_manager.received_stream_offset = replication_manager.snapshot_stream_offset;
     replication_manager.incremental_progress_ms = kvs_replication_now_ms();
-    kvs_dynamic_connector_config_t config = {
-        .host = replication_manager.primary_host, .port = replication_manager.capture_port,
-        .session = replication_manager.incremental_session, .context = &replication_manager,
-        .max_input_bytes = KVS_CAPTURE_DATA_BYTES + KVS_CAPTURE_LINE_BYTES,
-        .opened = kvs_replication_incremental_open, .message = kvs_replication_incremental_message,
-        .closed = kvs_replication_incremental_closed
-    };
-    return ntyco_connect_dynamic(&config, &replication_manager.incremental_connector);
+    kvs_log_message(KVS_LOG_INFO, "replication: waiting for capture push port=%u\n",
+                    replication_manager.service_port);
+    return 0;
+}
+
+static int kvs_replication_capture_peer(int fd)
+{
+    struct sockaddr_in peer;
+    socklen_t size = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &size) < 0 || peer.sin_family != AF_INET)
+        return 0;
+    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM}, *addresses;
+    if (getaddrinfo(replication_manager.primary_host, NULL, &hints, &addresses) != 0)
+        return 0;
+    int matches = 0;
+    for (struct addrinfo *p = addresses; p; p = p->ai_next)
+        if (((struct sockaddr_in *)p->ai_addr)->sin_addr.s_addr == peer.sin_addr.s_addr)
+            matches = 1;
+    freeaddrinfo(addresses);
+    return matches;
+}
+
+int kvs_replication_capture_network_protocol(int fd, char *msg, int length,
+    kvs_output_buffer_t *response, int *consumed)
+{
+    if (!consumed || !response || !response->data || response->capacity <= 0 || !msg || length < 0)
+        return -1;
+    *consumed = 0;
+    if (fd == replication_manager.incremental_fd) {
+        int result = kvs_replication_incremental_message(NULL, replication_manager.incremental_session,
+            fd, msg, length, response, consumed);
+        if (result < 0) {
+            kvs_log_message(KVS_LOG_ERROR, "replication: capture connection closed (protocol failure)\n");
+            replication_manager.retry_fullsync = 1;
+            kvs_replication_abort_replica(0);
+        }
+        return result;
+    }
+    if (!replication_manager.initialized || replication_manager.role != KVS_ROLE_REPLICA ||
+        !replication_manager.incremental_ebpf || !replication_manager.sync_finished_sent ||
+        !replication_manager.full_sync_rdma_closed || replication_manager.control_fd < 0 ||
+        replication_manager.incremental_fd >= 0 ||
+        (replication_manager.state != KVS_REPLICATION_STATE_CATCH_UP &&
+         replication_manager.state != KVS_REPLICATION_STATE_ONLINE) ||
+        !kvs_replication_capture_peer(fd))
+        return -1;
+    char *newline = memchr(msg, '\n', (size_t)length);
+    if (!newline) return length >= (int)KVS_CAPTURE_LINE_BYTES ? -1 : 0;
+    int bytes = (int)(newline - msg) + 1;
+    if (bytes < 2 || bytes >= (int)KVS_CAPTURE_LINE_BYTES || newline[-1] != '\r' ||
+        memchr(msg, '\0', (size_t)bytes)) return -1;
+    char line[KVS_CAPTURE_LINE_BYTES], primary[41], sync[41], offset[21];
+    memcpy(line, msg, (size_t)bytes - 2); line[bytes - 2] = '\0';
+    uint64_t requested;
+    int parsed = 0;
+    if (sscanf(line, "BEGIN %40[0-9a-f] %40[0-9a-f] %20[0-9]%n", primary, sync, offset, &parsed) != 3 ||
+        parsed != bytes - 2 || strlen(primary) != 40 || strlen(sync) != 40 ||
+        strcmp(primary, replication_manager.replication_id) || strcmp(sync, replication_manager.full_sync_id) ||
+        kvs_replication_parse_stream_offset(offset, strlen(offset), &requested) < 0 ||
+        requested < replication_manager.snapshot_stream_offset || requested > replication_manager.applied_stream_offset)
+        return -1;
+    int reply = snprintf(response->data, (size_t)response->capacity, "APPLIED %" PRIu64 "\r\n",
+                         replication_manager.applied_stream_offset);
+    if (reply < 0 || reply >= response->capacity) return -1;
+    replication_manager.incremental_fd = fd;
+    replication_manager.received_stream_offset = replication_manager.applied_stream_offset;
+    kvs_input_buffer_free(&replication_manager.incremental_commands);
+    replication_manager.incremental_progress_ms = kvs_replication_now_ms();
+    replication_manager.state = KVS_REPLICATION_STATE_CATCH_UP;
+    *consumed = bytes;
+    kvs_log_message(KVS_LOG_INFO, "replication: capture connected push fd=%d resume=%" PRIu64 "\n",
+                    fd, replication_manager.applied_stream_offset);
+    return reply;
+}
+
+int kvs_replication_capture_stream(int fd, char *output, int capacity)
+{
+    (void)output; (void)capacity;
+    if (replication_manager.control_fd < 0) return -1;
+    if (fd == replication_manager.incremental_fd) return KVS_STREAM_WAIT;
+    /* BEGIN 前缀已识别但整行仍为半包；继续收，受全局接入超时约束。 */
+    return replication_manager.role == KVS_ROLE_REPLICA && replication_manager.incremental_ebpf &&
+        replication_manager.incremental_fd < 0 && replication_manager.sync_finished_sent &&
+        replication_manager.full_sync_rdma_closed &&
+        replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ? KVS_STREAM_WAIT : -1;
+}
+
+void kvs_replication_capture_closed(int fd)
+{
+    if (fd != replication_manager.incremental_fd) return;
+    replication_manager.incremental_fd = -1;
+    replication_manager.state = KVS_REPLICATION_STATE_CATCH_UP;
+    replication_manager.received_stream_offset = replication_manager.applied_stream_offset;
+    kvs_input_buffer_free(&replication_manager.incremental_commands);
+    replication_manager.incremental_progress_ms = kvs_replication_now_ms();
+    kvs_log_message(KVS_LOG_ERROR, "replication: capture connection closed; await resume offset=%" PRIu64 "\n",
+                    replication_manager.applied_stream_offset);
+}
+
+void kvs_replication_maintenance(void)
+{
+    if (replication_manager.initialized && replication_manager.role == KVS_ROLE_REPLICA &&
+        replication_manager.incremental_ebpf && replication_manager.control_fd >= 0 &&
+        replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP &&
+        kvs_replication_now_ms() - replication_manager.incremental_progress_ms >= KVS_REPLICATION_FINISH_TIMEOUT_MS) {
+        kvs_log_message(KVS_LOG_ERROR, "replication: capture connection closed: capture wait timed out; request fresh full sync\n");
+        replication_manager.retry_fullsync = 1;
+        kvs_replication_abort_replica(0);
+    }
+}
+
+int kvs_replication_take_fullsync_retry(void)
+{
+    int retry = replication_manager.retry_fullsync;
+    replication_manager.retry_fullsync = 0;
+    return retry;
+}
+
+int kvs_replication_set_service_port(unsigned short port)
+{
+    if (!replication_manager.initialized || !port) return -1;
+    replication_manager.service_port = port;
+    return 0;
 }
 
 static int kvs_replication_control_line_protocol(
@@ -971,7 +1059,7 @@ static int kvs_replication_upstream_network_protocol(
     }
 if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
     replication_manager.state == KVS_REPLICATION_STATE_ONLINE) {
-    if (replication_manager.capture_port)
+    if (replication_manager.incremental_ebpf)
         return -1; /* control_fd 不得混入独立增量路径的数据。 */
 
     /* 增量命令以 * 开头，按长度字段解析。 */
@@ -1249,6 +1337,7 @@ int kvs_replication_build_connector_config(
         return -1;
     }
 
+    connector->retry_handler = kvs_replication_take_fullsync_retry;
     connector->host = replication_manager.primary_host;                // 连接目标地址
     connector->port = replication_manager.primary_port;                // 连接目标端口
     connector->stream_handler = kvs_replication_upstream_stream;
@@ -1266,8 +1355,15 @@ int kvs_replication_set_capture_port(unsigned short port)
 {
     if (!replication_manager.initialized || replication_manager.role != KVS_ROLE_PRIMARY)
         return -1;
-    replication_manager.capture_port = port;
+    replication_manager.incremental_ebpf = port != 0;
     return 0;
+}
+
+/* 固定独立符号；eBPF 仅在加载确认和 Primary RDMA 回收均完成后观察此事件。 */
+__attribute__((noinline, noclone))
+void kvs_replication_replica_ready(const kvs_replica_ready_event_t *ev)
+{
+    __asm__ volatile("" : : "r"(ev) : "memory");
 }
 
 /* Replica 加载完毕后，从快照边界开始取增量。 */
@@ -1277,11 +1373,20 @@ static int kvs_replication_primary_start_catch_up(int connection_fd)
         replication_manager.snapshot_stream_offset;
     replication_manager.state = KVS_REPLICATION_STATE_CATCH_UP;
 
-    if (replication_manager.capture_port != 0) {
-        kvs_log_message(KVS_LOG_INFO,
-                        "replication: hand off increment to capture port=%u offset=%" PRIu64 "\n",
-                        replication_manager.capture_port,
-                        replication_manager.send_stream_offset);
+    if (replication_manager.incremental_ebpf != 0) {
+        if (!replication_manager.replica_port || !replication_manager.replica_ip[0]) return -1;
+        kvs_replica_ready_event_t event = {
+            .version = KVS_EBPF_EVENT_VERSION,
+            .replica_port = replication_manager.replica_port,
+            .stream_offset = replication_manager.snapshot_stream_offset
+        };
+        memcpy(event.replica_ip, replication_manager.replica_ip, sizeof(event.replica_ip));
+        memcpy(event.primary_id, replication_manager.replication_id, KVS_EBPF_ID_BYTES);
+        memcpy(event.full_sync_id, replication_manager.full_sync_id, KVS_EBPF_ID_BYTES);
+        kvs_replication_replica_ready(&event);
+        kvs_log_message(KVS_LOG_INFO, "replication: hand off increment to capture push endpoint=%s:%u offset=%" PRIu64 " primary=%s sync=%s\n",
+            event.replica_ip, event.replica_port, (uint64_t)event.stream_offset,
+            replication_manager.replication_id, replication_manager.full_sync_id);
         return 0;
     }
 
@@ -1633,7 +1738,7 @@ int kvs_replication_stream(
         replication_manager.state != KVS_REPLICATION_STATE_ONLINE) {
         return 0;
     }
-    if (replication_manager.capture_port != 0)
+    if (replication_manager.incremental_ebpf != 0)
         return 0; /* eBPF 模式下控制连接不再转发增量或 ONLINE。 */
     return kvs_replication_primary_cache_stream(connection_fd, output, output_capacity);
 }
@@ -1678,8 +1783,24 @@ static int kvs_replication_frame_protocol(
         kvs_log_message(KVS_LOG_INFO, "replication: received SYNC_FINISHED offset=%" PRIu64 "\n",
                         replication_manager.snapshot_stream_offset);
         return 0;
-    } else if(frame_length == 10 &&
-             memcmp(frame,"PSYNC ? -1",10) == 0){
+    } else if(frame_length >= 10 && memcmp(frame,"PSYNC ? -1",10) == 0){
+        unsigned int replica_port = 0;
+        if (frame_length != 10) {
+            char port[6]; int parsed = 0;
+            uint64_t value;
+            if (sscanf(frame, "PSYNC ? -1 %5[0-9]%n", port, &parsed) != 1 || parsed != frame_length ||
+                kvs_replication_parse_stream_offset(port, strlen(port), &value) < 0 || !value || value > 65535)
+                return -1;
+            replica_port = (unsigned int)value;
+        }
+        if (replication_manager.incremental_ebpf && !replica_port) return -1;
+        char replica_ip[16] = {0};
+        if (replica_port) {
+            struct sockaddr_in peer; socklen_t size = sizeof(peer);
+            if (getpeername(connection_fd, (struct sockaddr *)&peer, &size) < 0 || peer.sin_family != AF_INET ||
+                !inet_ntop(AF_INET, &peer.sin_addr, replica_ip, sizeof(replica_ip))) return -1;
+        }
+
 
         if(!replication_manager.initialized ||
            replication_manager.role != KVS_ROLE_PRIMARY ||
@@ -1732,7 +1853,7 @@ static int kvs_replication_frame_protocol(
         kvs_replication_reset_finish();
         replication_manager.snapshot_file_size =snapshot_file_size;
         replication_manager.snapshot_stream_offset = snapshot_stream_offset;
-        if (replication_manager.capture_port == 0) {
+        if (replication_manager.incremental_ebpf == 0) {
             /* 普通 socket 模式由 Primary 持有缓存。 */
             replication_cache.start = snapshot_stream_offset;
             replication_cache.data = kvs_malloc(KVS_REPLICATION_CACHE_BYTES);
@@ -1744,7 +1865,9 @@ static int kvs_replication_frame_protocol(
         replication_manager.snapshot_connection_fd =connection_fd; // Snapshot 只能由当前发来 PSYNC 的连接读取
         replication_manager.state = KVS_REPLICATION_STATE_FULL_SYNC;
 
-        /* TCP 发送全量启动通知，快照内容通过 RDMA 传输。 */
+        replication_manager.replica_port = (unsigned short)replica_port;
+        memcpy(replication_manager.replica_ip, replica_ip, sizeof(replica_ip));
+        /* TCP 发送全量启动通知，末字段仅为 0=socket / 1=ebpf。 */
         response_length = snprintf(
             response,
             response_capacity,
@@ -1753,7 +1876,7 @@ static int kvs_replication_frame_protocol(
             replication_manager.snapshot_file_size,
             (unsigned int)replication_manager.rdma_port,
             replication_manager.full_sync_id,
-            snapshot_stream_offset, (unsigned int)replication_manager.capture_port);
+            snapshot_stream_offset, (unsigned int)replication_manager.incremental_ebpf);
 
         kvs_log_message(KVS_LOG_DEBUG,
                         "replication: snapshot stream offset=%" PRIu64 "\n",
@@ -1940,7 +2063,8 @@ int kvs_replication_init(
 
     kvs_replication_reset_finish();
     replication_manager.incremental_fd = -1;
-    replication_manager.capture_port = 0;
+    replication_manager.incremental_ebpf = 0;
+    replication_manager.retry_fullsync = 0;
     replication_manager.initialized = 1;
 
     return 0;
@@ -1985,7 +2109,7 @@ int kvs_replication_is_online(void)
     return replication_manager.initialized &&
            replication_manager.role == KVS_ROLE_REPLICA &&
            replication_manager.control_fd >= 0 &&
-           (!replication_manager.capture_port || replication_manager.incremental_fd >= 0) &&
+           (!replication_manager.incremental_ebpf || replication_manager.incremental_fd >= 0) &&
            replication_manager.state == KVS_REPLICATION_STATE_ONLINE;
 }
 

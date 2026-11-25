@@ -80,7 +80,7 @@ $(BIN_DIR)/kvstore: $(OBJS) $(NTYCO_DIR)/libntyco.a | $(BIN_DIR)
 $(BUILD_DIR)/kvstore.o: \
 	$(SRC_DIR)/kvstore.c \
 	$(INCLUDE_DIR)/kvstore.h \
-	$(INCLUDE_DIR)/replication.h \
+	$(INCLUDE_DIR)/replication.h $(INCLUDE_DIR)/ebpf_event.h \
 	$(INCLUDE_DIR)/rdma_transport.h \
 	$(INCLUDE_DIR)/protocol.h \
 	$(INCLUDE_DIR)/config.h \
@@ -109,6 +109,7 @@ $(BUILD_DIR)/codec.o: \
 
 $(BUILD_DIR)/ntyco.o: \
 	$(NETWORK_DIR)/ntyco.c \
+	$(INCLUDE_DIR)/protocol.h $(INCLUDE_DIR)/replication_capture_protocol.h \
 	$(INCLUDE_DIR)/server.h \
 	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -184,7 +185,7 @@ $(BUILD_DIR)/uring_io.o: \
 $(BUILD_DIR)/replication.o: \
 	$(REPLICATION_DIR)/replication.c \
 	$(INCLUDE_DIR)/replication_capture_protocol.h \
-	$(INCLUDE_DIR)/replication.h \
+	$(INCLUDE_DIR)/replication.h $(INCLUDE_DIR)/ebpf_event.h \
 	$(INCLUDE_DIR)/persistence.h \
 	$(INCLUDE_DIR)/aof_format.h \
 	$(INCLUDE_DIR)/snapshot_format.h \
@@ -625,6 +626,7 @@ $(BIN_DIR)/test_capture_cache: $(TEST_DIR)/test_capture_cache.c \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c,$^) -o $@
 
 test-capture-server: $(BIN_DIR)/test_capture_mock
+	python3 -B $(TEST_DIR)/test_capture_push.py .
 	python3 -u -B $(TEST_DIR)/test_capture_server.py .
 
 $(BUILD_DIR)/ebpf_capture.o: \
@@ -722,8 +724,12 @@ $(BIN_DIR)/test_capture_mock: $(TEST_DIR)/mock_ebpf_capture.c \
     $(INCLUDE_DIR)/ebpf_event.h $(INCLUDE_DIR)/replication_capture_protocol.h | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror $(filter %.c %.o,$^) -o $@
 
-.PHONY: test-capture-faults
+.PHONY: test-capture-faults test-capture-push
+test-capture-push: $(BIN_DIR)/test_capture_mock
+	python3 -B $(TEST_DIR)/test_capture_push.py .
+
 test-capture-faults: $(BIN_DIR)/kvstore $(BIN_DIR)/test_capture_mock
+	python3 -B $(TEST_DIR)/test_capture_push.py .
 	python3 -B $(TEST_DIR)/test_capture_replication.py . --mock-collector $(abspath $(BIN_DIR)/test_capture_mock)
 	python3 -B $(TEST_DIR)/test_capture_faults.py .
 

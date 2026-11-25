@@ -11,6 +11,8 @@ static char state_path[PATH_MAX];
 
 static int source_fd = -1;
 static off_t position;
+static off_t ready_position;
+static char ready_path[PATH_MAX];
 
 int kvs_ebpf_start_replication(const char *path, pid_t primary_pid)
 {
@@ -19,6 +21,8 @@ int kvs_ebpf_start_replication(const char *path, pid_t primary_pid)
         errno = ENAMETOOLONG;
         return -1;
     }
+    if (snprintf(ready_path, sizeof(ready_path), "%s.ready", path) >= (int)sizeof(ready_path)) return -1;
+    ready_position = 0;
     source_fd = open(path, O_RDONLY | O_CLOEXEC);
     position = 0;
     return source_fd < 0 ? -1 : 0;
@@ -81,4 +85,17 @@ void kvs_ebpf_stop(void)
         close(source_fd);
         source_fd = -1;
     }
+}
+
+int kvs_ebpf_read_ready(kvs_replica_ready_event_t *event)
+{
+    int fd = open(ready_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? 0 : -errno;
+    ssize_t n = pread(fd, event, sizeof(*event), ready_position);
+    int saved = errno;
+    close(fd);
+    if (n < 0) return -saved;
+    if (n != sizeof(*event)) return 0;
+    ready_position += n;
+    return event->version == KVS_EBPF_EVENT_VERSION ? 1 : -EPROTO;
 }

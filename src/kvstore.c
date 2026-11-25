@@ -245,6 +245,7 @@ static void kvs_stop_signal(int number)
 static void kvs_persistence_maintenance(void)
 {
     kvs_reap_background_save();
+    kvs_replication_maintenance();
     if (kvs_stop_requested) {
         /* 单线程循环已停止处理请求；先完成子进程和接力，再释放进程资源。 */
         kvs_close_current_persistence();
@@ -1605,6 +1606,8 @@ kvs_close_current_persistence();
             return -1;
         }
     }
+    if ((config.role == KVS_ROLE_PRIMARY || config.role == KVS_ROLE_REPLICA) &&
+        kvs_replication_set_service_port(config.service_port) < 0) return EXIT_FAILURE;
     struct sigaction stop_action = {0};
     stop_action.sa_handler = kvs_stop_signal;
     sigemptyset(&stop_action.sa_mask);
@@ -1619,7 +1622,7 @@ kvs_close_current_persistence();
 
     if (config.role == KVS_ROLE_PRIMARY) {
         if (config.replication_incremental_mode == KVS_REPLICATION_INCREMENTAL_EBPF &&
-            kvs_replication_set_capture_port(config.replication_capture_port) < 0) {
+            kvs_replication_set_capture_port(1) < 0) {
             fprintf(stderr, "failed to configure replication capture port\n");
             kvs_replication_destroy();
             kvs_close_current_persistence();
@@ -1648,12 +1651,15 @@ kvs_listener_config_t listener = {
 /* Service Port 处理客户端与复制控制，RDMA 监听独立管理。 */
     network_ret = ntyco_start_listeners(&listener, 1);
     } else if (config.role == KVS_ROLE_REPLICA) {
-        /* Replica 监听客户端端口，同时需要连接上游 Primary。 */
+        /* Replica 在同一 service_port 接受客户端与经过校验的采集端 BEGIN。 */
         kvs_listener_config_t listener = {
             .port = config.service_port,
             .bind_ip = config.bind_ip,
             .handler = kvs_network_protocol,
-            .stream_handler = NULL
+            .stream_handler = NULL,
+            .capture_handler = kvs_replication_capture_network_protocol,
+            .capture_stream_handler = kvs_replication_capture_stream,
+            .capture_close_handler = kvs_replication_capture_closed
         };
 
         kvs_connector_config_t connector;

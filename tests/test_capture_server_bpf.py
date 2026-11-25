@@ -35,10 +35,11 @@ class Collector:
         self.process = subprocess.Popen(
             ["sudo", "-n", "python3", "-u", "-c", OWNER,
              str(repo / "bin" / binary_name), str(pid),
-             str(repo / "build/ebpf_capture.bpf.o"), "--listen", f"{rdma.TEST_HOST}:{port}"],
+             str(repo / "build/ebpf_capture.bpf.o"),
+             *(["--listen", f"{rdma.TEST_HOST}:{port}"] if port is not None else [])],
             stdin=subprocess.PIPE, stdout=self.log, stderr=self.log)
         try:
-            fixture.wait(lambda: "capture TCP listening" in log_path.read_text(errors="replace") or
+            fixture.wait(lambda: ("capture TCP listening" if port is not None else "capture push client ready") in log_path.read_text(errors="replace") or
                          self.process.poll() is not None, "capture TCP did not listen", timeout=10)
             assert self.process.poll() is None, log_path.read_text(errors="replace")
         except BaseException:

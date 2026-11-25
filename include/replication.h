@@ -3,6 +3,7 @@
 #include "server.h"
 #include "protocol.h"
 #include "role.h"
+#include "ebpf_event.h"
 
 typedef enum {
     KVS_REPLICATION_STATE_DISCONNECTED = 0, // 尚未建立复制连接
@@ -53,7 +54,14 @@ int kvs_replication_init(
     kvs_snapshot_install_handler snapshot_install_handler,
     kvs_replication_command_handler command_handler
 );
-/* 0 为 socket 增量；非零为独立采集端 TCP 端口。 */
+int kvs_replication_set_service_port(unsigned short port);
+void kvs_replication_maintenance(void);
+int kvs_replication_take_fullsync_retry(void);
+int kvs_replication_capture_network_protocol(int fd, char *msg, int length,
+    kvs_output_buffer_t *response, int *consumed);
+int kvs_replication_capture_stream(int fd, char *output, int capacity);
+void kvs_replication_capture_closed(int fd);
+/* 兼容旧调用：0 为 socket，非零只表示 ebpf 模式，端口不再使用。 */
 int kvs_replication_set_capture_port(unsigned short port);
 /* Primary 初始化复制模块后调用；失败后由 destroy 清理。 */
 int kvs_replication_start_rdma_listener(

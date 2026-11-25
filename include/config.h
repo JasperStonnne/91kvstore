@@ -50,7 +50,7 @@ typedef struct {
     kvs_snapshot_checksum_t snapshot_checksum;
     kvs_aof_checksum_t aof_checksum;
     kvs_replication_incremental_mode_t replication_incremental_mode;
-    unsigned short replication_capture_port;
+    unsigned short replication_capture_port; /* deprecated: accepted, ignored */
     /* 保存启动时选择的内存分配后端。 */
     kvs_allocator_backend_t allocator_backend;
 

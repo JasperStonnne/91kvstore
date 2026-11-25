@@ -198,7 +198,7 @@ printf 'make test exit=%s\n' "$status"
 本机单独验收：`RDMA_TEST_IP=172.16.145.135 make test-rdma`。
 失败场景的 10 秒是测试等待上限；生产主动建连有 3 秒整体截止时间，
 涵盖地址/路由解析与等待 ESTABLISHED，不限制已建立连接的快照传输时长。
-当前并无自动重连/续传，失败后重新启动 Replica 发起新全量。
+RDMA 全量不续传半份快照；eBPF 增量可在 8 MiB 缓存范围内重连续传，等待采集接入或恢复超时会自动重新全量。
 
 两端同提交且 VM-A 可 SSH 登录 VM-B 时，可在 VM-A 使用现有双机入口：
 
@@ -221,10 +221,14 @@ printf 'two-vm exit=%s\n' "$status"
 
 ### 独立采集端增量（③b）
 
-`FULLRESYNC_RDMA` 末尾新增 `capture_port`（普通 socket 为 0），测试代理也须按七个字段解析。两端必须使用相同协议版本。
+`FULLRESYNC_RDMA` 末尾为 `incremental_mode`（0=socket，1=ebpf），测试代理也须按七个字段解析。两端必须使用相同协议版本。
 Replica 校验、加载并删除接收临时快照后发送 `SYNC_FINISHED <sync_id> <S>`；收到正常 RDMA 断开事件并释放本地 RDMA 后直接进入 CATCH_UP，不等待额外确认。Primary 收到最终 ACK 后发起 RDMA 断开并删除发送临时快照，待本地断开事件和有效 `SYNC_FINISHED` 两条件齐备后启动增量；不再发送 `SYNC_FINISHED_OK`。
-Replica 进入 CATCH_UP 后按配置连接采集端口并发送 `BEGIN <primary_id> <sync_id> <S>`。普通 socket 增量若早于本地 RDMA 释放到达，先保留在输入缓冲区，释放后再解析。未完成传输/最终 ACK 时 RDMA 断开、缺少 `SYNC_FINISHED` 超时或 TCP 控制连接提前关闭均取消本轮并清理资源，不让 Primary 启动增量。
+Replica 发送 `PSYNC ? -1 <service_port>`；Primary 兼容旧无端口 socket 格式，并从 getpeername 获取就绪事件的 Replica IPv4。全量结束后，Primary 调用 replica_ready 探针，经独立 ready_events ring 通知采集端主动连接 Replica，发送 `BEGIN <primary_id> <sync_id> <applied>`；Replica 校验源 IP、ID、偏移及唯一链路后回 APPLIED。普通 socket 增量若早于本地 RDMA 释放到达，先保留在输入缓冲区，释放后再解析。未完成传输/最终 ACK 时 RDMA 断开、缺少 `SYNC_FINISHED` 超时或 TCP 控制连接提前关闭均取消本轮并清理资源，不让 Primary 启动增量。
 
 `test_capture_replication.py` 验证真实 RDMA 与真实 Replica；默认是真实 BPF（需要 sudo），`--mock-collector /绝对路径/bin/test_capture_mock` 只替换事件与 Map 来源。两种模式使用同样的写入，检查每条成功应用的字节区间连续且只出现一次；eBPF 模式同时断言 Primary 控制连接没有增量或 ONLINE。可通过 `--output /新的证据目录` 保留配置与日志。
 
 `test_capture_server.py` 保留独立 TCP 的跨环、缺口、溢出、重启、末条丢失及错误帧验收；`test_capture_faults.py` 保留普通缓存溢出后重新全量的真实 RDMA 验收。真实 BPF 到测试客户端的六项较细场景仍可单独运行 `tests/test_capture_server_bpf.py`。
+
+Stage 4.3b 主动推流：无需配置 replication_capture_port，采集命令默认不带 --listen。
+make test-capture-push 覆盖丢失 ACK、截断 DATA 重传及 8 MiB 淘汰。test_capture_replication.py 的额外场景覆盖实际源 IP / ID / 偏移注入拒绝、唯一链路、5秒超时自动以新同步ID重全量、64KiB DATA载荷。
+旧 test_capture_server.py / test_capture_server_bpf.py 保留 --listen 兼容诊断场景；真实主动推流验收使用 sudo python3 -B -u tests/test_capture_replication.py .。

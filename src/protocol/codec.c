@@ -293,6 +293,11 @@ kvs_connection_kind_t kvs_identify_connection(
         return KVS_CONNECTION_CLIENT;
     }
 
+    static const char capture[] = "BEGIN ";
+    size_t prefix = length < sizeof(capture) - 1 ? length : sizeof(capture) - 1;
+    if (memcmp(input, capture, prefix) == 0)
+        return length < sizeof(capture) - 1 ? KVS_CONNECTION_NEED_MORE : KVS_CONNECTION_CAPTURE;
+
     size_t compare_length =
         length < handshake_length ? length : handshake_length;
 
