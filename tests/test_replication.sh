@@ -403,10 +403,10 @@ wait_for_log "$REPLICA_LOG" "listen port : $REPLICA_PORT" "$REPLICA_PID" ||
 wait_for_log "$REPLICA_LOG" "replication: enter ONLINE" "$REPLICA_PID" ||
     fail "Replica did not enter ONLINE"
 # 必须有真实 RDMA 传输及正常关闭证据，不能只凭 ONLINE 判断全量路径。
-for marker in "Primary verified RDMA READY" "RDMA Snapshot fully acknowledged"               "Primary RDMA closed, start TCP catch-up"; do
+for marker in "Primary verified RDMA READY" "RDMA Snapshot fully acknowledged" "received SYNC_FINISHED" "Primary RDMA closed, await SYNC_FINISHED"               "SYNC_FINISHED accepted and RDMA closed, start TCP catch-up"; do
     grep -Fq "$marker" "$PRIMARY_LOG" || fail "missing RDMA evidence: $marker"
 done
-grep -Fq "Replica RDMA closed, resume TCP catch-up" "$REPLICA_LOG" ||     fail "Replica RDMA did not close normally"
+grep -Fq "SYNC_FINISHED sent and local RDMA closed, enter CATCH_UP" "$REPLICA_LOG" ||     fail "Replica RDMA did not close normally"
 echo "[PASS] Replica entered ONLINE after real RDMA full sync"
 
 wait_for_value "$REPLICA_PORT" "fullsync_test" "before sync value"||

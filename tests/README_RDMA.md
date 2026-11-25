@@ -222,8 +222,8 @@ printf 'two-vm exit=%s\n' "$status"
 ### 独立采集端增量（③b）
 
 `FULLRESYNC_RDMA` 末尾新增 `capture_port`（普通 socket 为 0），测试代理也须按七个字段解析。两端必须使用相同协议版本。
-Replica 加载成功后发送 `SYNC_FINISHED <sync_id> <S>`；Primary 验证最终 RDMA ACK 并关闭自己的 RDMA 后返回 `SYNC_FINISHED_OK <sync_id> <S>`。
-Replica 收到 OK 且本地 RDMA 关闭后，才连接通知中的采集端口并发送 `BEGIN <primary_id> <sync_id> <S>`。
+Replica 校验、加载并删除接收临时快照后发送 `SYNC_FINISHED <sync_id> <S>`；收到正常 RDMA 断开事件并释放本地 RDMA 后直接进入 CATCH_UP，不等待额外确认。Primary 收到最终 ACK 后发起 RDMA 断开并删除发送临时快照，待本地断开事件和有效 `SYNC_FINISHED` 两条件齐备后启动增量；不再发送 `SYNC_FINISHED_OK`。
+Replica 进入 CATCH_UP 后按配置连接采集端口并发送 `BEGIN <primary_id> <sync_id> <S>`。普通 socket 增量若早于本地 RDMA 释放到达，先保留在输入缓冲区，释放后再解析。未完成传输/最终 ACK 时 RDMA 断开、缺少 `SYNC_FINISHED` 超时或 TCP 控制连接提前关闭均取消本轮并清理资源，不让 Primary 启动增量。
 
 `test_capture_replication.py` 验证真实 RDMA 与真实 Replica；默认是真实 BPF（需要 sudo），`--mock-collector /绝对路径/bin/test_capture_mock` 只替换事件与 Map 来源。两种模式使用同样的写入，检查每条成功应用的字节区间连续且只出现一次；eBPF 模式同时断言 Primary 控制连接没有增量或 ONLINE。可通过 `--output /新的证据目录` 保留配置与日志。
 

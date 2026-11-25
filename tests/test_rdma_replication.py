@@ -255,7 +255,6 @@ class SnapshotGate:
         self.advertised_rdma_port = advertised_rdma_port
         self.full_sync_id = None
         self.finish_control = bytearray()
-        self.finish_ok = None
         self.listener = socket.socket()
         self.listener.bind((TEST_HOST, 0))
         self.listener.listen(1)
@@ -322,7 +321,6 @@ class SnapshotGate:
             downstream.sendall(header)
             upstream.settimeout(3)
             downstream.settimeout(3)
-            control_buffer = bytearray()
             while not self.stopped.is_set():
                 self.tick(upstream, downstream)
                 ready, _, _ = select.select([upstream, downstream], [], [], 0.02)
@@ -338,19 +336,8 @@ class SnapshotGate:
                     if source is downstream:
                         self.finish_control.extend(data)
                         self.forward_control(data, upstream)
-                    elif self.finish_ok is None:
-                        control_buffer.extend(data)
-                        end = control_buffer.find(b"\r\n")
-                        if end < 0:
-                            require(len(control_buffer) < 256, "oversized SYNC_FINISHED_OK")
-                            continue
-                        self.finish_ok = bytes(control_buffer[:end + 2])
-                        require(self.finish_ok == b"SYNC_FINISHED_OK " + self.full_sync_id +
-                                f" {self.stream_offset}\r\n".encode(), "wrong load-finished acknowledgement")
-                        self.forward_finish_ok(self.finish_ok, downstream)
-                        if len(control_buffer) > end + 2:
-                            self.forward(bytes(control_buffer[end + 2:]), downstream)
                     else:
+                        require(b"SYNC_FINISHED_OK" not in data, "obsolete finish acknowledgement on wire")
                         self.forward(data, downstream)
         except Exception as exc:
             if not self.stopped.is_set():
@@ -359,9 +346,6 @@ class SnapshotGate:
 
     def forward_control(self, data, upstream):
         upstream.sendall(data)
-
-    def forward_finish_ok(self, data, downstream):
-        downstream.sendall(data)
 
     def tick(self, upstream, downstream):
         pass
@@ -419,13 +403,13 @@ def assert_rdma_snapshot(fixture):
     require(f"RDMA Snapshot fully acknowledged bytes={total}" in session,
             "missing final Snapshot ACK")
     require("Primary RDMA closed, await SYNC_FINISHED" in session and
-            "Replica RDMA closed, await SYNC_FINISHED_OK" in replica_log,
+            "Replica RDMA closed, resources released" in replica_log,
             "RDMA did not close normally before TCP catch-up")
     require(session.index("SYNC_FINISHED accepted and RDMA closed") >
             max(session.index("received SYNC_FINISHED"), session.index("Primary RDMA closed")),
             "Primary accepted finish before both TCP confirmation and RDMA close")
     require(replica_log.index("submit SYNC_FINISHED") > replica_log.index("Snapshot installed") and
-            "SYNC_FINISHED_OK and local RDMA closed, enter CATCH_UP" in replica_log,
+            "SYNC_FINISHED sent and local RDMA closed, enter CATCH_UP" in replica_log,
             "Replica entered catch-up before load-finished handshake")
     require(not (fixture.root / "replica/snapshot.db.replication.tmp").exists(),
             "Replica kept the temporary Snapshot after loading")
@@ -955,12 +939,8 @@ class FinishGate(SnapshotGate):
     def __init__(self, port, mode):
         self.mode = mode
         self.finish_seen = threading.Event()
-        self.ok_seen = threading.Event()
         self.allow_finish = threading.Event()
-        self.allow_ok = threading.Event()
         self.held_finish = bytearray()
-        self.held_ok = b""
-        self.held_data = bytearray()
         super().__init__(port)
 
     def forward_control(self, data, upstream):
@@ -972,6 +952,9 @@ class FinishGate(SnapshotGate):
         self.finish_seen.set()
         if self.mode in ("hold-finish", "drop-finish"):
             return
+        if self.mode == "close-control":
+            upstream.shutdown(socket.SHUT_RDWR)
+            return
         outgoing = expected
         if self.mode == "wrong-id":
             parts = expected.split()
@@ -982,29 +965,10 @@ class FinishGate(SnapshotGate):
         upstream.sendall(outgoing)
         self.held_finish.clear()
 
-    def forward_finish_ok(self, data, downstream):
-        self.ok_seen.set()
-        if self.mode in ("hold-ok", "drop-ok"):
-            self.held_ok = data
-        else:
-            downstream.sendall(data)
-
-    def forward(self, data, downstream):
-        if self.mode in ("hold-ok", "drop-ok") and self.held_ok:
-            self.held_data.extend(data)
-        else:
-            super().forward(data, downstream)
-
     def tick(self, upstream, downstream):
         if self.allow_finish.is_set() and self.held_finish:
             upstream.sendall(self.held_finish)
             self.held_finish.clear()
-        if self.allow_ok.is_set() and self.held_ok:
-            downstream.sendall(self.held_ok)
-            self.held_ok = b""
-            if self.held_data:
-                super().forward(bytes(self.held_data), downstream)
-                self.held_data.clear()
 
 
 def finish_handshake_case(fixture, mode):
@@ -1023,10 +987,8 @@ def finish_handshake_case(fixture, mode):
         replica_log = fixture.root / "replica/server.log"
         if mode == "hold-finish":
             fixture.wait(lambda: "Primary RDMA closed, await SYNC_FINISHED" in primary_log.read_text() and
-                         "Replica RDMA closed, await SYNC_FINISHED_OK" in replica_log.read_text(),
+                         "Replica RDMA closed, resources released" in replica_log.read_text(),
                          "RDMA close incorrectly waited for TCP confirmation", timeout=5)
-        if mode == "hold-ok":
-            require(gate.ok_seen.wait(5), "Primary did not acknowledge SYNC_FINISHED")
         if mode.startswith("hold-"):
             reader = Client(fixture.replica_port)
             reader.sock.sendall(frame("HGET", "finish"))
@@ -1039,16 +1001,20 @@ def finish_handshake_case(fixture, mode):
                     "waiting control handshake kept snapshot files")
             require(writer.command("HMOD", "finish", "during-wait") == b"OK", "write while waiting failed")
             gate.allow_finish.set()
-            gate.allow_ok.set()
             fixture.online()
             require(reader.command("HGET", "finish") == b"during-wait", "catch-up lost waiting-period write")
             assert_rdma_snapshot(fixture)
-            require(gate.finish_ok is not None, "missing explicit full-sync acknowledgement")
+            require(b"SYNC_FINISHED_OK" not in gate.finish_control,
+                    "Replica sent obsolete acknowledgement")
         else:
             fixture.wait(lambda: "Replica control connection closed" in replica_log.read_text() and
                          "Replica control connection released" in primary_log.read_text(),
                          "bad/missing confirmation did not cancel synchronization", timeout=10)
-            require("enter ONLINE" not in replica_log.read_text(), "Replica became ONLINE without valid confirmation")
+            require("enter ONLINE" not in replica_log.read_text(), "Replica became ONLINE without valid finish")
+            require("start TCP catch-up" not in primary_log.read_text(),
+                    "Primary entered increment without valid finish")
+            if mode == "drop-finish":
+                require("control handshake timed out" in primary_log.read_text(), "missing finish did not time out")
             require(not primary_snapshot_path(fixture).exists() and
                     not (fixture.root / "replica/snapshot.db.replication.tmp").exists(),
                     "failed handshake kept temporary snapshots")
@@ -1121,11 +1087,10 @@ def main():
             ("listener_failure", listener_failure_case),
             ("handshake_failure", handshake_failure_case),
             ("finish_hold", lambda f: finish_handshake_case(f, "hold-finish")),
-            ("finish_ok_hold", lambda f: finish_handshake_case(f, "hold-ok")),
             ("finish_wrong_id", lambda f: finish_handshake_case(f, "wrong-id")),
             ("finish_wrong_offset", lambda f: finish_handshake_case(f, "wrong-offset")),
             ("finish_missing", lambda f: finish_handshake_case(f, "drop-finish")),
-            ("finish_ok_missing", lambda f: finish_handshake_case(f, "drop-ok")),
+            ("finish_control_closed", lambda f: finish_handshake_case(f, "close-control")),
             ("finish_premature", premature_finish_case),
         ):
             case_dir = root / name
@@ -1136,7 +1101,7 @@ def main():
             finally:
                 fixture.close()
         success = True
-        print("[PASS] RDMA acceptance scenarios: 16 passed; owned server processes stopped", flush=True)
+        print("[PASS] RDMA acceptance scenarios: 15 passed; owned server processes stopped", flush=True)
     finally:
         if success:
             shutil.rmtree(root)

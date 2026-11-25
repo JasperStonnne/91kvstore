@@ -337,8 +337,9 @@ Primary:29000           Replica                  Capture:29005
      |                      | 校验、加载、删除接收 .tmp |
      |<-- SYNC_FINISHED ----|                         |
      | 最终 ACK、关闭 RDMA、删除发送 .tmp               |
-     |-- SYNC_FINISHED_OK ->|                         |
-     |                      | 关闭本地 RDMA            |
+     | 校验 SYNC_FINISHED；两条件齐备后启动增量         |
+     |                      | 关闭并释放本地 RDMA       |
+     |                      | 已发 SYNC_FINISHED 即进入 CATCH_UP，无额外 OK |
      |                      |-- BEGIN <IDs> <S> ------>|
      |                      |<-- DATA <start> <len> ---|
      |                      |-- APPLIED <offset> ---->| 完整命令执行成功才确认

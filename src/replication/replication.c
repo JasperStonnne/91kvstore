@@ -79,7 +79,6 @@ kvs_replication_rdma_sync_t rdma_sync;
     int initialized;
     int sync_finished_sent;
     int sync_finished_received;
-    int sync_finished_ok_received;
     int full_sync_rdma_closed;
     long long finish_wait_started_ms;
 } kvs_replication_manager_t;//复制管理器 保存复制相关信息
@@ -135,7 +134,6 @@ static void kvs_replication_reset_finish(void)
 {
     replication_manager.sync_finished_sent = 0;
     replication_manager.sync_finished_received = 0;
-    replication_manager.sync_finished_ok_received = 0;
     replication_manager.full_sync_rdma_closed = 0;
     replication_manager.finish_wait_started_ms = 0;
 }
@@ -393,29 +391,15 @@ static int kvs_replication_matches_finish(const char *verb, const char *frame, i
 static int kvs_replication_replica_maybe_catch_up(void)
 {
     if (replication_manager.full_sync_rdma_closed &&
-        replication_manager.sync_finished_ok_received) {
+        replication_manager.sync_finished_sent) {
         replication_manager.state = KVS_REPLICATION_STATE_CATCH_UP;
         kvs_log_message(KVS_LOG_INFO,
-            "replication: SYNC_FINISHED_OK and local RDMA closed, enter CATCH_UP offset=%" PRIu64 "\n",
+            "replication: SYNC_FINISHED sent and local RDMA closed, enter CATCH_UP offset=%" PRIu64 "\n",
             replication_manager.applied_stream_offset);
         if (replication_manager.capture_port && kvs_replication_start_incremental() < 0)
             return -1;
     }
     return 0;
-}
-
-static int kvs_replication_finish_ok_frame(int fd, char *frame, int length,
-                                          char *response, int capacity)
-{
-    (void)response;
-    (void)capacity;
-    if (fd != replication_manager.control_fd ||
-        replication_manager.state != KVS_REPLICATION_STATE_WAIT_SYNC_FINISHED ||
-        !replication_manager.sync_finished_sent || replication_manager.sync_finished_ok_received ||
-        !kvs_replication_matches_finish("SYNC_FINISHED_OK", frame, length))
-        return -1;
-    replication_manager.sync_finished_ok_received = 1;
-    return kvs_replication_replica_maybe_catch_up();
 }
 
 /* 调用处已提交最终 RDMA ACK；TCP 确认不能等待 RDMA 关闭，否则可能互相等待。 */
@@ -706,7 +690,7 @@ static int kvs_replication_incremental_open(void *context, uint64_t session, int
     if (!replication_manager.initialized || session != replication_manager.incremental_session ||
         replication_manager.state != KVS_REPLICATION_STATE_CATCH_UP ||
         replication_manager.control_fd < 0 || !replication_manager.full_sync_rdma_closed ||
-        !replication_manager.sync_finished_ok_received)
+        !replication_manager.sync_finished_sent)
         return -1;
     replication_manager.incremental_fd = fd;
     replication_manager.incremental_progress_ms = kvs_replication_now_ms();
@@ -977,12 +961,9 @@ static int kvs_replication_upstream_network_protocol(
     );
     }
     if (replication_manager.state == KVS_REPLICATION_STATE_WAIT_SYNC_FINISHED) {
-        if (replication_manager.sync_finished_ok_received && !replication_manager.full_sync_rdma_closed) {
-            *consumed_length = 0; /* OK 后粘着的增量先保留，继续驱动本地 CM 关闭。 */
-            return 0;
-        }
-        return kvs_replication_control_line_protocol(connection_fd, msg, length,
-            response->data, response->capacity, consumed_length, kvs_replication_finish_ok_frame);
+        /* Primary 可先完成 CM 关闭；保留先到的增量，待本地 RDMA 释放后解析。 */
+        *consumed_length = 0;
+        return 0;
     }
     if (replication_manager.state == KVS_REPLICATION_STATE_FULL_SYNC) {
         /* 全量数据只由 RDMA 接收，此阶段收到 TCP 数据属于协议错误。 */
@@ -1121,7 +1102,7 @@ if (replication_manager.state == KVS_REPLICATION_STATE_CATCH_UP ||
 
                 kvs_log_message(
                     KVS_LOG_INFO,
-                    "replication: Replica RDMA closed, await SYNC_FINISHED_OK\n");
+                    "replication: Replica RDMA closed, resources released\n");
 
                 return kvs_replication_replica_finish_control(output, output_capacity);
             }
@@ -1316,7 +1297,7 @@ static int kvs_replication_primary_cache_stream(
 {
     uint64_t offset = replication_manager.send_stream_offset;
 
-    /* 全量加载确认与增量缓存可用性分开；OK 已发出后，追赶失败仍必须断开。 */
+    /* 全量加载确认与增量缓存可用性分开；追赶失败仍必须断开。 */
     if (replication_cache.data == NULL) {
         kvs_log_message(KVS_LOG_ERROR,
             "replication: catch-up cache unavailable at offset=%" PRIu64 " fd=%d\n",
@@ -1401,8 +1382,8 @@ static int kvs_replication_rdma_send_snapshot_chunk(
     return KVS_STREAM_WAIT;
 }
 
-/* OK 必须排在增量前，且只在加载确认与本地 RDMA 清理都完成后生成。 */
-static int kvs_replication_primary_finish_control(int fd, char *output, int capacity)
+/* 加载确认与本地 RDMA 清理都完成后，直接启动增量，不再发送额外确认。 */
+static int kvs_replication_primary_finish_control(int fd)
 {
     if (kvs_replication_finish_wait() < 0)
         return -1;
@@ -1411,12 +1392,11 @@ static int kvs_replication_primary_finish_control(int fd, char *output, int capa
         return KVS_STREAM_WAIT;
     if (kvs_replication_remove_primary_snapshot() < 0)
         return -1;
-    int length = kvs_replication_format_finish("SYNC_FINISHED_OK", output, capacity);
-    if (length < 0 || kvs_replication_primary_start_catch_up(fd) < 0)
+    if (kvs_replication_primary_start_catch_up(fd) < 0)
         return -1;
     kvs_log_message(KVS_LOG_INFO,
         "replication: SYNC_FINISHED accepted and RDMA closed, start TCP catch-up\n");
-    return length;
+    return KVS_STREAM_WAIT; /* 继续调度增量流，不能在无新 TCP 输入时停住。 */
 }
 
 int kvs_replication_stream(
@@ -1441,9 +1421,10 @@ int kvs_replication_stream(
         return 0; // 当前 Snapshot 不属于这条连接
     }
     if (replication_manager.state == KVS_REPLICATION_STATE_WAIT_SYNC_FINISHED)
-        return kvs_replication_primary_finish_control(connection_fd, output, output_capacity);
+        return kvs_replication_primary_finish_control(connection_fd);
     if (replication_manager.state == KVS_REPLICATION_STATE_FULL_SYNC &&
-        replication_manager.sync_finished_received &&
+        (replication_manager.sync_finished_received ||
+         replication_manager.rdma_sync.disconnect_pending) &&
         kvs_replication_finish_wait() < 0) {
         return -1;
     }
@@ -1505,7 +1486,7 @@ int kvs_replication_stream(
                     kvs_log_message(
                         KVS_LOG_INFO,
                         "replication: Primary RDMA closed, await SYNC_FINISHED\n");
-                    return kvs_replication_primary_finish_control(connection_fd, output, output_capacity);
+                    return kvs_replication_primary_finish_control(connection_fd);
                 }
 
                 if (event.type == KVS_RDMA_EVENT_ESTABLISHED) {

@@ -40,7 +40,8 @@ static int early_disconnect;
 static int partial_disconnect;
 static int oversized_chunk;
 static int starts;
-static int finish_ok_early;
+static int disconnect_before_ack;
+static int transport_closes;
 static int install_fail;
 static int apply_fail;
 static unsigned int advertised_capture_port;
@@ -109,7 +110,7 @@ int kvs_rdma_connection_poll_event(kvs_rdma_connection_t *connection,
         event->type = KVS_RDMA_EVENT_ESTABLISHED;
         return 1;
     }
-    if (transport.ack_sent || (early_disconnect && transport.ready_sent) ||
+    if ((disconnect_before_ack && installed) || transport.ack_sent || (early_disconnect && transport.ready_sent) ||
         (partial_disconnect && transport.delivered)) {
         event->type = KVS_RDMA_EVENT_DISCONNECTED;
         return 1;
@@ -177,6 +178,7 @@ int kvs_rdma_connection_close(kvs_rdma_connection_t **connection)
     if (*connection != NULL) {
         assert(*connection == &transport);
         *connection = NULL;
+        ++transport_closes;
     }
     return 0;
 }
@@ -218,6 +220,7 @@ int kvs_rdma_listener_close(kvs_rdma_listener_t **listener)
 static kvs_connector_config_t setup(void)
 {
     installed = applied = starts = 0;
+    disconnect_before_ack = transport_closes = 0;
     install_fail = apply_fail = 0;
     assert(kvs_replication_init(KVS_ROLE_REPLICA, "127.0.0.1", 29000,
                                 verify_snapshot, apply_command) == 0);
@@ -236,20 +239,10 @@ static int feed(kvs_connector_config_t *connector, char *input, int length,
     return connector->message_handler(123, input, length, &response, consumed);
 }
 
-static int send_finish_ok(kvs_connector_config_t *connector)
-{
-    char message[128];
-    int consumed = 0;
-    int length = snprintf(message, sizeof(message), "SYNC_FINISHED_OK %s 112\r\n", sync_id);
-    assert(feed(connector, message, length, &consumed) == 0 && consumed == length);
-    assert(!kvs_replication_is_online());
-    return 1;
-}
-
 static int drive_replica(kvs_connector_config_t *connector)
 {
     char output[256], expected[128];
-    int sent = 0, accepted = 0;
+    int sent = 0;
     int length = snprintf(expected, sizeof(expected), "SYNC_FINISHED %s 112\r\n", sync_id);
     for (int i = 0; i < 20; i++) {
         int result = connector->stream_handler(123, output, sizeof(output));
@@ -257,13 +250,9 @@ static int drive_replica(kvs_connector_config_t *connector)
             assert(result == length && memcmp(output, expected, length) == 0 && sent++ == 0);
             assert(installed == 1 && transport.ack_sent && !transport.disconnected);
             assert(access("snapshot.db.replication.tmp", F_OK) < 0 && errno == ENOENT);
-            if (finish_ok_early)
-                accepted = send_finish_ok(connector);
         } else if (result == 0 || result != KVS_STREAM_WAIT) {
             return result;
         }
-        if (sent && transport.disconnected && !accepted)
-            accepted = send_finish_ok(connector);
     }
     assert(0 && "Replica failed to finish control handshake");
     return -1;
@@ -306,7 +295,6 @@ static void test_session(int reordered, int disconnect_early, int oversize)
     assert(feed(&connector, (char *)command, sizeof(command) - 1, &consumed) < 0);
     assert(installed == 0 && applied == 0);
 
-    finish_ok_early = reordered;
     int result = drive_replica(&connector);
     if (disconnect_early || oversize) {
         assert(result < 0 && result != KVS_STREAM_WAIT);
@@ -353,7 +341,6 @@ static void test_session(int reordered, int disconnect_early, int oversize)
 static void test_control_boundaries(void)
 {
     recv_before_send = early_disconnect = partial_disconnect = oversized_chunk = 0;
-    finish_ok_early = 0;
     static const char *headers[] = {
         "FULLRESYNC_RDMA short 21 29747 abcdef0123456789abcdef0123456789abcdef01 112 0\r\n",
         "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 -1 29747 abcdef0123456789abcdef0123456789abcdef01 112 0\r\n",
@@ -439,47 +426,25 @@ static kvs_connector_config_t loaded_replica(void)
 
 static void test_finish_handshake(void)
 {
-    static const char *bad[] = {
-        "SYNC_FINISHED_OK short 112\r\n",
-        "SYNC_FINISHED_OK abcdef0123456789abcdef0123456789abcdef01 111\r\n",
-        "SYNC_FINISHED_OK abcdef0123456789abcdef0123456789abcdef01 -1\r\n",
-        "SYNC_FINISHED_OK abcdef0123456789abcdef0123456789abcdef01 18446744073709551616\r\n",
-        "SYNC_FINISHED_OK abcdef0123456789abcdef0123456789abcdef01 112 extra\r\n",
-        "ONLINE 112\r\n"
-    };
-    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-        kvs_connector_config_t connector = loaded_replica();
-        char input[256];
-        strcpy(input, bad[i]);
-        int consumed = 0;
-        assert(feed(&connector, input, (int)strlen(input), &consumed) < 0);
-        assert(!kvs_replication_is_online() && applied == 0);
-        teardown();
-    }
     kvs_connector_config_t connector = loaded_replica();
     char input[512], output[256];
-    int length = snprintf(input, sizeof(input), "SYNC_FINISHED_OK %s 112\r\n", sync_id);
-    int consumed = 0;
-    for (int prefix = 1; prefix < length; prefix++) {
-        assert(feed(&connector, input, prefix, &consumed) == 0 && consumed == 0);
-    }
-    kvs_output_buffer_t response = { .data = output, .capacity = sizeof(output) };
-    assert(connector.message_handler(124, input, length, &response, &consumed) < 0);
     const char online[] = "ONLINE 112\r\n";
-    memcpy(input + length, online, sizeof(online) - 1);
-    memcpy(input + length + sizeof(online) - 1, command, sizeof(command) - 1);
+    memcpy(input, online, sizeof(online) - 1);
+    memcpy(input + sizeof(online) - 1, command, sizeof(command) - 1);
     int tail = (int)sizeof(online) + (int)sizeof(command) - 2;
-    assert(feed(&connector, input, length + tail, &consumed) == 0 && consumed == length);
-    memmove(input, input + consumed, (size_t)tail);
+    int consumed = -1;
+    kvs_output_buffer_t response = { .data = output, .capacity = sizeof(output) };
+    assert(connector.message_handler(124, input, tail, &response, &consumed) < 0);
     assert(feed(&connector, input, tail, &consumed) == 0 && consumed == 0);
-    assert(!kvs_replication_is_online() && applied == 0); /* OK 先到，CM 尚未关闭。 */
+    assert(!kvs_replication_is_online() && applied == 0); /* 增量先到，CM 尚未关闭。 */
     assert(connector.stream_handler(123, output, sizeof(output)) == 0 && transport.disconnected);
+    assert(transport_closes == 1);
     assert(feed(&connector, input, tail, &consumed) == 0 && consumed == (int)sizeof(online) - 1);
     assert(kvs_replication_is_online() && applied == 0);
     memmove(input, input + consumed, sizeof(command) - 1);
     assert(feed(&connector, input, sizeof(command) - 1, &consumed) == 0 && applied == 1);
-    length = snprintf(input, sizeof(input), "SYNC_FINISHED_OK %s 112\r\n", sync_id);
-    assert(feed(&connector, input, length, &consumed) < 0); /* 重复确认不重新上线。 */
+    int length = snprintf(input, sizeof(input), "SYNC_FINISHED_OK %s 112\r\n", sync_id);
+    assert(feed(&connector, input, length, &consumed) < 0); /* 旧确认不再属于协议。 */
     teardown();
 
     connector = setup();
@@ -494,7 +459,24 @@ static void test_finish_handshake(void)
     assert(result < 0 && result != KVS_STREAM_WAIT && !transport.ack_sent && installed == 0);
     assert(access("snapshot.db.replication.tmp", F_OK) < 0 && errno == ENOENT);
     teardown();
-    puts("[PASS] SYNC_FINISHED: load failure, IDs/S/FD, split/coalesced OK, early OK waits for RDMA, duplicates");
+    connector = setup();
+    install_fail = 0;
+    disconnect_before_ack = 1;
+    length = snprintf(input, sizeof(input),
+        "FULLRESYNC_RDMA 0123456789abcdef0123456789abcdef01234567 %zu 29747 %s 112 0\r\n",
+        sizeof(snapshot) - 1, sync_id);
+    assert(feed(&connector, input, length, &consumed) == 0);
+    result = KVS_STREAM_WAIT;
+    for (int i = 0; i < 12 && result == KVS_STREAM_WAIT; i++)
+        result = connector.stream_handler(123, output, sizeof(output));
+    assert(result < 0 && result != KVS_STREAM_WAIT);
+    assert(installed == 1 && !transport.ack_sent && !kvs_replication_is_online());
+    connector.close_handler(123);
+    assert(transport_closes == 1);
+    assert(access("snapshot.db.replication.tmp", F_OK) < 0 && errno == ENOENT);
+    teardown();
+    assert(transport_closes == 1); /* 重复清理不重复释放连接。 */
+    puts("[PASS] SYNC_FINISHED: load failure, wrong FD, early coalesced increment waits for RDMA, no OK round trip, disconnect before final ACK, idempotent cleanup");
 }
 
 
@@ -504,8 +486,6 @@ static kvs_connector_config_t capture_replica(void)
     int before = dynamic_starts;
     kvs_connector_config_t control = loaded_replica();
     assert(dynamic_starts == before); /* 加载及最终 ACK 都不能提前连接采集端。 */
-    send_finish_ok(&control);
-    assert(dynamic_starts == before); /* OK 先到，仍等待本地 RDMA 关闭。 */
     char output[256];
     assert(control.stream_handler(123, output, sizeof(output)) == 0);
     assert(dynamic_starts == before + 1 && transport.disconnected);
