@@ -30,11 +30,11 @@ raise SystemExit(p.returncode)
 
 
 class Collector:
-    def __init__(self, repo, pid, port, log_path, fixture):
+    def __init__(self, repo, pid, port, log_path, fixture, binary_name="kvstore-ebpf-capture"):
         self.log = log_path.open("wb")
         self.process = subprocess.Popen(
             ["sudo", "-n", "python3", "-u", "-c", OWNER,
-             str(repo / "bin/kvstore-ebpf-capture"), str(pid),
+             str(repo / "bin" / binary_name), str(pid),
              str(repo / "build/ebpf_capture.bpf.o"), "--listen", f"{rdma.TEST_HOST}:{port}"],
             stdin=subprocess.PIPE, stdout=self.log, stderr=self.log)
         try:
@@ -71,7 +71,10 @@ def run(repo, root):
         port = rdma.free_port()
         while port in (fixture.primary_port, fixture.rdma_port, fixture.replica_port):
             port = rdma.free_port()
-        collector = Collector(repo, primary.pid, port, root / "capture-1.log", fixture)
+        collector = Collector(repo, "kvstore", port, root / "capture-1.log", fixture,
+                              binary_name="ebpf_capture")
+        assert f"resolved process 'kvstore' to PID {primary.pid}" in (root / "capture-1.log").read_text()
+        print(f"[PASS] process-name kvstore resolved and real uprobe attached to PID {primary.pid}", flush=True)
         control, stream, primary_id, sync_id, start = request_boundary(fixture.primary_port)
         assert start == expected
         commands = [("HMOD", "color", "green"), ("HSET", "extra", "value")]

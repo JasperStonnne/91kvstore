@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "ebpf_capture.h"
 #include "capture_server.h"
+#include "process_target.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -18,13 +19,11 @@ int main(int argc, char **argv)
 {
     int listen_mode = argc == 5 && strcmp(argv[3], "--listen") == 0;
     if (argc != 3 && !listen_mode) {
-        fprintf(stderr, "usage: %s PRIMARY_PID BPF_OBJECT [--listen IPv4:PORT]\n", argv[0]);
+        fprintf(stderr, "usage: %s PRIMARY_PID|PROCESS_NAME BPF_OBJECT [--listen IPv4:PORT]\n", argv[0]);
         return EXIT_FAILURE;
     }
-    char *end;
-    errno = 0;
-    long pid = strtol(argv[1], &end, 10);
-    if (errno || *end || pid <= 0 || pid > INT_MAX)
+    pid_t pid;
+    if (kvs_resolve_process_target(argv[1], &pid, stderr) < 0)
         return EXIT_FAILURE;
     struct sigaction action = { .sa_handler = stop_capture };
     sigemptyset(&action.sa_mask);
@@ -40,7 +39,7 @@ int main(int argc, char **argv)
         if (result < 0)
             perror("capture TCP server");
     } else {
-        fprintf(stderr, "replication uprobe attached to Primary %ld\n", pid);
+        fprintf(stderr, "replication uprobe attached to Primary %ld\n", (long)pid);
         while (!stopping) {
             struct kvs_ebpf_event event;
             int count = kvs_ebpf_read(&event);

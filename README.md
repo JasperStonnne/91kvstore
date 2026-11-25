@@ -48,7 +48,7 @@ sudo apt install -y clang libbpf-dev libelf-dev zlib1g-dev
 make ebpf-capture
 ```
 
-生成 `bin/kvstore-ebpf-capture` 和 `build/ebpf_capture.bpf.o`，启动参数见下方主从复制配置。
+生成 `bin/kvstore-ebpf-capture`、兼容入口 `bin/ebpf_capture` 和 `build/ebpf_capture.bpf.o`，启动参数见下方主从复制配置。
 
 性能复现使用 `-O2 -g`，在仓库根目录强制重编译项目、NtyCo 和对照工具，避免复用默认构建的旧对象：
 
@@ -316,6 +316,15 @@ make all ebpf-capture
 # PRIMARY_PID 为本次 Primary 进程的 PID。
 sudo bin/kvstore-ebpf-capture "$PRIMARY_PID" build/ebpf_capture.bpf.o --listen 172.16.145.135:29005
 ```
+
+若本机仅有一个 `kvstore` 实例，也可以用进程名替代 PID（与上面的命令任选其一）：
+
+```sh
+sudo bin/ebpf_capture kvstore build/ebpf_capture.bpf.o --listen 172.16.145.135:29005
+```
+
+进程名按 `/proc/<pid>/comm` 精确匹配，最多 15 字节，并跳过采集器自身。未找到或有多个匹配时明确报错，多个匹配会列出全部 PID；同机运行多个 `kvstore` 时请使用数字 PID。以数字开头的参数必须是合法的纯十进制 PID，不接受 `123abc` 这类混合输入。
+
 
 Primary 和 Replica 必须使用同一版本的全量控制协议：
 `FULLRESYNC_RDMA <repl_id> <snapshot_bytes> <rdma_port> <sync_id> <stream_offset> <capture_port>`。

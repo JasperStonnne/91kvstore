@@ -287,6 +287,7 @@ clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
 
 UNIT_TEST_TARGETS := \
+    test-process-target \
     test-capture-cache \
     test-ebpf-state \
     test-uring-io \
@@ -590,10 +591,11 @@ $(BUILD_DIR)/ebpf_capture.bpf.o: \
 	    -c $< -o $@
 
 .PHONY: ebpf-capture
-ebpf-capture: $(BIN_DIR)/kvstore-ebpf-capture $(BUILD_DIR)/ebpf_capture.bpf.o
+ebpf-capture: $(BIN_DIR)/kvstore-ebpf-capture $(BIN_DIR)/ebpf_capture $(BUILD_DIR)/ebpf_capture.bpf.o
 
 $(BIN_DIR)/kvstore-ebpf-capture: \
     $(REPLICATION_DIR)/ebpf_capture_main.c \
+    $(REPLICATION_DIR)/process_target.c $(REPLICATION_DIR)/process_target.h \
     $(BUILD_DIR)/ebpf_capture.o \
     $(BUILD_DIR)/ebpf_state.o \
     $(BUILD_DIR)/capture_cache.o $(BUILD_DIR)/capture_server.o $(BUILD_DIR)/codec.o \
@@ -711,6 +713,7 @@ $(BIN_DIR)/benchmark_transfer: $(TEST_DIR)/benchmark_transfer.c \
 # 独立进程故障回归使用文件事件源替身，正式采集二进制继续链接 libbpf。
 $(BIN_DIR)/test_capture_mock: $(TEST_DIR)/mock_ebpf_capture.c \
     $(REPLICATION_DIR)/ebpf_capture_main.c $(INCLUDE_DIR)/ebpf_capture.h \
+    $(REPLICATION_DIR)/process_target.c $(REPLICATION_DIR)/process_target.h \
     $(REPLICATION_DIR)/capture_cache.c $(REPLICATION_DIR)/capture_cache.h \
     $(REPLICATION_DIR)/capture_server.c $(REPLICATION_DIR)/capture_server.h \
     $(REPLICATION_DIR)/ebpf_state.c $(INCLUDE_DIR)/ebpf_state.h $(BUILD_DIR)/codec.o \
@@ -726,3 +729,19 @@ test-capture-faults: $(BIN_DIR)/kvstore $(BIN_DIR)/test_capture_mock
 .PHONY: test-background-save
 test-background-save: $(BIN_DIR)/kvstore $(BIN_DIR)/test_kvstore_snapshot_fault
 	python3 -B $(TEST_DIR)/test_background_save.py
+
+# 兼容简短入口，现有脚本继续使用kvstore-ebpf-capture。
+$(BIN_DIR)/ebpf_capture: $(BIN_DIR)/kvstore-ebpf-capture
+	ln -sf kvstore-ebpf-capture $@
+
+.PHONY: test-process-target
+test-process-target: $(BIN_DIR)/test_process_target
+	./$(BIN_DIR)/test_process_target
+
+$(BIN_DIR)/test_process_target: $(TEST_DIR)/test_process_target.c \
+    $(REPLICATION_DIR)/process_target.c $(REPLICATION_DIR)/process_target.h | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -I$(REPLICATION_DIR) $(filter %.c,$^) -o $@
+
+.PHONY: test-process-target-cli
+test-process-target-cli: $(BIN_DIR)/kvstore $(BIN_DIR)/ebpf_capture
+	python3 -B $(TEST_DIR)/test_process_target_cli.py
