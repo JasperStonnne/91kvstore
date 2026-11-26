@@ -1,6 +1,7 @@
 /* 验证 Hash 在 SYSTEM、POOL 后端下的生命周期和失败处理。 */
 
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -43,6 +44,19 @@ static hashnode_t *find_node(kvs_hash_t *hash, const char *key)
     }
 
     return NULL;
+}
+
+/* 通过真实桶表观察分布，不复制被测哈希算法。 */
+static int find_bucket(kvs_hash_t *hash, const char *key)
+{
+    for (int i = 0; i < hash->max_slots; i++) {
+        for (hashnode_t *node = hash->nodes[i]; node != NULL; node = node->next) {
+            if (strcmp(node->key, key) == 0) {
+                return i;
+            }
+        }
+    }
+    return -1;
 }
 
 static void expect_value(kvs_hash_t *hash,
@@ -90,20 +104,23 @@ static void test_hash_backend(kvs_allocator_backend_t backend)
     expect_pool(backend, 1, 1);
 
     /*
-     * 当前 Hash 使用字符求和。
-     * 这三个 key 的字符和相同，会形成同一条桶链。
+     * FNV-1a下这三个key均落在当前1024桶的267号桶，
+     * 保留真实碰撞链的中间、头部与末节点删除覆盖。
      */
     assert(kvs_hash_set(&hash, "abc", "one") == 0);
-    assert(kvs_hash_set(&hash, "acb", "two") == 0);
-    assert(kvs_hash_set(&hash, "bac", "three") == 0);
+    assert(kvs_hash_set(&hash, "k32", "two") == 0);
+    assert(kvs_hash_set(&hash, "k263", "three") == 0);
     assert(hash.count == 3);
+    assert(find_bucket(&hash, "abc") == 267);
+    assert(find_bucket(&hash, "abc") == find_bucket(&hash, "k32"));
+    assert(find_bucket(&hash, "abc") == find_bucket(&hash, "k263"));
 
     /* 一个桶表，每条记录各有节点、key、value。 */
     expect_pool(backend, 10, 1);
 
     expect_value(&hash, "abc", "one");
-    expect_value(&hash, "acb", "two");
-    expect_value(&hash, "bac", "three");
+    expect_value(&hash, "k32", "two");
+    expect_value(&hash, "k263", "three");
 
     hashnode_t *original = find_node(&hash, "abc");
     assert(original != NULL);
@@ -173,16 +190,16 @@ static void test_hash_backend(kvs_allocator_backend_t backend)
     expect_value(&hash, "abc", "short");
     expect_pool(backend, 10, 1);
 
-    /* 插入顺序形成 bac → acb → abc，先删除中间节点。 */
-    assert(kvs_hash_del(&hash, "acb") == 0);
+    /* 插入顺序形成 k263 → k32 → abc，先删除中间节点。 */
+    assert(kvs_hash_del(&hash, "k32") == 0);
     assert(hash.count == 2);
-    assert(kvs_hash_get(&hash, "acb") == NULL);
+    assert(kvs_hash_get(&hash, "k32") == NULL);
     expect_value(&hash, "abc", "short");
-    expect_value(&hash, "bac", "three");
+    expect_value(&hash, "k263", "three");
     expect_pool(backend, 7, 1);
 
     /* 再删除头节点及最后一个节点。 */
-    assert(kvs_hash_del(&hash, "bac") == 0);
+    assert(kvs_hash_del(&hash, "k263") == 0);
     assert(hash.count == 1);
     expect_value(&hash, "abc", "short");
     expect_pool(backend, 4, 1);
@@ -260,8 +277,69 @@ static void test_hash_backend(kvs_allocator_backend_t backend)
            backend == KVS_ALLOCATOR_SYSTEM ? "system" : "pool");
 }
 
+/* SYSTEM后端的ASan还能直接捕获旧负下标越过桶数组边界。 */
+static void test_hash_byte_keys(kvs_allocator_backend_t backend)
+{
+    assert(kvs_allocator_init(backend) == 0);
+    kvs_hash_t hash = {0};
+    assert(kvs_hash_create(&hash) == 0);
+    char *keys[] = {"中", "中文键", "abc", "cba", ""};
+    const size_t count = sizeof(keys) / sizeof(keys[0]);
+
+    for (size_t i = 0; i < count; i++) {
+        assert(kvs_hash_set(&hash, keys[i], "initial") == 0);
+        expect_value(&hash, keys[i], "initial");
+        assert(kvs_hash_exist(&hash, keys[i]) == 0);
+        int bucket = find_bucket(&hash, keys[i]);
+        assert(bucket >= 0 && bucket < hash.max_slots);
+        assert(kvs_hash_set(&hash, keys[i], "overwritten") == 0);
+        expect_value(&hash, keys[i], "overwritten");
+        assert(kvs_hash_mod(&hash, keys[i], "更新值") == 0);
+        expect_value(&hash, keys[i], "更新值");
+    }
+    assert(hash.count == (int)count);
+
+    /* 已知FNV-1a向量取模后的桶；字符求和会让这两个排列相撞。 */
+    assert(find_bucket(&hash, "abc") == 267);
+    assert(find_bucket(&hash, "cba") == 99);
+    assert(find_bucket(&hash, "abc") != find_bucket(&hash, "cba"));
+
+    /* C-string允许任意非NUL字节，不仅是有效UTF-8。 */
+    for (int byte = 1; byte <= 255; byte++) {
+        char key[] = {(char)byte, '\0'};
+        assert(kvs_hash_set(&hash, key, "byte") == 0);
+        expect_value(&hash, key, "byte");
+        assert(kvs_hash_mod(&hash, key, "modified") == 0);
+        expect_value(&hash, key, "modified");
+        assert(kvs_hash_set(&hash, key, "replaced") == 0);
+        expect_value(&hash, key, "replaced");
+        assert(kvs_hash_exist(&hash, key) == 0);
+    }
+    assert(hash.count == (int)count + 255);
+    expect_pool(backend, 1 + 3 * (size_t)hash.count, 1);
+
+    for (int byte = 1; byte <= 255; byte++) {
+        char key[] = {(char)byte, '\0'};
+        assert(kvs_hash_del(&hash, key) == 0);
+        assert(kvs_hash_get(&hash, key) == NULL);
+        assert(kvs_hash_exist(&hash, key) == 1);
+    }
+    for (size_t i = 0; i < count; i++) {
+        assert(kvs_hash_del(&hash, keys[i]) == 0);
+        assert(kvs_hash_get(&hash, keys[i]) == NULL);
+    }
+    assert(hash.count == 0);
+    kvs_hash_destory(&hash);
+    expect_pool(backend, 0, 0);
+    assert(kvs_allocator_destroy() == 0);
+    printf("[PASS] Hash UTF-8/high-bit bytes, abc/cba distribution allocator=%s signed_char=%d\n",
+           backend == KVS_ALLOCATOR_SYSTEM ? "system" : "pool", CHAR_MIN < 0);
+}
+
 int main(void)
 {
+    test_hash_byte_keys(KVS_ALLOCATOR_SYSTEM);
+    test_hash_byte_keys(KVS_ALLOCATOR_POOL);
     test_hash_backend(KVS_ALLOCATOR_SYSTEM);
     test_hash_backend(KVS_ALLOCATOR_POOL);
     return 0;

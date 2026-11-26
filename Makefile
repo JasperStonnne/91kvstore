@@ -224,7 +224,8 @@ $(BIN_DIR)/test_hash_memory_pool: \
 	$(INCLUDE_DIR)/kvstore.h \
 	$(INCLUDE_DIR)/kvs_allocator.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror \
-		-fsanitize=address \
+		-fsanitize=address,undefined -fsigned-char \
+		-fno-sanitize-recover=undefined \
 		-fno-omit-frame-pointer \
 		$(TEST_DIR)/test_hash_memory_pool.c \
 		$(ENGINE_DIR)/kvs_hash.c \

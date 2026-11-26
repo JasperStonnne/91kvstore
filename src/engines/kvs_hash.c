@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <pthread.h>
 
 
@@ -18,23 +19,22 @@
 kvs_hash_t global_hash;
 
 
-//Connection 
-// 'C' + 'o' + 'n'
-static int _hash(char *key, int size) {
+/* FNV-1a按无符号字节计算，UTF-8和高位字节也不会产生负桶下标。 */
+static int _hash(char *key, int size)
+{
+    if (key == NULL || size <= 0) {
+        return -1;
+    }
 
-	if (!key) return -1;
+    uint32_t h = UINT32_C(2166136261);
+    for (size_t i = 0; key[i] != '\0'; i++) {
+        h ^= (uint32_t)(unsigned char)key[i];
+        h *= UINT32_C(16777619);
+    }
 
-	int sum = 0;
-	int i = 0;
-
-	while (key[i] != 0) {
-		sum += key[i];
-		i ++;
-	}
-
-	return sum % size;
-
+    return (int)(h % (uint32_t)size);
 }
+
 /* 只申请节点本身；key/value 由 _create_node 另外申请。 */
 static hashnode_t *hash_node_alloc(kvs_hash_t *hash)
 {
