@@ -27,7 +27,7 @@ int kvs_array_create(kvs_array_t *inst){
     inst->total=0;
     return 0;
 }
-void kvs_array_destory(kvs_array_t *inst){
+void kvs_array_destroy(kvs_array_t *inst){
 
     if(!inst||!inst->table) return;
     for(int i=0;i<inst->total;i++){

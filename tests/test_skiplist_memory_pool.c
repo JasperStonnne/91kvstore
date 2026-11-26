@@ -253,7 +253,7 @@ static void test_backend(kvs_allocator_backend_t backend)
     }
 
     /* 剩余 1000 条记录及 header 都由 destroy 释放。 */
-    kvs_skiplist_destory(&list);
+    kvs_skiplist_destroy(&list);
     assert(list.header == NULL);
     assert(list.level == 0);
     check_live(backend, 0);

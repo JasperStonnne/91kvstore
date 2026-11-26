@@ -339,96 +339,6 @@ void rbtree_traversal(rbtree *T, rbtree_node *node) {
 		rbtree_traversal(T, node->right);
 	}
 }
-#if 0
-int main() {
-
-#if ENABLE_KEY_CHAR
-    char* keyArray[10] = {"King","Darren","Mark","Vico","Nick","qiuxiang","youzi","taozi","123","234"};
-    char* valueArray[10] = {"1King","2Darren","3Mark","4Vico","5Nick","6qiuxiang","7youzi","8taozi","9123","10234"};
-	rbtree *T = (rbtree *)malloc(sizeof(rbtree));
-	if (T == NULL) {
-		printf("malloc failed\n");
-		return -1;
-	}
-	
-	T->nil = (rbtree_node*)malloc(sizeof(rbtree_node));
-	T->nil->color = BLACK;
-	T->root = T->nil;
-
-	rbtree_node *node = T->nil;
-	int i = 0;
-	for (i = 0;i < 10;i ++) {
-		node = (rbtree_node*)malloc(sizeof(rbtree_node));
-
-		node->key = malloc(strlen(keyArray[i])+1);
-        memset(node->key,0,strlen(keyArray[i])+1);
-        strcpy(node->key,keyArray[i]);
-
-		node->value =malloc(strlen(valueArray[i])+1);
-        memset(node->value,0,strlen(valueArray[i])+1);
-        strcpy(node->value,keyArray[i]);
-
-		rbtree_insert(T, node);
-		
-	}
-
-	rbtree_traversal(T, T->root);
-	printf("----------------------------------------\n");
-
-	for (i = 0;i < 10;i ++) {
-
-		rbtree_node *node = rbtree_search(T, keyArray[i]);
-		rbtree_node *cur = rbtree_delete(T, node);
-		free(cur);
-
-		rbtree_traversal(T, T->root);
-		printf("----------------------------------------\n");
-	}
-
-#else
-
-	int keyArray[20] = {24,25,13,35,23, 26,67,47,38,98, 20,19,17,49,12, 21,9,18,14,15};
-
-	rbtree *T = (rbtree *)malloc(sizeof(rbtree));
-	if (T == NULL) {
-		printf("malloc failed\n");
-		return -1;
-	}
-	
-	T->nil = (rbtree_node*)malloc(sizeof(rbtree_node));
-	T->nil->color = BLACK;
-	T->root = T->nil;
-
-	rbtree_node *node = T->nil;
-	int i = 0;
-	for (i = 0;i < 20;i ++) {
-		node = (rbtree_node*)malloc(sizeof(rbtree_node));
-		node->key = keyArray[i];
-		node->value = NULL;
-
-		rbtree_insert(T, node);
-		
-	}
-
-	rbtree_traversal(T, T->root);
-	printf("----------------------------------------\n");
-
-	for (i = 0;i < 20;i ++) {
-
-		rbtree_node *node = rbtree_search(T, keyArray[i]);
-		rbtree_node *cur = rbtree_delete(T, node);
-		free(cur);
-
-		rbtree_traversal(T, T->root);
-		printf("----------------------------------------\n");
-	}
-#endif
-
-	
-}
-
-
-#endif
 
 kvs_rbtree_t global_rbtree;
 
@@ -489,7 +399,7 @@ int kvs_rbtree_create(kvs_rbtree_t *inst)
     return 0;
 }
 
-void kvs_rbtree_destory(kvs_rbtree_t *inst)
+void kvs_rbtree_destroy(kvs_rbtree_t *inst)
 {
     if (inst == NULL || inst->nil == NULL) {
         return;

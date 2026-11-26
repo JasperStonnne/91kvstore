@@ -130,7 +130,7 @@ static void test_array_backend(kvs_allocator_backend_t backend)
     assert(array.total == KVS_ARRAY_SIZE);
 
     /* 销毁满的 Array，释放全部 key/value 和整个表。 */
-    kvs_array_destory(&array);
+    kvs_array_destroy(&array);
 
     assert(array.table == NULL);
     assert(array.total == 0);
@@ -262,7 +262,7 @@ static void test_array_failures(kvs_allocator_backend_t backend)
         assert(stats.large_count == 1);
     }
 
-    kvs_array_destory(&array);
+    kvs_array_destroy(&array);
 
     assert(array.table == NULL);
     assert(array.total == 0);

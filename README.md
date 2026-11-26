@@ -10,7 +10,7 @@ GNU C11 · Linux · NtyCo · io_uring · RDMA · eBPF · [MIT License](LICENSE)
 
 ## 1. 项目简介与架构
 
-91kvstore 用于学习和实验数据库系统：将 TCP 字节流、RESP 解析、命令执行、持久化和复制连接成可运行、可测试的链路。
+91kvstore 用于学习和实验数据库系统。Array、Hash、Red-Black Tree 和 Skip List 沿用基础教学骨架。项目在此基础上实现了统一 Slab 分配、基于 NtyCo 的 RESP 收发与解析、AOF 和后台快照、主从复制及其验证工具。
 
 | 组件 | 实现 |
 |---|---|
@@ -31,7 +31,7 @@ flowchart LR
     E -->|RDMA 全量快照| R
 ```
 
-eBPF 保留成功提交点探针，直接引用原始 RESP 切片；Replica 全量完成后触发独立就绪事件，由采集器主动连入从机。完整握手、快照边界 S、资源清理与方案取舍见 **[主从时序与架构](docs/REPLICATION.md)**。
+eBPF 旁路采集和软件 SIW RDMA 属于实验性技术探索。第 4 节分别列出双机增量复制与 SIW 全量传输的实测对照。eBPF 保留成功提交点探针，直接引用原始 RESP 切片；Replica 全量完成后触发独立就绪事件，由采集器主动连入从机。完整握手、快照边界 S、资源清理与方案取舍见 **[主从时序与架构](docs/REPLICATION.md)**。
 
 ## 2. 环境依赖与编译步骤
 
@@ -149,7 +149,7 @@ Stage 1 工作区（后归入 `e9584bb`），每项 3 轮。`redis-benchmark 7.0
 
 ### 表 3　Pipeline 批处理对比 Redis
 
-`49b8d3d` 与 Redis 7.0.15 均关闭持久化。单连接 `-c 1`，每轮 100,000 次 SET，固定 `hotkey`、128 个 ASCII `x`，每个深度两端各 3 轮并交替执行，共 30 轮。相对差异以 Redis QPS 中位数为基准。
+`49b8d3d` 与 Redis 7.0.15 均关闭持久化。单连接 `-c 1`，每轮 100,000 次 SET，固定 `hotkey`、128 个 ASCII `x`，每个深度两端各 3 轮并交替执行，共 30 轮。该成绩用于验证单连接热点负载下的网络收发与 RESP 解析链路表现。相对差异以 Redis QPS 中位数为基准。
 
 | Pipeline 深度 P | kv-none QPS 中位数 | redis-none QPS 中位数 | kv 相对 Redis |
 | --- | --- | --- | --- |

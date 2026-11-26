@@ -43,10 +43,10 @@ static void create_engines(void)
 
 static void destroy_engines(void)
 {
-    kvs_array_destory(&global_array);
-    kvs_rbtree_destory(&global_rbtree);
-    kvs_hash_destory(&global_hash);
-    kvs_skiplist_destory(&global_skiplist);
+    kvs_array_destroy(&global_array);
+    kvs_rbtree_destroy(&global_rbtree);
+    kvs_hash_destroy(&global_hash);
+    kvs_skiplist_destroy(&global_skiplist);
 }
 
 static void expect_value(const char *actual, const char *expected)

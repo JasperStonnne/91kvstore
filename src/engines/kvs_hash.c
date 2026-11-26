@@ -46,7 +46,7 @@ static hashnode_t *hash_node_alloc(kvs_hash_t *hash)
 }
 
 /* 只释放节点本身；key/value 由调用方先释放。 */
-static void hash_storge_free(kvs_hash_t *hash, hashnode_t *node)
+static void hash_storage_free(kvs_hash_t *hash, hashnode_t *node)
 {
     if (hash == NULL || node == NULL) {
         return;
@@ -62,7 +62,7 @@ hashnode_t *_create_node(kvs_hash_t *hash, char *key, char *value) {
 #if ENABLE_KEY_POINTER
 	char *kcopy = kvs_malloc(strlen(key) + 1);
 	if (kcopy == NULL){
-		hash_storge_free(hash,node);
+		hash_storage_free(hash,node);
 		return NULL;
 	}
 	memcpy(kcopy, key, strlen(key) + 1);
@@ -72,7 +72,7 @@ hashnode_t *_create_node(kvs_hash_t *hash, char *key, char *value) {
 	char *kvalue = kvs_malloc(strlen(value) + 1);
 	if (kvalue == NULL) { 
 		kvs_free(kcopy);
-		hash_storge_free(hash,node);
+		hash_storage_free(hash,node);
 		return NULL;
 	}
 	memcpy(kvalue,value, strlen(value) + 1);
@@ -95,7 +95,7 @@ static void _hash_node_free(kvs_hash_t *hash,hashnode_t *node){
 	kvs_free(node->key);
 	kvs_free(node->value);
 #endif
-	hash_storge_free(hash,node);
+	hash_storage_free(hash,node);
 }
 
 int kvs_hash_create(kvs_hash_t *hash)
@@ -118,7 +118,7 @@ int kvs_hash_create(kvs_hash_t *hash)
 }
 
 // 
-void kvs_hash_destory(kvs_hash_t *hash) {
+void kvs_hash_destroy(kvs_hash_t *hash) {
 
 	if (!hash) return;
 
@@ -203,7 +203,7 @@ char * kvs_hash_get(kvs_hash_t *hash, char *key) {
 
 int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value) {
 
-	if (!hash || !key) return -1;
+	if (!hash || !key || value == NULL) return -1;
 
 	int idx = _hash(key, MAX_TABLE_SIZE);
 
@@ -318,38 +318,3 @@ int kvs_hash_foreach(
 
     return 0;
 }
-
-
-#if 0
-int main() {
-
-	 kvs_hash_create(&hash);
-
-	kvs_hash_set(&hash, "Teacher1", "King");
-	kvs_hash_set(&hash, "Teacher2", "Darren");
-	kvs_hash_set(&hash, "Teacher3", "Mark");
-	kvs_hash_set(&hash, "Teacher4", "Vico");
-	kvs_hash_set(&hash, "Teacher5", "Nick");
-
-	char *value1 = kvs_hash_get(&hash, "Teacher1");
-	printf("Teacher1 : %s\n", value1);
-
-	int ret = kvs_hash_mod(&hash, "Teacher1", "King1");
-	printf("mode Teacher1 ret : %d\n", ret);
-	
-	char *value2 = kvs_hash_get(&hash, "Teacher1");
-	printf("Teacher2 : %s\n", value1);
-
-	ret = kvs_hash_del(&hash, "Teacher1");
-	printf("delete Teacher1 ret : %d\n", ret);
-
-	ret = kvs_hash_exist(&hash, "Teacher1");
-	printf("Exist Teacher1 ret : %d\n", ret);
-
-	kvs_hash_destory(&hash);
-
-	return 0;  
-}
-
-#endif
-

@@ -85,7 +85,7 @@ int kvs_skiplist_create(kvs_skiplist_t *inst)
      */
     return 0;
 }
-void kvs_skiplist_destory(kvs_skiplist_t *inst)
+void kvs_skiplist_destroy(kvs_skiplist_t *inst)
 {
     if (inst == NULL || inst->header == NULL) {
         return;
@@ -402,7 +402,7 @@ int main(void)
     display(skipList);
 
     /* 测试销毁 */
-    kvs_skiplist_destory(skipList);
+    kvs_skiplist_destroy(skipList);
 
     check_test(
         skipList->header == NULL && skipList->level == 0,

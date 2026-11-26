@@ -193,7 +193,7 @@ static void test_backend(kvs_allocator_backend_t backend)
     check_pool(backend, 1 + 3 * (count - 1), 0);
 
     /* 故意保留剩余节点，由 destroy 释放整棵树及 nil。 */
-    kvs_rbtree_destory(&tree);
+    kvs_rbtree_destroy(&tree);
 
     assert(tree.root == NULL);
     assert(tree.nil == NULL);

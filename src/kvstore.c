@@ -353,250 +353,84 @@ static char *kvs_get_value(int cmd, char *key)
     }
 }
 
-//SET Key Value
-//tokens[0]:SET
-//tokens[1]:Key
-//tokens[2]:Value
-int kvs_filter_protocol(
+/* 执行已校验的引擎命令，由调用方按状态生成 RESP 回复。 */
+static int kvs_filter_protocol(
+    int cmd,
     char **tokens,
     int count,
-    char *response,
-    int response_capacity,
     kvs_command_source_t source,
     kvs_slice_t raw_command,
     kvs_exec_status_t *status)
 {
-
-    if (tokens == NULL || count <= 0 || tokens[0] == NULL || response == NULL||response_capacity <= 0){
-        if (status) *status = KVS_EXEC_FAILED;
-        return -1;
+    if (kvs_server_role == KVS_ROLE_REPLICA &&
+        source == KVS_COMMAND_SOURCE_CLIENT && kvs_is_write_command(cmd)) {
+        *status = KVS_EXEC_FAILED;
+        return 0;
     }
 
-    int cmd= KVS_CMD_START;
-    for(cmd=KVS_CMD_START;cmd<KVS_CMD_COUNT;cmd++){
-        if(strcmp(tokens[0],command[cmd])==0){
-            break;
-        }
-    }
+    int ret;
+    char *key = tokens[1];
+    char *value = tokens[2];
 
-    if (cmd == KVS_CMD_COUNT) {
-    return snprintf(response, (size_t)response_capacity, "ERROR unknown command\r\n");
-    }
-
-    if(kvs_server_role==KVS_ROLE_REPLICA&&source==KVS_COMMAND_SOURCE_CLIENT&&kvs_is_write_command(cmd)){
-        return snprintf(response, (size_t)response_capacity,"READONLY replica does not accept client writes\r\n");
-    }
-
-    int length=0;
-    int ret=0;
-    char *key=tokens[1];
-    char *value=tokens[2];
-    switch(cmd){
+    switch (cmd) {
 #if ENABLE_ARRAY
     case KVS_CMD_SET:
-        ret=kvs_array_set(&global_array,key,value);
-        if(ret<0){
-            length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"EXIST\r\n");
-        }
-
+        ret = kvs_array_set(&global_array, key, value);
         break;
-    case KVS_CMD_GET:{
-    char *result = kvs_get_value(cmd, key);
-    if(result==NULL){
-        length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-    }else {
-        length=snprintf(response, (size_t)response_capacity,"%s\r\n",result);
-    }
-        break;
-}
     case KVS_CMD_DEL:
-        ret=kvs_array_del(&global_array,key);
-        if(ret<0){
-           length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_array_del(&global_array, key);
         break;
     case KVS_CMD_MOD:
-        ret=kvs_array_mod(&global_array,key,value);
-        if(ret<0){
-           length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_array_mod(&global_array, key, value);
         break;
     case KVS_CMD_EXIST:
-        ret=kvs_array_exist(&global_array,key);
-        if(ret==0){
-        length=snprintf(response, (size_t)response_capacity,"EXIST\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_array_exist(&global_array, key);
         break;
 #endif
 #if ENABLE_RBTREE
-//rbtree
     case KVS_CMD_RSET:
-        ret=kvs_rbtree_set(&global_rbtree,key,value);
-        if(ret<0){
-            length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"EXIST\r\n");
-        }
-
+        ret = kvs_rbtree_set(&global_rbtree, key, value);
         break;
-    case KVS_CMD_RGET:{
-    char *result = kvs_get_value(cmd, key);
-    if(result==NULL){
-        length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-    }else {
-        length=snprintf(response, (size_t)response_capacity,"%s\r\n",result);
-    }
-        break;
-}
     case KVS_CMD_RDEL:
-        ret=kvs_rbtree_del(&global_rbtree,key);
-        if(ret<0){
-           length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_rbtree_del(&global_rbtree, key);
         break;
     case KVS_CMD_RMOD:
-        ret=kvs_rbtree_mod(&global_rbtree,key,value);
-        if(ret<0){
-           length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_rbtree_mod(&global_rbtree, key, value);
         break;
     case KVS_CMD_REXIST:
-        ret=kvs_rbtree_exist(&global_rbtree,key);
-        if(ret==0){
-        length=snprintf(response, (size_t)response_capacity,"EXIST\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_rbtree_exist(&global_rbtree, key);
         break;
 #endif
 #if ENABLE_HASH
     case KVS_CMD_HSET:
-        ret=kvs_hash_set(&global_hash,key,value);
-        if(ret<0){
-            length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"EXIST\r\n");
-        }
-
+        ret = kvs_hash_set(&global_hash, key, value);
         break;
-    case KVS_CMD_HGET:{
-    char *result = kvs_get_value(cmd, key);
-    if(result==NULL){
-        length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-    }else {
-        length=snprintf(response, (size_t)response_capacity,"%s\r\n",result);
-    }
-        break;
-}
     case KVS_CMD_HDEL:
-        ret=kvs_hash_del(&global_hash,key);
-        if(ret<0){
-           length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_hash_del(&global_hash, key);
         break;
     case KVS_CMD_HMOD:
-        ret=kvs_hash_mod(&global_hash,key,value);
-        if(ret<0){
-           length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_hash_mod(&global_hash, key, value);
         break;
     case KVS_CMD_HEXIST:
-        ret=kvs_hash_exist(&global_hash,key);
-        if(ret==0){
-        length=snprintf(response, (size_t)response_capacity,"EXIST\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_hash_exist(&global_hash, key);
         break;
 #endif
 #if ENABLE_SKIPLIST
     case KVS_CMD_SSET:
-        ret=kvs_skiplist_set(&global_skiplist,key,value);
-        if(ret<0){
-            length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"EXIST\r\n");
-        }
-
+        ret = kvs_skiplist_set(&global_skiplist, key, value);
         break;
-    case KVS_CMD_SGET:{
-    char *result = kvs_get_value(cmd, key);
-    if(result==NULL){
-        length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-    }else {
-        length=snprintf(response, (size_t)response_capacity,"%s\r\n",result);
-    }
-        break;
-}
     case KVS_CMD_SDEL:
-        ret=kvs_skiplist_del(&global_skiplist,key);
-        if(ret<0){
-           length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_skiplist_del(&global_skiplist, key);
         break;
     case KVS_CMD_SMOD:
-        ret=kvs_skiplist_mod(&global_skiplist,key,value);
-        if(ret<0){
-           length=snprintf(response, (size_t)response_capacity,"ERROR\r\n");
-        }else if(ret==0){
-            length=snprintf(response, (size_t)response_capacity,"OK\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_skiplist_mod(&global_skiplist, key, value);
         break;
     case KVS_CMD_SEXIST:
-        ret=kvs_skiplist_exist(&global_skiplist,key);
-        if(ret==0){
-        length=snprintf(response, (size_t)response_capacity,"EXIST\r\n");
-        }else{
-            length=snprintf(response, (size_t)response_capacity,"NO EXIST\r\n");
-        }
+        ret = kvs_skiplist_exist(&global_skiplist, key);
         break;
-
 #endif
-
     default:
-        assert(0);
+        return -1;
     }
 
     if (status != NULL) {
@@ -687,41 +521,8 @@ int kvs_filter_protocol(
         }
     }
 
-    return length;
-
+    return 0;
 }
-
-/* 统一执行已经拆好的命令字段，供旧格式和新格式共用。 */
-static int kvs_execute_tokens(
-    char **tokens,
-    int count,
-    char *response,
-    int response_capacity,
-    kvs_command_source_t source,
-    kvs_slice_t raw_command,
-    kvs_exec_status_t *status)
-{
-    if (tokens == NULL || count <= 0 ||
-        tokens[0] == NULL || response == NULL || response_capacity <= 0) {
-        return -1;
-    }
-        int response_length = kvs_filter_protocol(
-        tokens, count, response, response_capacity, source, raw_command, status
-    );
-
-    if (response_length < 0) {
-        return -1;  /* 命令执行或回复生成失败 */
-    }
-
-    if (response_length >= response_capacity) {
-        return -1;  /* 回复被截断；还需要留一个位置给 '\0' */
-    }
-
-    return response_length;
-}
-
-
-
 
 /* 将读取到的 value 编码成长度格式响应，空间不够时先扩容。 */
 static int kvs_encode_value_to_output(
@@ -1125,24 +926,21 @@ static int kvs_execute_fields(
     }
 
     kvs_exec_status_t exec_status = KVS_EXEC_FAILED;
-    int result = kvs_execute_tokens(
-        tokens,
-        (int)field_count,
-        reply_data,      /* 本条回复从已有数据末尾写入。 */
-        reply_capacity,  /* 只能使用剩余空间。 */
-        source,
-        raw_command,
-        &exec_status
-    );
+    int result = -1;
+    if (reply_capacity > 0) {
+        result = kvs_filter_protocol(
+            command_id, tokens, (int)field_count, source, raw_command, &exec_status
+        );
+    }
     if (execution_status != NULL && result >= 0) {
-    *execution_status = exec_status;
-}
+        *execution_status = exec_status;
+    }
+
     if (result >= 0 &&
-    source == KVS_COMMAND_SOURCE_CLIENT &&
-    (command_id == KVS_CMD_SET ||
-    command_id == KVS_CMD_RSET ||
-    command_id == KVS_CMD_HSET ||
-    command_id == KVS_CMD_SSET)) {
+        (command_id == KVS_CMD_SET ||
+         command_id == KVS_CMD_RSET ||
+         command_id == KVS_CMD_HSET ||
+         command_id == KVS_CMD_SSET)) {
     static const char ok[] = "+OK\r\n";
     static const char exists[] = "-ERR key already exists\r\n";
     static const char failed[] = "-ERR SET failed\r\n";
@@ -1169,7 +967,6 @@ static int kvs_execute_fields(
     }
 
     if (result >= 0 &&
-        source == KVS_COMMAND_SOURCE_CLIENT &&
         (command_id == KVS_CMD_DEL ||
          command_id == KVS_CMD_RDEL ||
          command_id == KVS_CMD_HDEL ||
@@ -1197,8 +994,7 @@ static int kvs_execute_fields(
         }
     }
 
-        if (result >= 0 &&
-        source == KVS_COMMAND_SOURCE_CLIENT &&
+    if (result >= 0 &&
         (command_id == KVS_CMD_MOD ||
          command_id == KVS_CMD_RMOD ||
          command_id == KVS_CMD_HMOD ||
@@ -1226,7 +1022,6 @@ static int kvs_execute_fields(
         }
     }
     if (result >= 0 &&
-        source == KVS_COMMAND_SOURCE_CLIENT &&
         (command_id == KVS_CMD_EXIST ||
          command_id == KVS_CMD_REXIST ||
          command_id == KVS_CMD_HEXIST ||
@@ -1464,25 +1259,25 @@ int init_kvengine(void)
     /* 创建失败，按相反顺序释放此前创建成功的引擎。 */
 #if ENABLE_SKIPLIST
     if (skiplist_created) {
-        kvs_skiplist_destory(&global_skiplist);
+        kvs_skiplist_destroy(&global_skiplist);
     }
 #endif
 
 #if ENABLE_HASH
     if (hash_created) {
-        kvs_hash_destory(&global_hash);
+        kvs_hash_destroy(&global_hash);
     }
 #endif
 
 #if ENABLE_RBTREE
     if (rbtree_created) {
-        kvs_rbtree_destory(&global_rbtree);
+        kvs_rbtree_destroy(&global_rbtree);
     }
 #endif
 
 #if ENABLE_ARRAY
     if (array_created) {
-        kvs_array_destory(&global_array);
+        kvs_array_destroy(&global_array);
     }
 #endif
 
@@ -1491,19 +1286,19 @@ int init_kvengine(void)
 void dest_kvengine(void){
 
 #if ENABLE_ARRAY
-    kvs_array_destory(&global_array);
+    kvs_array_destroy(&global_array);
 #endif
 
 #if ENABLE_RBTREE
-    kvs_rbtree_destory(&global_rbtree);
+    kvs_rbtree_destroy(&global_rbtree);
 #endif
 
 #if ENABLE_HASH
-    kvs_hash_destory(&global_hash);
+    kvs_hash_destroy(&global_hash);
 #endif
 
 #if ENABLE_SKIPLIST
-    kvs_skiplist_destory(&global_skiplist);
+    kvs_skiplist_destroy(&global_skiplist);
 #endif
 }
 

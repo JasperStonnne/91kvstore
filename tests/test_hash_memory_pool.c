@@ -167,6 +167,11 @@ static void test_hash_backend(kvs_allocator_backend_t backend)
     expect_value(&hash, "abc", "changed");
     expect_pool(backend, 10, 1);
 
+    /* NULL value 应被拒绝，已有记录保持原值。 */
+    assert(kvs_hash_mod(&hash, "abc", NULL) == -1);
+    expect_value(&hash, "abc", "changed");
+    expect_pool(backend, 10, 1);
+
     /* MOD 不存在的 key，不应创建记录。 */
     assert(kvs_hash_mod(&hash, "missing", "value") == 1);
     assert(hash.count == 3);
@@ -265,7 +270,7 @@ static void test_hash_backend(kvs_allocator_backend_t backend)
 
     expect_pool(backend, 1 + 3 * (size_t)hash.count, 1);
 
-    kvs_hash_destory(&hash);
+    kvs_hash_destroy(&hash);
     assert(hash.nodes == NULL);
     assert(hash.count == 0);
     assert(hash.max_slots == 0);
@@ -329,7 +334,7 @@ static void test_hash_byte_keys(kvs_allocator_backend_t backend)
         assert(kvs_hash_get(&hash, keys[i]) == NULL);
     }
     assert(hash.count == 0);
-    kvs_hash_destory(&hash);
+    kvs_hash_destroy(&hash);
     expect_pool(backend, 0, 0);
     assert(kvs_allocator_destroy() == 0);
     printf("[PASS] Hash UTF-8/high-bit bytes, abc/cba distribution allocator=%s signed_char=%d\n",
