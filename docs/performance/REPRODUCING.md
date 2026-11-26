@@ -1,5 +1,7 @@
 # 构建与测量复现说明
 
+> 历史测量/流程归档：本文原有版本和通过范围保持原样。49b8d3d最终成绩见[Stage 5正式报告](REPORT.md)，当前时序见[复制架构](../REPLICATION.md)，新复现入口见[Stage 5命令](STAGE5-REPRODUCING.md)。
+
 > 本页记录历史性能基线。旧构建目标和配置只适用于该页注明的历史版本，当前启动方式见[仓库 README](../../README.md)。
 
 [首页](../../README.md) · [总报告](REPORT.md) · [测试可行性](TESTING.md)

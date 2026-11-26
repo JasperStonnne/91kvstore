@@ -1,0 +1,806 @@
+Stage 5 direct Replica profile evidence; diagnostics outside throughput timing.
+Source: 49b8d3d, 136 isolated same ELF, c8/P1 follow-up.
+
+=== idle ===
+
+pidstat; raw SHA256=0bfcb95bdf225234b171442227809793b5973a22bdcae4c3f79ca1db761086dc
+Linux 6.8.0-147-generic (ubuntu-dev) 	11/26/26 	_aarch64_	(4 CPU)
+
+05:39:59      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:00     1000    157824   22.00   28.00    0.00    0.00   50.00     2  kvstore
+
+05:39:59      UID       PID   cswch/s nvcswch/s  Command
+05:40:00     1000    157824    432.00      1.00  kvstore
+
+05:40:00      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:01     1000    157824   28.00   31.00    0.00    0.00   59.00     2  kvstore
+
+05:40:00      UID       PID   cswch/s nvcswch/s  Command
+05:40:01     1000    157824    357.00      2.00  kvstore
+
+05:40:01      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:02     1000    157824   26.00   31.00    0.00    0.00   57.00     2  kvstore
+
+05:40:01      UID       PID   cswch/s nvcswch/s  Command
+05:40:02     1000    157824    377.00      1.00  kvstore
+
+05:40:02      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:03     1000    157824   22.00   32.00    0.00    0.00   54.00     2  kvstore
+
+05:40:02      UID       PID   cswch/s nvcswch/s  Command
+05:40:03     1000    157824    391.00      1.00  kvstore
+
+05:40:03      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:04     1000    157824   23.00   34.00    0.00    0.00   57.00     2  kvstore
+
+05:40:03      UID       PID   cswch/s nvcswch/s  Command
+05:40:04     1000    157824    372.00      2.00  kvstore
+
+05:40:04      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:05     1000    157824   26.00   30.00    0.00    0.00   56.00     2  kvstore
+
+05:40:04      UID       PID   cswch/s nvcswch/s  Command
+05:40:05     1000    157824    380.00      0.00  kvstore
+
+05:40:05      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:06     1000    157824   25.00   29.00    0.00    0.00   54.00     2  kvstore
+
+05:40:05      UID       PID   cswch/s nvcswch/s  Command
+05:40:06     1000    157824    395.00      0.00  kvstore
+
+05:40:06      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:07     1000    157824   25.00   31.00    0.00    0.00   56.00     2  kvstore
+
+05:40:06      UID       PID   cswch/s nvcswch/s  Command
+05:40:07     1000    157824    378.00      2.00  kvstore
+
+Average:      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+Average:     1000    157824   24.62   30.75    0.00    0.00   55.38     -  kvstore
+
+Average:      UID       PID   cswch/s nvcswch/s  Command
+Average:     1000    157824    385.25      1.12  kvstore
+
+perf-flat; raw SHA256=3a4daa8b1b7b76e0a2bdf3523f0c5b752fd7856b06b672be32c6e4f044500ffa
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 880  of event 'cpu-clock'
+# Event count (approx.): 4422110000
+#
+# Overhead  Command  Shared Object      Symbol                               IPC   [IPC Coverage]
+# ........  .......  .................  ...................................  ....................
+#
+    29.09%  kvstore  [kernel.kallsyms]  [k] el0_svc                          -      -
+            |
+            ---el0_svc
+               el0t_64_sync_handler
+               el0t_64_sync
+               |
+                --28.86%--__GI_epoll_pwait (inlined)
+                          nty_schedule_run
+                          ntyco_start_runtime
+                          kvs_server_run (inlined)
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+    26.59%  kvstore  libc.so.6          [.] epoll_pwait                      -      -
+            |
+            ---__GI_epoll_pwait (inlined)
+               nty_schedule_run
+               ntyco_start_runtime
+               kvs_server_run (inlined)
+               main
+               __libc_start_call_main
+               __libc_start_main_impl (inlined)
+               _start
+
+    12.73%  kvstore  [vdso]             [.] 0x00000000000002e0               -      -
+            |
+            ---0xf90ae47202e0
+               __kernel_gettimeofday
+
+     7.84%  kvstore  [kernel.kallsyms]  [k] get_random_u16                   -      -
+            |
+            ---get_random_u16
+               |
+               |--4.66%--el0_svc_common.constprop.0
+               |          do_el0_svc
+               |          el0_svc
+               |          el0t_64_sync_handler
+               |          el0t_64_sync
+               |          __GI_epoll_pwait (inlined)
+               |          nty_schedule_run
+               |          ntyco_start_runtime
+               |          kvs_server_run (inlined)
+               |          main
+               |          __libc_start_call_main
+               |          __libc_start_main_impl (inlined)
+               |          _start
+               |
+                --3.18%--invoke_syscall
+                          el0_svc_common.constprop.0
+                          do_el0_svc
+                          el0_svc
+                          el0t_64_sync_handler
+                          el0t_64_sync
+                          __GI_epoll_pwait (inlined)
+                          nty_schedule_run
+                          ntyco_start_runtime
+                          kvs_server_run (inlined)
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+     7.27%  kvstore  [kernel.kallsyms]  [k] __fget_light                     -      -
+            |
+            ---__fget_light
+               |
+                --6.93%--__fdget
+                          |
+                           --6.82%--do_epoll_wait
+                                     do_epoll_pwait.part.0
+                                     __arm64_sys_epoll_pwait
+                                     invoke_syscall
+                                     el0_svc_common.constprop.0
+                                     do_el0_svc
+                                     el0_svc
+                                     el0t_64_sync_handler
+                                     el0t_64_sync
+                                     __GI_epoll_pwait (inlined)
+                                     nty_schedule_run
+                                     ntyco_start_runtime
+                                     kvs_server_run (inlined)
+                                     main
+                                     __libc_start_call_main
+                                     __libc_start_main_impl (inlined)
+                                     _start
+
+     6.48%  kvstore  [kernel.kallsyms]  [k] invoke_syscall                   -      -
+            |
+            ---invoke_syscall
+               el0_svc_common.constprop.0
+               do_el0_svc
+               el0_svc
+               el0t_64_sync_handler
+               el0t_64_sync
+               __GI_epoll_pwait (inlined)
+               nty_schedule_run
+               ntyco_start_runtime
+               kvs_server_run (inlined)
+               main
+               __libc_start_call_main
+               __libc_start_main_impl (inlined)
+               _start
+
+     2.39%  kvstore  [vdso]             [.] 0x00000000000002dc               -      -
+            |
+            ---0xf90ae47202dc
+               __kernel_gettimeofday
+
+     1.25%  kvstore  [kernel.kallsyms]  [k] ep_poll                          -      -
+            |
+            ---ep_poll
+               |
+               |--0.68%--do_epoll_wait
+               |          do_epoll_pwait.part.0
+               |          __arm64_sys_epoll_pwait
+               |          invoke_syscall
+               |          el0_svc_common.constprop.0
+               |          do_el0_svc
+               |          el0_svc
+               |          el0t_64_sync_handler
+               |          el0t_64_sync
+               |          __GI_epoll_pwait (inlined)
+               |          nty_schedule_run
+               |          ntyco_start_runtime
+               |          kvs_server_run (inlined)
+               |          main
+               |          __libc_start_call_main
+               |          __libc_start_main_impl (inlined)
+               |          _start
+               |
+                --0.57%--do_epoll_pwait.part.0
+                          __arm64_sys_epoll_pwait
+                          invoke_syscall
+                          el0_svc_common.constprop.0
+                          do_el0_svc
+                          el0_svc
+                          el0t_64_sync_handler
+                          el0t_64_sync
+                          __GI_epoll_pwait (inlined)
+                          nty_schedule_run
+                          ntyco_start_runtime
+                          kvs_server_run (inlined)
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+     1.25%  kvstore  kvstore            [.] nty_schedule_run                 -      -
+            |
+            ---nty_schedule_run
+               ntyco_start_runtime
+               kvs_server_run (inlined)
+               main
+               __libc_start_call_main
+               __libc_start_main_impl (inlined)
+               _start
+
+     0.80%  kvstore  [kernel.kallsyms]  [k] do_el0_svc                       -      -
+            |
+            ---do_el0_svc
+
+     0.80%  kvstore  [kernel.kallsyms]  [k] set_user_sigmask                 -      -
+            |
+            ---set_user_sigmask
+               |
+                --0.68%--__arm64_sys_epoll_pwait
+                          invoke_syscall
+                          el0_svc_common.constprop.0
+                          do_el0_svc
+                          el0_svc
+                          el0t_64_sync_handler
+                          el0t_64_sync
+                          __GI_epoll_pwait (inlined)
+                          nty_schedule_run
+                          ntyco_start_runtime
+                          kvs_server_run (inlined)
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+     0.68%  kvstore  [kernel.kallsyms]  [k] do_epoll_wait                    -      -
+            |
+            ---do_epoll_wait
+
+     0.57%  kvstore  [kernel.kallsyms]  [k] el0_svc_common.constprop.0       -      -
+            |
+            ---el0_svc_common.constprop.0
+               do_el0_svc
+               el0_svc
+               el0t_64_sync_handler
+               el0t_64_sync
+               __GI_epoll_pwait (inlined)
+               nty_schedule_run
+               ntyco_start_runtime
+               kvs_server_run (inlined)
+               main
+               __libc_start_call_main
+               __libc_start_main_impl (inlined)
+               _start
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
+
+perf-callgraph; raw SHA256=4b8b1acc73c7d2ef5701b5677c06457bf37b7c2b206adc49eee3e50d7e2ea583
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 880  of event 'cpu-clock'
+# Event count (approx.): 4422110000
+#
+# Children      Self  Command  Shared Object      Symbol
+# ........  ........  .......  .................  ...................................
+#
+    83.64%     0.00%  kvstore  kvstore            [.] _start
+            |
+            ---_start
+               __libc_start_main_impl (inlined)
+               __libc_start_call_main
+               main
+               kvs_server_run (inlined)
+               ntyco_start_runtime
+               nty_schedule_run
+               |
+                --81.82%--__GI_epoll_pwait (inlined)
+                          |
+                           --55.23%--el0t_64_sync
+                                     el0t_64_sync_handler
+                                     |
+                                      --54.89%--el0_svc
+                                                |
+                                                 --26.02%--do_el0_svc
+                                                           |
+                                                            --25.57%--el0_svc_common.constprop.0
+                                                                      |
+                                                                      |--20.11%--invoke_syscall
+                                                                      |          |
+                                                                      |          |--10.34%--__arm64_sys_epoll_pwait
+                                                                      |          |          |
+                                                                      |          |           --9.20%--do_epoll_pwait.part.0
+                                                                      |          |                     |
+                                                                      |          |                      --8.30%--do_epoll_wait
+                                                                      |          |                                |
+                                                                      |          |                                 --6.82%--__fdget
+                                                                      |          |                                           __fget_light
+                                                                      |          |
+                                                                      |           --3.18%--get_random_u16
+                                                                      |
+                                                                       --4.66%--get_random_u16
+
+    83.64%     0.00%  kvstore  libc.so.6          [.] __libc_start_main_impl (inlined)
+            |
+            ---__libc_start_main_impl (inlined)
+               __libc_start_call_main
+               main
+               kvs_server_run (inlined)
+               ntyco_start_runtime
+               nty_schedule_run
+               |
+                --81.82%--__GI_epoll_pwait (inlined)
+                          |
+                           --55.23%--el0t_64_sync
+                                     el0t_64_sync_handler
+                                     |
+                                      --54.89%--el0_svc
+                                                |
+                                                 --26.02%--do_el0_svc
+                                                           |
+                                                            --25.57%--el0_svc_common.constprop.0
+                                                                      |
+                                                                      |--20.11%--invoke_syscall
+                                                                      |          |
+                                                                      |          |--10.34%--__arm64_sys_epoll_pwait
+                                                                      |          |          |
+                                                                      |          |           --9.20%--do_epoll_pwait.part.0
+                                                                      |          |                     |
+                                                                      |          |                      --8.30%--do_epoll_wait
+                                                                      |          |                                |
+                                                                      |          |                                 --6.82%--__fdget
+                                                                      |          |                                           __fget_light
+                                                                      |          |
+                                                                      |           --3.18%--get_random_u16
+                                                                      |
+                                                                       --4.66%--get_random_u16
+
+    83.64%     0.00%  kvstore  libc.so.6          [.] __libc_start_call_main
+            |
+            ---__libc_start_call_main
+               main
+               kvs_server_run (inlined)
+               ntyco_start_runtime
+               nty_schedule_run
+               |
+               |--52.27%--__GI_epoll_pwait (inlined)
+               |          |
+               |           --35.34%--el0t_64_sync
+               |                     el0t_64_sync_handler
+               |                     |
+               |                      --35.11%--el0_svc
+               |                                |
+               |                                 --16.14%--do_el0_svc
+               |                                           |
+               |                                            --15.91%--el0_svc_common.constprop.0
+[callgraph excerpt ends]
+
+=== load ===
+
+pidstat; raw SHA256=515839aab4883bf3838a8288dd8976ba5f79f93f04ef6f24ece6ea03aedbe88b
+Linux 6.8.0-147-generic (ubuntu-dev) 	11/26/26 	_aarch64_	(4 CPU)
+
+05:40:09      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:10     1000    157824   52.00   20.00    0.00    0.00   72.00     1  kvstore
+
+05:40:09      UID       PID   cswch/s nvcswch/s  Command
+05:40:10     1000    157824    251.00      2.00  kvstore
+
+05:40:10      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:11     1000    157824   47.52   19.80    0.00    0.00   67.33     2  kvstore
+
+05:40:10      UID       PID   cswch/s nvcswch/s  Command
+05:40:11     1000    157824    279.21      1.98  kvstore
+
+05:40:11      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:12     1000    157824   46.00   21.00    0.00    0.00   67.00     2  kvstore
+
+05:40:11      UID       PID   cswch/s nvcswch/s  Command
+05:40:12     1000    157824    296.00      3.00  kvstore
+
+05:40:12      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:13     1000    157824   45.00   23.00    0.00    0.00   68.00     2  kvstore
+
+05:40:12      UID       PID   cswch/s nvcswch/s  Command
+05:40:13     1000    157824    285.00      2.00  kvstore
+
+05:40:13      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:14     1000    157824   53.00   21.00    0.00    0.00   74.00     2  kvstore
+
+05:40:13      UID       PID   cswch/s nvcswch/s  Command
+05:40:14     1000    157824    233.00      2.00  kvstore
+
+05:40:14      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:15     1000    157824   46.00   23.00    0.00    0.00   69.00     2  kvstore
+
+05:40:14      UID       PID   cswch/s nvcswch/s  Command
+05:40:15     1000    157824    274.00      2.00  kvstore
+
+05:40:15      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:16     1000    157824   46.00   22.00    0.00    0.00   68.00     2  kvstore
+
+05:40:15      UID       PID   cswch/s nvcswch/s  Command
+05:40:16     1000    157824    278.00      5.00  kvstore
+
+05:40:16      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:40:17     1000    157824   47.00   21.00    0.00    0.00   68.00     2  kvstore
+
+05:40:16      UID       PID   cswch/s nvcswch/s  Command
+05:40:17     1000    157824    292.00      0.00  kvstore
+
+Average:      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+Average:     1000    157824   47.82   21.35    0.00    0.00   69.16     -  kvstore
+
+Average:      UID       PID   cswch/s nvcswch/s  Command
+Average:     1000    157824    273.53      2.25  kvstore
+
+perf-flat; raw SHA256=e69bc57d1e10915ab8c6a12d5390b8726c2768b9afdeb125dd65b1d97bdfb68d
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock'
+# Event count (approx.): 5527637500
+#
+# Overhead  Command  Shared Object      Symbol                                         IPC   [IPC Coverage]
+# ........  .......  .................  .............................................  ....................
+#
+    27.00%  kvstore  kvstore            [.] kvs_allocator_alloc                        -      -
+            |
+            |--23.82%--pool_alloc_small (inlined)
+            |          kvs_allocator_alloc
+            |          kvs_hash_set
+            |          kvs_filter_protocol
+            |          kvs_execute_tokens (inlined)
+            |          kvs_execute_fields
+            |
+             --3.18%--slab_alloc_block (inlined)
+                       pool_alloc_small (inlined)
+                       kvs_allocator_alloc
+                       kvs_hash_set
+                       kvs_filter_protocol
+                       kvs_execute_tokens (inlined)
+                       kvs_execute_fields
+
+    14.36%  kvstore  [kernel.kallsyms]  [k] el0_svc                                    -      -
+            |
+            ---el0_svc
+               el0t_64_sync_handler
+               el0t_64_sync
+               __GI_epoll_pwait (inlined)
+               nty_schedule_run
+               ntyco_start_runtime
+               kvs_server_run (inlined)
+               main
+               __libc_start_call_main
+               __libc_start_main_impl (inlined)
+               _start
+
+    14.00%  kvstore  libc.so.6          [.] epoll_pwait                                -      -
+            |
+            ---__GI_epoll_pwait (inlined)
+               nty_schedule_run
+               ntyco_start_runtime
+               kvs_server_run (inlined)
+               main
+               __libc_start_call_main
+               __libc_start_main_impl (inlined)
+               _start
+
+    13.36%  kvstore  libc.so.6          [.] strcmp                                     -      -
+            |
+            ---__GI_strcmp (inlined)
+               |
+                --13.18%--kvs_hash_set
+                          kvs_filter_protocol
+                          kvs_execute_tokens (inlined)
+                          kvs_execute_fields
+
+     8.55%  kvstore  [vdso]             [.] 0x00000000000002e0                         -      -
+            |
+            ---0xf90ae47202e0
+               __kernel_gettimeofday
+
+     3.09%  kvstore  [kernel.kallsyms]  [k] writel                                     -      -
+            |
+            ---writel
+               e1000_xmit_frame
+               dev_hard_start_xmit
+               sch_direct_xmit
+               __dev_xmit_skb
+               __dev_queue_xmit
+               neigh_hh_output
+               ip_finish_output2
+               __ip_finish_output
+               ip_finish_output
+               ip_output
+               __ip_queue_xmit
+               ip_queue_xmit
+               __tcp_transmit_skb
+               tcp_write_xmit
+               __tcp_push_pending_frames
+               tcp_push
+               tcp_sendmsg_locked
+               tcp_sendmsg
+               inet_sendmsg
+               __sock_sendmsg
+               __sys_sendto
+               __arm64_sys_sendto
+               invoke_syscall
+               el0_svc_common.constprop.0
+               do_el0_svc
+               el0_svc
+               el0t_64_sync_handler
+               el0t_64_sync
+               __libc_send (inlined)
+               send
+               nty_send
+               ntyco_send_all
+               ntyco_flush_output (inlined)
+               ntyco_stream_control (inlined)
+               server_reader
+               _exec
+
+     2.91%  kvstore  [kernel.kallsyms]  [k] __fget_light                               -      -
+            |
+            ---__fget_light
+               |
+                --2.82%--__fdget
+                          do_epoll_wait
+                          do_epoll_pwait.part.0
+                          __arm64_sys_epoll_pwait
+                          invoke_syscall
+                          el0_svc_common.constprop.0
+                          do_el0_svc
+                          el0_svc
+                          el0t_64_sync_handler
+                          el0t_64_sync
+                          __GI_epoll_pwait (inlined)
+                          nty_schedule_run
+                          ntyco_start_runtime
+                          kvs_server_run (inlined)
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+     2.91%  kvstore  [kernel.kallsyms]  [k] invoke_syscall                             -      -
+            |
+            ---invoke_syscall
+               el0_svc_common.constprop.0
+               do_el0_svc
+               el0_svc
+               el0t_64_sync_handler
+               el0t_64_sync
+               __GI_epoll_pwait (inlined)
+               nty_schedule_run
+               ntyco_start_runtime
+               kvs_server_run (inlined)
+               main
+               __libc_start_call_main
+               __libc_start_main_impl (inlined)
+               _start
+
+     1.91%  kvstore  [kernel.kallsyms]  [k] get_random_u16                             -      -
+            |
+            ---get_random_u16
+               |
+               |--1.00%--invoke_syscall
+               |          el0_svc_common.constprop.0
+               |          do_el0_svc
+               |          el0_svc
+               |          el0t_64_sync_handler
+               |          el0t_64_sync
+               |          __GI_epoll_pwait (inlined)
+               |          nty_schedule_run
+               |          ntyco_start_runtime
+               |          kvs_server_run (inlined)
+               |          main
+               |          __libc_start_call_main
+               |          __libc_start_main_impl (inlined)
+               |          _start
+               |
+                --0.91%--el0_svc_common.constprop.0
+                          do_el0_svc
+                          el0_svc
+                          el0t_64_sync_handler
+                          el0t_64_sync
+                          __GI_epoll_pwait (inlined)
+                          nty_schedule_run
+                          ntyco_start_runtime
+                          kvs_server_run (inlined)
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+     1.73%  kvstore  kvstore            [.] strcmp@plt                                 -      -
+            |
+            ---strcmp@plt
+               kvs_hash_set
+               kvs_filter_protocol
+               kvs_execute_tokens (inlined)
+               kvs_execute_fields
+
+     1.36%  kvstore  kvstore            [.] kvs_hash_set                               -      -
+            |
+             --1.18%--kvs_hash_set
+                       kvs_filter_protocol
+                       kvs_execute_tokens (inlined)
+                       kvs_execute_fields
+
+     1.09%  kvstore  [vdso]             [.] 0x00000000000002dc                         -      -
+            |
+            ---0xf90ae47202dc
+               __kernel_gettimeofday
+
+     0.91%  kvstore  kvstore            [.] nty_schedule_run                           -      -
+            |
+            ---nty_schedule_run
+               ntyco_start_runtime
+               kvs_server_run (inlined)
+               main
+               __libc_start_call_main
+               __libc_start_main_impl (inlined)
+               _start
+
+     0.82%  kvstore  [kernel.kallsyms]  [k] ep_poll                                    -      -
+            |
+            ---ep_poll
+               |
+                --0.64%--do_epoll_wait
+                          do_epoll_pwait.part.0
+                          __arm64_sys_epoll_pwait
+                          invoke_syscall
+                          el0_svc_common.constprop.0
+                          do_el0_svc
+                          el0_svc
+                          el0t_64_sync_handler
+                          el0t_64_sync
+                          __GI_epoll_pwait (inlined)
+                          nty_schedule_run
+                          ntyco_start_runtime
+                          kvs_server_run (inlined)
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+     0.64%  kvstore  kvstore            [.] parse_number.constprop.0                   -      -
+            |
+            ---parse_number (inlined)
+               parse_field (inlined)
+               kvs_parse_command_limited
+               kvs_replication_apply_capture (inlined)
+               kvs_replication_incremental_message (inlined)
+               kvs_replication_capture_network_protocol
+               ntyco_stream_control (inlined)
+               server_reader
+               _exec
+
+     0.55%  kvstore  [kernel.kallsyms]  [k] __arm64_sys_epoll_pwait                    -      -
+            |
+            ---__arm64_sys_epoll_pwait
+
+     0.55%  kvstore  [kernel.kallsyms]  [k] set_user_sigmask                           -      -
+            |
+            ---set_user_sigmask
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
+
+perf-callgraph; raw SHA256=ed9b8e6142e13b1beac547fc35b594461da7dbf879e31cfb39b9113cded7ad4e
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock'
+# Event count (approx.): 5527637500
+#
+# Children      Self  Command  Shared Object      Symbol
+# ........  ........  .......  .................  .............................................
+#
+    44.55%     0.18%  kvstore  kvstore            [.] kvs_execute_fields
+            |
+            ---kvs_execute_fields
+               |
+                --44.09%--kvs_execute_tokens (inlined)
+                          kvs_filter_protocol
+                          |
+                           --43.55%--kvs_hash_set
+                                     |
+                                     |--27.00%--kvs_allocator_alloc
+                                     |          pool_alloc_small (inlined)
+                                     |          |
+                                     |           --3.18%--slab_alloc_block (inlined)
+                                     |
+                                     |--13.18%--__GI_strcmp (inlined)
+                                     |
+                                      --1.73%--strcmp@plt
+
+    44.09%     0.00%  kvstore  kvstore            [.] kvs_execute_tokens (inlined)
+            |
+            ---kvs_execute_tokens (inlined)
+               kvs_filter_protocol
+               |
+                --43.55%--kvs_hash_set
+                          |
+                          |--27.00%--kvs_allocator_alloc
+                          |          pool_alloc_small (inlined)
+                          |          |
+                          |           --3.18%--slab_alloc_block (inlined)
+                          |
+                          |--13.18%--__GI_strcmp (inlined)
+                          |
+                           --1.73%--strcmp@plt
+
+    44.09%     0.18%  kvstore  kvstore            [.] kvs_filter_protocol
+            |
+             --43.91%--kvs_filter_protocol
+                       |
+                        --43.55%--kvs_hash_set
+                                  |
+                                  |--27.00%--kvs_allocator_alloc
+                                  |          pool_alloc_small (inlined)
+                                  |          |
+                                  |           --3.18%--slab_alloc_block (inlined)
+                                  |
+                                  |--13.18%--__GI_strcmp (inlined)
+                                  |
+                                   --1.73%--strcmp@plt
+
+    43.55%     1.36%  kvstore  kvstore            [.] kvs_hash_set
+            |
+            |--42.18%--kvs_hash_set
+            |          |
+            |          |--27.00%--kvs_allocator_alloc
+            |          |          pool_alloc_small (inlined)
+            |          |          |
+            |          |           --3.18%--slab_alloc_block (inlined)
+            |          |
+            |          |--13.18%--__GI_strcmp (inlined)
+            |          |
+            |           --1.73%--strcmp@plt
+            |
+             --1.36%--kvs_execute_fields
+                       kvs_execute_tokens (inlined)
+                       kvs_filter_protocol
+                       kvs_hash_set
+
+    39.91%     0.00%  kvstore  kvstore            [.] _start
+            |
+            ---_start
+               __libc_start_main_impl (inlined)
+               __libc_start_call_main
+               main
+               kvs_server_run (inlined)
+               ntyco_start_runtime
+               nty_schedule_run
+               |
+                --38.82%--__GI_epoll_pwait (inlined)
+                          |
+                           --24.82%--el0t_64_sync
+                                     el0t_64_sync_handler
+                                     |
+                                      --24.73%--el0_svc
+                                                |
+                                                 --10.36%--do_el0_svc
+                                                           el0_svc_common.constprop.0
+                                                           |
+                                                            --9.00%--invoke_syscall
+                                                                      |
+[callgraph excerpt ends]

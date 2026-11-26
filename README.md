@@ -53,8 +53,7 @@ make ebpf-capture
 性能复现使用 `-O2 -g`，在仓库根目录强制重编译项目、NtyCo 和对照工具，避免复用默认构建的旧对象：
 
 ```bash
-make -B -j4 CFLAGS='-std=gnu11 -Wall -Wextra -O2 -g' \
-    all ebpf-capture benchmark-tools
+make -B -j4 OPT=-O2 all ebpf-capture benchmark-tools
 ```
 
 ### 2. 写入与读取
@@ -144,7 +143,7 @@ NtyCo 网络层负责连接、收发和缓冲区；长度前缀解析集中在�
 | 删除 | `DEL` | `RDEL` | `HDEL` | `SDEL` |
 | 判断存在 | `EXIST` | `REXIST` | `HEXIST` | `SEXIST` |
 
-新增/覆盖、修改：`命令 key value`。读取、删除、判断存在：`命令 key`。`SAVE` 手动保存 Snapshot。
+新增/覆盖、修改：`命令 key value`。读取、删除、判断存在：`命令 key`。`SAVE` 发起后台 Snapshot（fork+COW），`SAVEINFO` 查询是否完成；`ALLOCINFO` 查询池明细，`ALLOCTRIM` 显式触发system/glibc回收。
 
 对 RESP 请求，重复 SET 成功返回 `+OK` 并覆盖旧值；MOD 未命中返回 `-ERR key not found`，不插入新键。插入测试使用不同 key，更新测试固定使用 MOD，这是负载分组约定，不是 SET 只能新增的协议限制。[实现与既有用例核对](docs/performance/REPORT.md#命令语义与测量约定)。
 
@@ -178,8 +177,12 @@ $11\r\nhello world\r\n
 | 配置 | 写入/恢复边界 |
 | --- | --- |
 | `none` | 从空引擎启动，不写本地 AOF，也不支持客户端 SAVE。主从全量仍使用复制专用临时快照。 |
-| `snapshot` | 普通写入只更新内存；成功 `SAVE` 后保存二进制 `snapshot.bin`，重启只加载快照，不创建 AOF |
+| `snapshot` | 普通写入只更新内存；`SAVE`接受后由fork+COW子进程保存`snapshot.bin`，用`SAVEINFO`确认完成，重启只加载已完成快照，不创建AOF |
 | `aof` | 成功写回复前完成 AOF 追加和同步；重启回放 `commands.aof`，不需要 SAVE，也不生成快照 |
+
+### SAVE 是后台保存
+
+本项目 `SAVE` **非阻塞**：fork()+COW子进程保存，语义等价于Redis **BGSAVE**，不是Redis同步SAVE。`+OK`表示已接受，不表示落盘已结束。已有保存时只设一个save_pending接力标记；重复请求会合并。以`SAVEINFO`确认completed增加、failed未增加且in_progress=0/pending=0，优雅退出会等待最后一轮。NtyCo的10ms后台协程用waitpid(WNOHANG)回收；[状态与失败边界](docs/REPLICATION.md#非阻塞-save)。
 
 ### v3 快照与校验模式
 
@@ -330,27 +333,89 @@ Primary 和 Replica 必须使用同一版本的全量控制协议：
 `FULLRESYNC_RDMA <repl_id> <snapshot_bytes> <rdma_port> <sync_id> <stream_offset> <incremental_mode>`。
 末尾固定为 `0`（socket）或 `1`（ebpf）。Replica 发送 `PSYNC ? -1 <service_port>`；Primary 兼容无端口的旧 socket PSYNC。eBPF 模式必须提供 Replica service_port，地址从控制连接 getpeername 获取。
 
-```text
-Primary                 Replica:service_port        Capture (client)
-   |<-- PSYNC ? -1 port -----|                           |
-   |-- FULLRESYNC_RDMA ----->|                           |
-   |===== RDMA snapshot ===>|                           | 采集/缓存命令
-   |                        | 校验、加载、删除接收临时文件 |
-   |<-- SYNC_FINISHED -------|                           |
-   | 最终 ACK -> 断开 RDMA -> 删除临时文件 -> 释放 RDMA    |
-   |-- replica_ready uprobe ---------------------------->|
-   |                        |<-- TCP connect + BEGIN ---|
-   |                        |--- APPLIED current ------>|
-   |                        |<-- DATA / ONLINE ---------|
-   |                        |--- APPLIED -------------->|
-   | 控制连接持续保留        |                           |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as 写客户端
+    participant P as Primary
+    participant R as Replica
+    participant B as 内核BPF探针与Maps
+    participant C as ebpf_capture Client
+    Note over P,C: Primary启动后挂探针，再启动Replica；socket分支不启动采集器
+    R->>P: TCP connect / PING
+    P-->>R: PONG
+    R->>P: PSYNC ? -1 service_port
+    P->>P: getpeername取得Replica IPv4，保存service_port
+    P->>P: 创建full_sync_id，快照前固定 S=stream_end
+    P->>B: kvs_replication_snapshot_boundary(primary_id, full_sync_id, S)
+    P->>P: 同调度线程生成replication.snapshot.tmp
+    P-->>R: FULLRESYNC_RDMA primary_id bytes rdma_port full_sync_id S mode
+    Note over P,C: RDMA全量期间持续采集S之后的成功写，先缓存后推流
+    R->>P: RDMA connect / READY full_sync_id
+    loop 全量传输，累计确认
+        P->>R: RDMA快照数据块
+        R-->>P: SNAPSHOT_ACK bytes
+    end
+    R->>R: 完整写入、校验、加载snapshot.db.replication.tmp
+    R->>R: unlink接收临时快照，applied=S
+    R-->>P: 提交最终RDMA SNAPSHOT_ACK
+    R->>P: TCP SYNC_FINISHED full_sync_id S
+    Note over P,R: SYNC_FINISHED不等本地RDMA关闭后才发，避免互相等待
+    P->>P: 全字节ACK且本地SEND完成
+    P-->>R: 发起RDMA正常disconnect
+    P->>P: 关闭快照reader，unlink replication.snapshot.tmp
+    par Primary回收
+        P->>P: 收DISCONNECTED，释放RDMA，closed=1
+    and Replica回收
+        R->>R: 收正常DISCONNECTED，幂等断开并释放RDMA，closed=1
+    end
+    Note over P,R: 无SYNC_FINISHED_OK命令；两端独立满足自己的完成条件
+    R->>R: sent且closed，进入CATCH_UP
+    P->>P: received且closed，启动catch-up
+    alt socket模式 mode=0
+        P->>R: 原TCP控制连接发送增量 / ONLINE target
+        R->>R: 连续应用至target，进入ONLINE
+    else ebpf模式 mode=1
+        P->>B: kvs_replication_replica_ready(ev)，noinline/noclone
+        B-->>C: 独立64KiB ready_events ringbuf
+        C->>C: 校验Map中的本轮身份、S、水位与缓存边界
+        C->>R: TCP connect Replica service_port
+        C->>R: BEGIN primary_id full_sync_id S或续传位置
+        R->>R: 校验就绪状态、源IPv4、身份、offset、唯一活动链路
+        R-->>C: APPLIED actual_offset
+        loop 持续追赶与实时推流
+            W->>P: 写命令
+            P->>P: 执行成功 ret=0
+            P->>B: on_committed：原始RESP切片与连续offset
+            B-->>C: events ringbuf；stream_end Map持续更新
+            C->>C: 保存在8MiB环形缓存
+            C->>R: DATA offset bytes + RESP字节
+            R->>R: 只按完整命令连续应用，推进applied
+            R-->>C: APPLIED offset，允许回收缓存
+        end
+        C->>R: ONLINE target
+        R->>R: 应用至target后进入ONLINE
+        opt 区间缺口、溢出、丢失或不可续传
+            C->>R: ERROR reason（已完成身份握手后）
+            R->>R: 取消本轮，清理并重新全量
+        end
+    end
 ```
 
 普通 socket 模式在同样的加载握手后，由 Primary 在原控制连接发送增量和 `ONLINE`。eBPF 模式的增量及 `ONLINE` 全部来自采集端；Primary 不回传增量，不创建 `.sock` 文件。网络层独占连接的关闭权，增量接入检查当前就绪状态、Primary 源 IP、两份同步 ID 和续传偏移，并拒绝第二条活动链路。
 
+### 方案取舍与边界
+
+- **RDMA角色**：Primary生命周期长、固定单端口接受Replica重连，控制TCP和RDMA均Replica主动建连，地址/防火墙方向一致，便于后续多从聚合；当前实现仍只管理一轮单Replica会话，不能声称已支持多从并行全量。
+- **eBPF Client**：利用PSYNC携带的业务端口，删除默认采集监听端口；采集器主动连接Replica，代价是反向网络可达性与严格BEGIN校验。用户态8MiB缓存只保有限历史，持续写入超过追赶速率会溢出并要求重全量；它不是持久化backlog。
+- **提交点不前移**：成功写ret=0后保留on_committed探针；标准RESP直接借用当前原始切片，inline回退编码，避免Primary重复编码/堆分配。nty_recv无法保证多协程执行顺序、过滤读/失败命令或对齐快照前固定S，不能简单改成收包探针。[完整正确性约束](docs/REPLICATION.md#提交点探针与原始resp切片)。
+- **结束顺序**：Replica校验加载并删.tmp后发SYNC_FINISHED，不等RDMA关闭才发；两端独立回收正常RDMA资源后进入增量，无SYNC_FINISHED_OK。提前断连、最终ACK缺失、控制失效不进入ONLINE，5秒等待超时清理并重全量。
+
+[完整新版时序、主动推流与异常分支](docs/REPLICATION.md)。
+
 内核 BPF 在成功提交点更新 `stream_end`，在快照边界更新包含本轮身份、S 和丢失计数基线的 `snapshot_boundary` Map；采集端读取一致的 Map 状态核对 `BEGIN` 和追平目标。BPF ring buffer 只负责搬运事件，可靠范围由用户态的 8 MiB 字节缓存决定：连接前滚动淘汰，连接后只按 `APPLIED` 回收。单事件最多 4 KiB 编码命令。
 
-采集端在单独的 `ready_events` ring buffer 中读取就绪事件，先以当前边界/水位校验，再发送 `BEGIN`。Replica 回传实际 `APPLIED`，包括 ACK 丢失时已执行但尚未被采集端确认的部分；采集端校验完整命令边界后继续发送，避免重复执行。瞬断采用 25–500ms 退避重连，未应用的半包从最近完整命令位置重传。
+采集端在独立 **64KiB** 的 `ready_events` ring buffer 中读取就绪事件，先以当前边界/水位校验，再发送 `BEGIN`。Replica 回传实际 `APPLIED`，包括 ACK 丢失时已执行但尚未被采集端确认的部分；采集端校验完整命令边界后继续发送，避免重复执行。瞬断采用 25–500ms 退避重连，未应用的半包从最近完整命令位置重传。
 
 缓存淘汰/溢出、区间缺口、内核丢失计数变化等错误要求重新全量。Replica 等待首次接入或断线恢复超过 5 秒、接收到 ERROR 时，清理本轮并自动重新 PSYNC；控制连接失效始终取消增量，不提供旧数据。采集端重启丢失缓存，须等待新全量边界，不能续用旧会话。`--listen IPv4:PORT` 仅保留作旧协议诊断与细粒度兼容测试。
 
@@ -389,11 +454,13 @@ RDMA_TEST_IP=172.16.145.135 make test-capture-faults test-capture-server
 
 详见[四引擎分配与释放路径核对](docs/performance/REPORT.md#分配覆盖范围只读源码核对)。这三方案比较不是只替换固定大小节点。
 
-空 slab 在最后一个对象释放后摘链并 `munmap`，大对象仍单独解除映射。2026-11-19 的 `-O2 -g` 百万条三轮实测：pool 起始 / 写满 / 删除核对后 RSS 为 2.660 / 274.930 / 2.680 MiB，结束比起始高 20 KiB；写满仍高于 system 的 237.066 MiB，不能称为全面省内存。删除后 RSS 保留不等于泄漏。VmSize 与物理 RSS 分开记录。[本批结果和口径](docs/performance/2026-11-19.md#分配器百万条-rss)；[历史分配覆盖与结果](docs/performance/REPORT.md)。
+空slab在最后一个对象释放后立即摘链并munmap，大对象单独解除映射；规格16..4096保持不变。`ALLOCINFO`区分当前映射、累计映射和各规格used/capacity；`ALLOCTRIM`只在显式请求时为system/glibc调用malloc_trim(0)，不改变默认启动/free行为。
+
+最新同轮百万条公平回收（各1轮）：system-malloctrim删除核对后RSS **2.398MiB**，pool **2.707MiB**；pool不是所有条件下更省内存。起始5个64KiB slab=**0.3125MiB**，规格取整碎片**81.18MiB**，不为129B value过拟合新增160B档。[明细、五模式历史与同轮对照](docs/performance/REPORT.md#6-内存池百万条明细与公平回收保留-stage-31)。
 
 ## 测试
 
-测试分层，不要求每个单元用例都灌一万条。以下命令在仓库根目录执行，可能编译测试程序。本批性能测量前已完成 `-O2 -g` 正确性回归，包括单元/消毒器、真实 RDMA、单机持久化恢复、双机 10 万条与故障测试；真实 BPF 小负载专项由交互式 sudo 终端补跑通过。该验收不代替下述持续负载测试：修复前真实 eBPF 性能组三轮出现缓存溢出/事件缺口；修复后的正式三轮结果见下方对比。
+测试分层，不要求每个单元用例都灌一万条。以下命令在仓库根目录执行，可能编译测试程序。截至49b8d3d的性能测量前已完成 `-O2 -g` 正确性回归，包括单元/消毒器、真实 RDMA、单机持久化恢复、双机 10 万条与故障测试；真实 BPF 小负载专项由交互式 sudo 终端补跑通过。历史真实eBPF旧版本曾出现缓存溢出/缺口，记录保留；最终49b8d3d的c1/c8各四档三轮均通过一致性。Stage 5只做文档与图表校验，不将旧PASS写成新执行。
 
 | 入口 | 目标与规模 | 环境/判据 |
 | --- | --- | --- |
@@ -411,105 +478,55 @@ RDMA_TEST_IP=172.16.145.135 make test-capture-faults test-capture-server
 
 ## 性能结果
 
-### 2026-11-19：最新正式数据
+### Stage 5 最终归档：49b8d3d / -O2
 
-修复后版本为 `846c87d`，修复前为 `0e25dd7`，项目与 NtyCo 均以 `-O2 -g` 构建。两台 aarch64 VM 各 4 vCPU、约 8 GiB，共享 Mac；全量复制走软件 SIW RDMA，增量走 TCP。表中取三轮中位数，波动为 `(max-min)/median × 100%`；SAVE 的 1k 档仅一个完整样本。P1、Pipeline 与实时复制为修复后重测，SAVE、RSS 和传输沿用 `0e25dd7` 的正式结果。
+[完整正式报告与原始轮次](docs/performance/REPORT.md) · [数值与来源](docs/performance/data/measurements-2026-11-26.json) · [复现/离线制图](docs/performance/STAGE5-REPRODUCING.md)
 
-本轮通过 TCP_NODELAY 消除 Pipeline 小回复固定等待，将复制输出/IPC 单次上限统一为 64 KiB、重试缩至 1ms、内核 ring 扩至 16 MiB，并补充失败计数日志。用户态缓存仍为 8 MiB，缺口/溢出仍明确失败；组合修复未逐开关隔离归因。
+**最终版本重测**为Pipeline交替30次、双机c1/c8四档各3轮；其余为注明版本的阶段保留测量。不得把旧版本、不同客户端或不同c/P混算。三轮取各指标中位数，波动率=100×(max-min)/median；单轮无轮间波动。
 
-**SAVE：100 万条唯一 Hash 记录，key 32B / value 128B，pool、整文件校验。** 总耗时含串行写入与同步 SAVE，计时后各核对 100 万条。
+| 组别 | 成绩 | 版本/轮次与口径 |
+|---|---|---|
+| 单请求 ECHO / kv-none / redis-none | 18,365 / 18,208 / 19,286 QPS | 保留Stage 1，各3轮；c1/P1，hotkey+128B x |
+| 严格kv-aof | 2,780.87→3,052.04，+9.75% | 保留Stage 1，各3轮；LINK WRITE+DATASYNC，非只提交异步io-wq |
+| redis-aof | 3,771.73 QPS | 保留Stage 1，3轮；appendfsync always，关闭RDB/rewrite |
+| Pipeline P160 | **2,941,176 vs Redis 2,631,579 QPS，+11.76%** | 49b8d3d，交替3轮/端/深度，共30次 |
+| 后台SAVE并发 | SET+GET整组P99 **0.153ms** | 保留Stage 2，3万条、2073对请求，非百万条单SET延迟 |
+| 百万条SAVE四档 | 总耗时248.301–277.613s；1k历史1713.18→277.613s | 各1轮；save_pending使1000次请求仅完成230次保存，非等次数纯IO加速 |
+| 公平回收RSS | system-malloctrim **2.398MiB** vs pool **2.707MiB** | 保留Stage 3.1，同轮各1次，百万条删除核对后 |
+| 双向sendfile / RDMA | 约147–149 / 84 MiB/s | 保留Stage 3.2，各3轮；168000052B，1MiB/window1；软件SIW非硬件RNIC |
 
-| 每多少条 SAVE | 总耗时(s) | SAVE 累计(s) | 写 QPS | 轮次 |
-| --- | ---: | ---: | ---: | ---: |
-| 100 万 | 288.68 | 2.81 | 3,464.05 | 3 |
-| 10 万 | 296.41 | 15.09 | 3,373.69 | 3 |
-| 1 万 | 417.41 | 146.22 | 2,395.71 | 3 |
-| 1 千 | 1713.18 | 1451.45 | 583.71 | 1 |
+### Pipeline与阶段收益
 
-![SAVE 频率耗时分解（沿用基线）](docs/performance/figures/20261119-save-frequency.svg)
+最终c1、100000请求、SET hotkey/128 ASCII x，无持久化；P10/20/40/80/160各端3轮。短轮吞吐受计时粒度影响，P20/P80的差异小于观测波动，不认定稳定领先。
 
-**P1：最新三轮中位数，每轮 10 万次、32B 热点键 / 128B 值覆盖写。** Redis 7.0.15 关闭 RDB；AOF 显式 `appendfsync always`、关闭自动 rewrite，与 kvstore 成功回复前同步的承诺对齐，kvstore 使用 `aof_checksum=none`。ECHO 为独立网络/协议参考程序。
+![Pipeline交替三轮](docs/performance/figures/20261126-pipeline.svg)
 
-| P1 场景 | QPS | P50 RTT(ms) | P99 RTT(ms) | 服务端 CPU/单核 | QPS 波动 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| echo | 17,953.32 | 0.055 | 0.087 | 31.2% | 11.19% |
-| kv-none | 17,803.10 | 0.055 | 0.079 | 31.3% | 1.66% |
-| kv-aof | 2,790.18 | 0.351 | 0.487 | 22.0% | 4.82% |
-| redis-none | 19,029.50 | 0.055 | 0.071 | 27.3% | 4.96% |
-| redis-aof | 3,661.39 | 0.263 | 0.391 | 15.4% | 0.55% |
+已测阶段为O2→游标/64KiB→tokens栈缓冲；历史各P仅1轮。没有同SET/hotkey负载的O0配对成绩，不虚构O0收益，也不把不同窗口差值相加为单项贡献。[分阶段表与图](docs/performance/REPORT.md#分阶段贡献机制与已测数值分开)。
 
-**Pipeline：c1、每端每档3×10万请求、热点覆盖、无持久化。**
+### 双机满载：c8/P1，100000次HSET，32B/128B
 
-| P | kv 前 QPS | kv 后 QPS | kv 提升 | Redis 前 QPS | Redis 后 QPS | 新 kv/Redis |
-| --- | --- | --- | --- | --- | --- | --- |
-| 10 | 241.19 | 169,491.53 | 702.73× | 170,940.17 | 173,611.12 | 97.63% |
-| 20 | 482.32 | 231,481.47 | 479.93× | 295,858.00 | 316,455.69 | 73.15% |
-| 40 | 964.90 | 316,455.69 | 327.97× | 534,759.31 | 549,450.56 | 57.59% |
-| 80 | 1,933.00 | 364,963.53 | 188.81× | 840,336.12 | 869,565.19 | 41.97% |
-| 160 | 3,869.37 | 401,606.44 | 103.79× | 1,265,822.75 | 1,408,450.62 | 28.51% |
+| 模式 | QPS中位数 | P50/P99 ms | QPS波动率 | CPU Primary/Capture/Replica % | 可见性P50/P99 ms |
+|---|---:|---:|---:|---:|---:|
+| none | 122,849.88 | 0.0617/0.1369 | 1.68% | 98.28/—/— | — |
+| ebpf-capture-only | 106,097.99 | 0.0729/0.1412 | 1.20% | 98.90/1.07/— | — |
+| socket | 122,241.66 | 0.0629/0.1216 | 0.69% | 98.70/—/25.41 | 0.939/1.230 |
+| ebpf | 98,863.36 | 0.0785/0.1427 | 0.34% | 98.77/6.91/60.82 | 1.994/2.304 |
 
-![Pipeline 修复前后与 Redis](docs/performance/figures/20261119-pipeline.svg)
+四档各3轮全部通过；复制档逐条验证100000条一致。采集相对none QPS−13.64%；ebpf相对socket−19.12%。CPU 100%=一个核心。可见性另用1000次c8并发HMOD/HGET探测，包含查询RTT，不是持续HSET压力内的延迟。
 
-**三分配器：同一四引擎百万条，写入、读回、删除、未命中核对均通过。** RSS 单位 MiB，状态取五次采样中位数，再取三轮中位数；结束时服务仍运行，无强制 trim/decay 调优。
+c1/P1同版本另组各3轮：none/capture-only/socket/ebpf QPS中位数约15,404/13,643/21,386/13,975；socket Primary约99.4% CPU，none约52.1%。1ms流控唤醒与调度利用率差有关，没有独立因果消融；不能说复制本身提高服务吞吐。两组完整表、每轮值与CPU定义见正式报告。
 
-| 分配器 | 起始 RSS | 写满 RSS | 删除核对后 RSS | 结束−起始 |
-| --- | ---: | ---: | ---: | ---: |
-| system | 2.344 | 237.066 | 237.066 | +234.723 |
-| pool | 2.660 | 274.930 | 2.680 | +0.020 |
-| jemalloc | 4.738 | 245.512 | 6.527 | +1.789 |
+![c1与c8四档主从对照](docs/performance/figures/20261126-replication.svg)
 
-![三分配器百万条 RSS（沿用基线）](docs/performance/figures/20261119-allocator-rss.svg)
+Replica idle时流量水位完全不变但**总CPU55.13%**；perf栈定位到nty_schedule_run→epoll_pwait（Children81.82%，Self26.59%，不是“epoll占55.13%”）。持续写入时另见分配器27.00%、strcmp/kvs_hash_set13.36%热点。源码存在亚毫秒等待截断为0的路径，与空转观测一致；尚未逐次测epoll参数或APPLIED频次，不把推测当结论。[直接证据](docs/performance/REPORT.md#replica-cpu直接perf证据与源码解释)。
 
-**双机实时复制：c1/P1、3×10万请求/模式。**
+### 其他正式图表与历史
 
-| 模式 | 前 Primary QPS | 后 Primary QPS | 后通过轮数 | 前可见性 P99(ms) | 后可见性 P99(ms) | 后 QPS 波动 |
-| --- | --- | --- | --- | --- | --- | --- |
-| none | 33,079.72 | 17,787.26 | 3/3 | — | — | 0.84% |
-| socket | 32,216.49 | 29,154.52 | 3/3 | 51.477 | 3.219 | 1.23% |
-| ebpf | 3/3 失败，无有效复制成绩 | 25,667.35 | 3/3 | — | 5.557 | 2.07% |
+[单请求/AOF图](docs/performance/figures/20261126-single-aof.svg) · [阶段轨迹](docs/performance/figures/20261126-pipeline-stages.svg) · [异步SAVE](docs/performance/figures/20261126-save.svg) · [CPU分布](docs/performance/figures/20261126-replication-cpu.svg) · [Replica热点](docs/performance/figures/20261126-replica-profile.svg) · [双向传输](docs/performance/figures/20261126-transfer.svg) · [Bufferbloat诊断](docs/performance/figures/20261126-bufferbloat.svg) · [内存公平回收](docs/performance/figures/20261126-memory.svg)
 
-三模式各三轮均通过；复制模式核对 ONLINE、最终标记及每轮 1000 次可见性探针，eBPF 三轮 oversize/ring_full/read_error 均为零。
+iperf3默认单流RTT61–63ms；另一次-w131072诊断降至约1.1ms、吞吐升至约1.14–1.15Gb/s，支持缓冲排队诊断。原生传输从R就绪交换后到末A，setup/checksum单列、不含落盘与加载；同时给MiB/s和Gb/s，**软件SIW不外推硬件RDMA性能**。
 
-`none`、`socket` 吞吐中位数分别下降 46.23% / 9.51%；旧 `none` 波动 46.82%，本轮 0.84%。差异原因尚未隔离定位，不能概括为所有模式吞吐均提升；逐轮原值见完整报告。
-
-短时快速 Pipeline 样本受计时粒度与调度噪声限制；P/QPS 是批周期，非单条执行时间。复制QPS计量Primary回复，另核对ONLINE、最终标记和每轮1000次可见性探针；完整CPU、延迟、失败计数与每轮数据见报告。组合修复未逐开关隔离归因，旧eBPF缺口也不能追认一定由ring_full造成。
-
-![双机实时复制修复前后](docs/performance/figures/20261119-replication.svg)
-
-**2026-11-20：直连 eBPF 单轮复测，135→136。**
-
-同样使用 `-O2 -g`、c1/P1、32B 热键覆盖 128B 值、1 万次热身和 10 万次正式 HSET，另做 1,000 次串行可见性探针。普通 socket 和 `.sock` eBPF 沿用上表修复后历史三轮，未在本日重测；新值是单轮，不计算轮间波动。
-
-| 模式 | 样本 | Primary QPS | 可见性 P50(ms) | 可见性 P99(ms) |
-| --- | --- | ---: | ---: | ---: |
-| 普通 socket（历史） | 3 轮中位数 | 29,154.52 | 1.526 | 3.219 |
-| 旧 `.sock` eBPF（历史） | 3 轮中位数 | 25,667.35 | 4.172 | 5.557 |
-| 直连 eBPF（本轮） | 1 轮实测 | 28,727.38 | 2.542 | 2.730 |
-
-相对旧 `.sock` eBPF 的三轮中位数，本轮 QPS **+11.92%**，可见性 P50 **−39.08%**、P99 **−50.88%**。相对历史普通 socket，QPS **−1.47%**、P50 **+66.57%**、P99 **−15.20%**，不能概括为全面更快。Primary / 采集端 / Replica CPU 本轮约 **34.1% / 3.1% / 37.5%**，旧 `.sock` eBPF 为 **99.4% / 3.8% / 5.2%**；CPU 工作分布也改变了。
-
-本轮 ONLINE、最终标记及 `APPLIED = stream_end = 20,979,189` 验证通过，三项 BPF 丢失计数均为零。可见性采样在 QPS 窗口外，包含两端请求往返和 1ms 轮询；不代表压测并发期间的延迟。单轮、跨日、共享宿主机及整版代码变化限制因果归因，不能将差值全部算作删除 Unix socket 的收益。清理脚本的退出轮询告警与随后独立清理核对均完整保留。
-
-[完整口径、原始结果与清理说明](docs/performance/2026-11-20-direct-ebpf.md)。
-
-![直连 eBPF 单轮与历史参考](docs/performance/figures/20261120-direct-ebpf.svg)
-
-**相同 168,000,052 字节真实快照：热缓存、1 MiB 分块 / window=1、接收进内存，12 次正式文件传输均通过长度/CRC。** 只计首块到末 ACK，不含准备、CRC、落盘或加载。
-
-| 方向 | sendfile(MiB/s) | RDMA(MiB/s) | iperf3 单流 30 秒(Gb/s) |
-| --- | ---: | ---: | ---: |
-| 135→136 | 146.52 | 82.87 | 0.461 |
-| 136→135 | 137.38 | 84.66 | 0.450 |
-
-iperf3 是独立负载参考，不能将其数值当作所有传输的链路上限。软件 SIW 结果不推导物理 RNIC 性能。
-
-![双向传输速度（沿用基线）](docs/performance/figures/20261119-transfer.svg)
-
-135 原校时设置已恢复，测试实例、采集进程及 socket 已清理。
-
-[2026-11-19 完整报告：修复前基线、修复后对比及逐轮结果](docs/performance/2026-11-19.md) · [原始数值与环境](docs/performance/data/measurements-2026-11-19.json) · [工具与复现入口](tests/README_BENCHMARK_TOOLS.md)
-
-[2026-11-09—10 历史结果与图表](docs/performance/REPORT.md)。历史版本的客户端、数据集和构建条件不同，不与本批数值混算。
+保留[719836e旧报告](docs/performance/REPORT-719836e-legacy.md)、[2026-11-19报告](docs/performance/2026-11-19.md)、[2026-11-20单轮直连eBPF](docs/performance/2026-11-20-direct-ebpf.md)，均有各自版本、轮次与命令，不并入本轮中位数。
 
 ## 项目结构
 
@@ -534,9 +551,9 @@ iperf3 是独立负载参考，不能将其数值当作所有传输的链路上�
 
 - 仅保证已列客户端子集，不完整兼容 Redis 命令语义；默认 redis-benchmark `-t ping` 未支持
 - key/value 不支持嵌入 `\0`；行命令也不支持字段中包含空格
-- Replica 尚无断线自动重连、复制 backlog 或部分重同步
-- 当前主要面向单 Replica 场景；已有 RDMA 快照累计 ACK，尚无增量 ACK、心跳和自动故障转移
-- Snapshot、AOF 的同步文件操作可能阻塞事件处理
+- eBPF仅支持8MiB缓存内的短断线续传，超时/缺口重全量；无持久化复制backlog或跨采集器重启续传
+- 当前主要面向单Replica；有RDMA累计ACK和eBPF APPLIED，没有选主、通用心跳与自动故障转移
+- standalone SAVE已后台fork+COW；Primary复制快照生成和AOF逐写同步仍可能阻塞事件处理
 - 尚未提供认证、访问控制或 TLS
 
 ## 许可证

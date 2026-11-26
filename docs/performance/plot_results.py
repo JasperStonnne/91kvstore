@@ -165,13 +165,172 @@ def plot_direct(data, target, preview):
     plt.close(fig)
     print('Generated direct eBPF comparison from stored JSON only; no service or test executed.')
 
+def plot_final(data, target, preview):
+    """Stage 5: no benchmarks; keep each version, client and round group separate."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from statistics import median
+    target.mkdir(parents=True, exist_ok=True)
+    if preview:preview.mkdir(parents=True,exist_ok=True)
+    plt.rcParams.update({'font.family':'DejaVu Sans','font.size':10,
+        'axes.spines.top':False,'axes.spines.right':False,'svg.fonttype':'none',
+        'svg.hashsalt':'91kv-stage5-final','figure.facecolor':'white'})
+    blue,orange,gray,green='#2563eb','#d97706','#64748b','#059669'
+    def save(fig,name,title,note):
+        fig.suptitle(title,x=.065,ha='left',fontweight='bold',fontsize=15)
+        fig.text(.065,.025,note,va='bottom',fontsize=8.8,linespacing=1.4)
+        fig.tight_layout(rect=(.015,.16,.985,.90))
+        path=target/('20261126-'+name+'.svg')
+        fig.savefig(path,metadata={'Date':None,'Title':title,'Description':note})
+        path.write_text('\n'.join(line.rstrip() for line in path.read_text().splitlines())+'\n')
+        ET.parse(path)
+        if preview:fig.savefig(preview/('20261126-'+name+'.png'),dpi=125)
+        plt.close(fig)
+    def grid(ax,ylabel):
+        ax.set_ylabel(ylabel);ax.set_axisbelow(True);ax.grid(axis='y',alpha=.18)
+    def var(values):return 100*(max(values)-min(values))/median(values)
+    def measured(ax,values,labels,colors=None,log=False):
+        mids=[median(v) for v in values]
+        ax.bar(range(len(values)),mids,color=colors or blue,width=.66)
+        for i,(v,m) in enumerate(zip(values,mids)):
+            ax.scatter([i+(k-(len(v)-1)/2)*.055 for k in range(len(v))],v,s=20,c='#111827',zorder=3)
+            if len(v)>1:ax.errorbar(i,m,yerr=[[m-min(v)],[max(v)-m]],fmt='none',ecolor='#111827',capsize=4)
+            ax.annotate(f'{m:,.0f}\n'+(f'v={var(v):.2f}%' if len(v)>1 else 'n=1; v=N/A'),(i,max(v)),xytext=(0,7),textcoords='offset points',ha='center',fontsize=8)
+        ax.set_xticks(range(len(labels)),labels)
+        if log:ax.set_yscale('log');ax.set_ylim(min(mids)*.65,max(mids)*2)
+        else:ax.set_ylim(0,max(max(v) for v in values)*1.25)
+    # Stage-1 retained AOF samples: do not relabel them as final-code reruns.
+    labels=['ECHO','kv-none','kv-aof\nbefore','kv-aof\nlinked','Redis\nnone','Redis AOF\nalways']
+    modes=['echo','kv-none','kv-aof-before','kv-aof','redis-none','redis-aof']
+    values=[[r['qps'] for r in data['single']['rows'] if r['server']==m] for m in modes]
+    fig,ax=plt.subplots(figsize=(11,5.8));measured(ax,values,labels,[gray,blue,gray,blue,orange,orange],True);grid(ax,'QPS (log scale)')
+    save(fig,'single-aof','P1 network / persistence references: retained Stage 1',
+         '3 rounds/case; c1/P1/n100000; hotkey + 128 ASCII x. Dots=rounds, whiskers=min/max; v=QPS range/median.\nLinked WRITE + DATASYNC waits for both CQEs; Redis appendfsync=always. These samples were NOT rerun at 49b8d3d.')
+    depths=[10,20,40,80,160];rows=data['pipeline']['rows'];x=np.arange(5)
+    fig,axes=plt.subplots(1,2,figsize=(13,5.8))
+    for mode,color,label in [('kv-none',blue,'kv-none'),('redis-none',orange,'Redis 7.0.15')]:
+        groups=[[r['qps'] for r in rows if r['program']==mode and r['pipeline']==p] for p in depths]
+        mids=[median(v) for v in groups];offset=-.17 if mode=='kv-none' else .17
+        pos=x+offset;axes[0].bar(pos,np.array(mids)/1e6,width=.3,color=color,label=label)
+        for i,(p,v,m) in enumerate(zip(pos,groups,mids)):
+            axes[0].scatter([p]*3,np.array(v)/1e6,color='#111827',s=14,zorder=3)
+            axes[0].errorbar(p,m/1e6,yerr=[[(m-min(v))/1e6],[(max(v)-m)/1e6]],fmt='none',ecolor='#111827',capsize=3)
+            axes[0].text(p,max(v)/1e6+.06,f'{m/1e6:.2f}\n{var(v):.2f}%',ha='center',fontsize=7.5)
+        for metric,style in [('p50_ms','--'),('p99_ms','-')]:
+            vals=[median([r[metric] for r in rows if r['program']==mode and r['pipeline']==p]) for p in depths]
+            axes[1].plot(x,vals,'o'+style,color=color,label=label+' '+metric[:3].upper())
+    for ax in axes:ax.set_xticks(x,[str(p) for p in depths]);ax.set_xlabel('Pipeline depth P')
+    grid(axes[0],'Million requests/s');grid(axes[1],'redis-benchmark native batch latency (ms)')
+    axes[0].set_ylim(0,3.6);axes[0].legend(frameon=False);axes[1].legend(frameon=False,fontsize=8)
+    save(fig,'pipeline','49b8d3d: alternating Pipeline controls (30 runs)',
+         'c1; 100000 requests/run; SET hotkey + 128 ASCII x; no persistence. Each server/P has 3 rounds.\nThroughput labels: median and QPS variation; dots=rounds, whiskers=min/max. P160: kv +11.76%; latency is not per-command CPU time.')
+    fig,ax=plt.subplots(figsize=(11,5.8))
+    for stage,color,label in [('O2',gray,'O2 baseline (1 run/P)'),('cursor64k',orange,'cursor + 64KiB (1 run/P)'),('tokens',green,'4KiB tokens stack (1 run/P)')]:
+        vals=[next(r['qps'] for r in data['pipeline_stages']['rows'] if r['stage']==stage and r['pipeline']==p) for p in depths]
+        ax.plot(x,np.array(vals)/1e6,'o--',color=color,label=label)
+    vals=[median([r['qps'] for r in rows if r['program']=='kv-none' and r['pipeline']==p]) for p in depths]
+    ax.plot(x,np.array(vals)/1e6,'o-',color=blue,label='49b8d3d controls (3 runs/P)')
+    ax.set_xticks(x,[str(p) for p in depths]);ax.set_xlabel('Pipeline depth P');grid(ax,'Million requests/s');ax.legend(frameon=False,fontsize=9)
+    save(fig,'pipeline-stages','Pipeline stages: measured observations, not isolated attribution',
+         'Historical O2/cursor/stack: 1 run/P, variation=N/A. Final controls: 3 runs/P (ranges in Pipeline figure).\nNo paired O0 SET/hotkey sample exists. Stage changes, cross-window noise and version changes cannot be added as causal gains.')
+    rows=data['save']['rows'];fig,axes=plt.subplots(1,2,figsize=(12.5,5.8))
+    axes[0].bar(x[:4],[r['write_seconds'] for r in rows],color=blue,label='Write phase')
+    axes[0].bar(x[:4],[r['drain_seconds'] for r in rows],bottom=[r['write_seconds'] for r in rows],color=orange,label='Final drain')
+    for i,r in enumerate(rows):axes[0].text(i,r['total_seconds']+6,f"{r['total_seconds']:.3f}s\n{r['triggered']}/{r['completed']}",ha='center',fontsize=8)
+    axes[0].set_xticks(range(4),['1M','100k','10k','1k']);axes[0].set_xlabel('Writes between SAVE; labels=triggered/completed');axes[0].set_ylim(0,330);grid(axes[0],'Write + final drain (s)');axes[0].legend(frameon=False,fontsize=8)
+    axes[1].bar([0,1],[1713.18,rows[-1]['total_seconds']],color=[gray,blue]);axes[1].set_xticks([0,1],['Historical sync\n1000 snapshots','Async + coalescing\n230 snapshots'])
+    for i,v in enumerate([1713.18,rows[-1]['total_seconds']]):axes[1].text(i,v+35,f'{v:.3f}s',ha='center')
+    axes[1].set_ylim(0,2000);grid(axes[1],'1k SAVE interval total time (s)')
+    save(fig,'save','Nonblocking SAVE: retained Stage 2 million-record measurements',
+         '1 round/frequency; variation=N/A. Python serial HSET; 1M unique 32B keys + 128B values; all restarts verified.\nBackground save time overlaps writes; do not stack it. 1k total -83.80% includes fewer snapshots, not a 6.17x disk-I/O speedup.')
+    modes=['none','ebpf-capture-only','socket','ebpf'];labels=['none','capture-only','socket','ebpf']
+    fig,axes=plt.subplots(2,2,figsize=(13,9))
+    for line,concurrency in enumerate([1,8]):
+        rs=data['replication']['c'+str(concurrency)]
+        values=[[r['load']['qps'] for r in rs if r['mode']==m] for m in modes]
+        measured(axes[line,0],values,labels,[gray,orange,green,blue]);grid(axes[line,0],f'c{concurrency}/P1 Primary QPS')
+        for metric,offset,color in [('ack_to_observed_p50_ms',-.17,green),('ack_to_observed_p99_ms',.17,blue)]:
+            vals=[median([r['visibility'][metric] for r in rs if r['mode']==m]) for m in ['socket','ebpf']]
+            axes[line,1].bar(np.arange(2)+offset,vals,.3,color=color,label=metric.split('_')[3].upper())
+            for p,v in zip(np.arange(2)+offset,vals):axes[line,1].text(p,v+.06,f'{v:.3f}',ha='center',fontsize=9)
+        axes[line,1].set_xticks([0,1],['socket','ebpf']);grid(axes[line,1],f'c{concurrency} separate visibility (ms)');axes[line,1].legend(['P50','P99'],frameon=False)
+        axes[line,1].set_ylim(0,7 if concurrency==1 else 3)
+    save(fig,'replication','49b8d3d: c1 and c8 replication controls (separate groups)',
+         '3 rounds/mode/concurrency; 100000 HSET; key32B/value128B; preloaded 50k + 50k new; all records verified.\nQPS dots=rounds, whiskers=min/max; v=range/median. Visibility: separate 1000 probes, serial c1 vs c8 chains; not under sustained write load.')
+    fig,axes=plt.subplots(1,2,figsize=(13,5.8))
+    for line,c in enumerate([1,8]):
+        rs=data['replication']['c'+str(c)]
+        for key,label,offset,color in [('primary','Primary',-.23,blue),('capture','Capture',0,orange),('replica','Replica',.23,green)]:
+            vals=[]
+            for mode in modes:
+                group=[r for r in rs if r['mode']==mode]
+                values=[r.get('replica_cpu_pct') if key=='replica' else r['load'][key+'_cpu_pct'] for r in group]
+                vals.append(median(values) if all(v is not None and v>=0 for v in values) else float('nan'))
+            axes[line].bar(np.arange(4)+offset,vals,.21,label=label,color=color)
+        axes[line].set_xticks(range(4),labels);axes[line].set_title(f'c{c}/P1: median of 3 timed rounds');axes[line].set_ylim(0,112);grid(axes[line],'Process CPU % (100% = one core)');axes[line].legend(frameon=False,fontsize=8)
+    save(fig,'replication-cpu','Replication CPU distribution: utilization is part of the result',
+         'Primary/Capture sampled in timed write window; Replica surrounding RPC window (c8 uses READY/GO gate).\nMissing processes omitted. QPS variations (none/capture/socket/ebpf): c1=5.15/20.22/19.45/4.88%; c8=1.68/1.20/0.69/0.34%.')
+    fig,axes=plt.subplots(1,2,figsize=(12,5.8))
+    profile_cpu=[data['replica_profile'][k]['replica_cpu_pct'] for k in ['idle','load']]
+    axes[0].bar([0,1],profile_cpu,color=[gray,blue]);axes[0].set_xticks([0,1],['Idle online','Sustained c8 load']);axes[0].set_ylim(0,85);grid(axes[0],'Replica CPU % (one observation each)')
+    for i,v in enumerate(profile_cpu):axes[0].text(i,v+2,f'{v:.2f}%',ha='center')
+    names=['allocator','strcmp','epoll_pwait'];shares=data['replica_profile']['load']['self_samples_pct'];axes[1].bar(range(3),[shares[k] for k in ['kvs_allocator_alloc','strcmp','epoll_pwait']],color=[blue,orange,gray]);axes[1].set_xticks(range(3),names);grid(axes[1],'Load perf Self samples (%)');axes[1].set_ylim(0,35)
+    save(fig,'replica-profile','Replica CPU: direct idle/load observations after timed rounds',
+         'Idle: sent/applied fixed at 28728000, yet CPU=55.13%. Stack: nty_schedule_run -> epoll_pwait (81.82% children).\nCPU bars: proc ticks, idle 9.27s / load 10.02s; load pidstat 8s=69.16%. Epoll Self=26.59% idle; profiles n=1; variation=N/A.')
+    native=data['transfer']['medians']['native'];fig,ax=plt.subplots(figsize=(11,5.8))
+    for mode,offset,color in [('sendfile',-.18,blue),('rdma',.18,orange)]:
+        rs=[r for r in native if r['mode']==mode];vals=[r['mib_per_second'] for r in rs]
+        ax.bar(np.arange(2)+offset,vals,.32,label=mode+' (3 runs)',color=color)
+        for i,r in enumerate(rs):ax.text(i+offset,r['mib_per_second']+3,f"{r['mib_per_second']:.2f}\nv={r['variation']:.2f}%",ha='center',fontsize=8)
+    ax.set_xticks([0,1],['135 -> 136','136 -> 135']);grid(ax,'Transfer-only throughput (MiB/s)');ax.set_ylim(0,185);ax.legend(frameon=False)
+    factor=data['units']['mibps_to_gbps'];secondary=ax.secondary_yaxis('right',functions=(lambda v:v*factor,lambda v:v/factor));secondary.set_ylabel('Gb/s (decimal bits/s)')
+    save(fig,'transfer','Stage 3.2 retained transfer controls: software SIW, not hardware RNIC',
+         "168000052 B / 160.22 MiB; 1MiB chunks, window=1. Clock: after 'R' ready exchange to final 'A' ACK.\n3 runs/direction/mode; v=QPS-style throughput range. Setup, checksum, file persistence and snapshot loading are excluded.")
+    ip=data['transfer']['medians']['iperf'];fig,axes=plt.subplots(1,2,figsize=(12,5.8))
+    for mode,offset,color,label in [('iperf3',-.18,gray,'Default (3 x 30s)'),('iperf3-W128K30',.18,blue,'-w 131072 (1 x 30s)')]:
+        rs=[r for r in ip if r['mode']==mode]
+        axes[0].bar(np.arange(2)+offset,[r['receiver_gbps'] for r in rs],.32,label=label,color=color)
+        for pos,r in zip(np.arange(2)+offset,rs):
+            samples=[v['receiver_gbps'] for v in data['transfer']['rounds'] if v['mode']==mode and v['sender']==r['sender'] and not v.get('warmup')]
+            label_var=f'v={var(samples):.2f}%' if len(samples)>1 else 'v=N/A'
+            axes[0].text(pos,r['receiver_gbps']+.025,f"{r['receiver_gbps']:.3f}\n{label_var}",ha='center',fontsize=8)
+        axes[1].bar(np.arange(2)+offset,[r['mean_rtt_us']/1000 for r in rs],.32,color=color)
+    for ax in axes:ax.set_xticks([0,1],['135 -> 136','136 -> 135'])
+    grid(axes[0],'iperf3 receiver throughput (Gb/s)');grid(axes[1],'iperf3 sender TCP mean RTT (ms)');axes[0].set_ylim(0,1.55);axes[0].legend(frameon=False,fontsize=8,loc='upper left')
+    save(fig,'bufferbloat','TCP buffer diagnostic: same NIC path, different buffering behavior',
+         'Default 30s controls: n=3/direction; socket-window diagnostic: n=1/direction, variation=N/A.\n-w 131072: RTT ~61-63ms -> ~1.1ms, receiver ~0.44-0.46 -> ~1.14-1.15Gb/s. Supports queueing/bufferbloat, not a hardware RDMA claim.')
+    mem=data['memory'];rows=mem['same_round_trim_pair'];fig,axes=plt.subplots(1,2,figsize=(12.5,6))
+    for mode,offset,color in [('system-malloctrim',-.18,blue),('pool',.18,orange)]:
+        vals=[next(r['VmRSS_KiB']/1024 for r in rows if r['mode']==mode and r['state']==phase) for phase in ['start','peak','end']]
+        axes[0].bar(np.arange(3)+offset,vals,.32,color=color,label=mode)
+        for pos,v in zip(np.arange(3)+offset,vals):axes[0].text(pos,v*1.1,f'{v:.3f}',ha='center',fontsize=8)
+    axes[0].set_xticks(range(3),['Start','Full + verified','Deleted + trim']);axes[0].set_yscale('log');axes[0].set_ylim(1.5,700);grid(axes[0],'VmRSS (MiB, log scale)');axes[0].legend(frameon=False,fontsize=8)
+    bottom=0
+    for label,count,color in [('Requested objects',mem['requested_bytes'],blue),('Size-class rounding',mem['fragmentation_bytes'],orange),('Startup blocks + free + metadata',mem['start_occupied_block_bytes']+mem['slab_free_block_bytes']+mem['slab_metadata_and_alignment_bytes'],gray)]:
+        v=count/1048576;axes[1].bar(0,v,bottom=bottom,color=color,label=f'{label}: {v:.2f} MiB');bottom+=v
+    axes[1].set_xticks([0],['Pool small-slab mapping']);grid(axes[1],'Mapped MiB (not RSS)');axes[1].legend(frameon=False,fontsize=8,loc='upper left');axes[1].set_ylim(0,350)
+    save(fig,'memory','Comparable reclaim: retained Stage 3.1 million-record pair',
+         '1 round/mode; variation=N/A. Each RSS state=median of five /proc samples. system ALLOCTRIM after absent checks.\nPool immediately munmaps empty slabs; startup has five 64KiB slabs (0.3125MiB). Rounding waste=81.18MiB; no 160B class added.')
+    print('Generated 10 Stage 5 SVG figures from archived data only.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--final-data',type=Path,help='Stage 5 final and retained-stage measurements JSON')
     parser.add_argument('--preview-dir', type=Path, help='optional local PNG QA copies')
     parser.add_argument('--direct-data', type=Path, help='single direct eBPF rerun JSON with historical references')
     parser.add_argument('--data', type=Path, help='formal matrix JSON containing retune results')
     parser.add_argument('--figures-dir', type=Path, help='optional SVG destination')
     args = parser.parse_args()
+    if args.final_data:
+        if args.data or args.direct_data:parser.error('--final-data cannot be combined with another data mode')
+        with tempfile.TemporaryDirectory(prefix='91kv-stage5-plot-') as cache:
+            os.environ['MPLCONFIGDIR']=cache
+            os.environ['XDG_CACHE_HOME']=cache
+            plot_final(json.loads(args.final_data.read_text()),args.figures_dir or Path(__file__).resolve().parent/'figures',args.preview_dir)
+        return
     if args.direct_data:
         if args.data:
             parser.error('--data and --direct-data are mutually exclusive')
